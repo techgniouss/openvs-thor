@@ -197,6 +197,16 @@ to the next healthy account.
 - Chat call returns 404/410 → "the Antigravity backend may have been shut down" (the upstream
   repo was archived).
 
+## Plan step 0: connectivity probe (build-gate)
+
+Because the upstream repo was archived 2026-07-17, the endpoints may already be dead. The
+first implementation step is a **throwaway standalone probe** (a small script run outside the
+extension) that: runs the OAuth flow once for one account, resolves `projectId` via
+`loadCodeAssist`, and makes one `streamGenerateContent` call. If it 404/410s or the client is
+rejected (`invalid_client`), **stop** — the backend is gone and the rest of the build is moot.
+Only proceed to the provider once the probe returns a real completion. The probe is not
+shipped.
+
 ## Testing
 
 - **`geminiTransform.ts`** — mocha unit tests (`test/unit` style, `tdd`), preferring
