@@ -5,7 +5,7 @@
 
 import {
 	AgentRequest, AgentStep, ApiFetchOptions, ChatMessage, ChatProvider, ChatRequest, ModelEntry,
-	ProviderInfo, RetryInfo, ToolCall, apiFetch, describeHttpError, readSSE,
+	ProviderInfo, RetryInfo, StreamChatResult, ToolCall, apiFetch, describeHttpError, readSSE,
 } from './types';
 
 /**
@@ -81,7 +81,7 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 		};
 	}
 
-	async streamChat(request: ChatRequest): Promise<void> {
+	async streamChat(request: ChatRequest): Promise<StreamChatResult> {
 		const response = await apiFetch(this.url(request.baseUrl, '/chat/completions'), {
 			method: 'POST',
 			headers: { ...this.authHeaders(request.apiKey), 'Accept': 'text/event-stream' },
@@ -102,9 +102,13 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 		// thought as `reasoning_content` before any `content`. Dropping it made those
 		// models look dead for minutes; surface it, separated from the final answer.
 		let phase: 'idle' | 'reasoning' | 'answer' = 'idle';
+		let truncated = false;
 		await readSSE(response, data => {
 			try {
 				const json = JSON.parse(data);
+				if (json?.choices?.[0]?.finish_reason === 'length') {
+					truncated = true;
+				}
 				const delta = json?.choices?.[0]?.delta;
 				const reasoning: string | undefined = delta?.reasoning_content;
 				if (typeof reasoning === 'string' && reasoning) {
@@ -126,6 +130,7 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 				// Skip malformed chunks.
 			}
 		}, request.signal);
+		return { truncated };
 	}
 
 	async listModels(apiKey: string, baseUrl: string, signal: AbortSignal): Promise<ModelEntry[]> {
@@ -169,6 +174,7 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 		// (OpenAI streams tool_calls piece-by-piece, keyed by index).
 		let content = '';
 		let reasoning = '';
+		let truncated = false;
 		const acc = new Map<number, { id?: string; name?: string; args: string }>();
 		await readSSE(response, data => {
 			let json: any;
@@ -176,6 +182,9 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 				json = JSON.parse(data);
 			} catch {
 				return;
+			}
+			if (json?.choices?.[0]?.finish_reason === 'length') {
+				truncated = true;
 			}
 			const delta = json?.choices?.[0]?.delta;
 			if (!delta) {
@@ -219,7 +228,7 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 			});
 		// A reasoning model that produced no answer and no tool calls would otherwise
 		// yield an empty step; fall back to its reasoning so the agent loop can react.
-		return { content: content || (toolCalls.length ? '' : reasoning), toolCalls };
+		return { content: content || (toolCalls.length ? '' : reasoning), toolCalls, truncated };
 	}
 }
 

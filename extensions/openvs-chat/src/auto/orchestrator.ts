@@ -7,7 +7,7 @@ import { AgentCallbacks, AgentRunner } from '../agent/agentRunner';
 import { ToolApprover } from '../agent/tools';
 import { McpToolset } from '../mcp/manager';
 import { ProviderRegistry } from '../providers/registry';
-import { ChatMessage, ToolCall } from '../providers/types';
+import { ChatMessage, ToolCall, streamChatWithContinuation } from '../providers/types';
 import { AutoRole, RoleAssignment, RoleRouter } from './router';
 
 /** Events the orchestrator emits as it moves through the plan → code → review phases. */
@@ -173,17 +173,16 @@ export class AutoOrchestrator {
 		if (!provider) {
 			throw new Error(`${assignment.roleLabel} provider "${assignment.providerId}" is unavailable.`);
 		}
-		let full = '';
-		await provider.streamChat({
+		const { text } = await streamChatWithContinuation(provider, {
 			messages,
 			model: assignment.model,
 			apiKey: await this.apiKey(assignment.providerId),
 			baseUrl: this.registry.getBaseUrl(assignment.providerId),
 			maxTokens,
 			signal,
-			onToken: delta => { full += delta; cb.token(delta); },
+			onToken: delta => cb.token(delta),
 		});
-		return full;
+		return text;
 	}
 
 	/** Runs the implementation tool-loop, falling back to the next inferred model on an early model error. */

@@ -68,5 +68,5 @@
   "config.auto.reviewModel": "Model used for the **review** phase in **Auto** mode. Format: `provider:model` (e.g. `openai:gpt-4o`). Leave empty to auto-select.",
   "config.auto.enableReview": "When using Auto mode in Agent, run a final review pass over the agent's changes with the review model.",
   "config.systemPrompt": "System prompt prepended to every conversation.",
-  "config.maxTokens": "Maximum number of tokens to generate in a response. Non-inline Edit mode (which asks for a whole file back) always uses at least 8192 regardless of this setting, to avoid the response being cut off mid-file."
+  "config.maxTokens": "Maximum number of tokens to generate per response round. When a response hits this limit, the chat automatically continues it in place (up to 8 rounds), so long answers and big code blocks are not cut off midway. Non-inline Edit mode (which asks for a whole file back) always uses at least 8192 regardless of this setting."
 }

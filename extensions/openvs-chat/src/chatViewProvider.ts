@@ -12,7 +12,7 @@ import { WebAuthManager } from './auth';
 import { McpManager } from './mcp/manager';
 import { supportsNativeSignIn } from './oauth';
 import { ProviderRegistry } from './providers/registry';
-import { ChatMessage, ChatProvider, ModelEntry, entrySupportsTools, modelSupportsVision } from './providers/types';
+import { ChatMessage, ChatProvider, ModelEntry, entrySupportsTools, modelSupportsVision, streamChatWithContinuation } from './providers/types';
 import { RulesProvider } from './rules';
 import { SkillRegistry } from './skills';
 
@@ -834,11 +834,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		mode: ChatMode,
 		post: SessionPost,
 	): Promise<void> {
-		let full = '';
-		await provider.streamChat({
+		// Streams with transparent auto-continuation: a max-token cutoff is resumed
+		// in place (Claude-style) instead of the reply stopping midway.
+		const { text: full } = await streamChatWithContinuation(provider, {
 			messages,
 			...params,
-			onToken: delta => { full += delta; post({ type: 'token', delta }); },
+			onToken: delta => post({ type: 'token', delta }),
 		});
 		if (mode === 'edit') {
 			// An odd number of ``` fences means the response was cut off mid code-block

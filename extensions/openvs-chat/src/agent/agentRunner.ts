@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { McpToolset } from '../mcp/manager';
-import { ChatProvider, ChatMessage, ToolCall, ToolSpec } from '../providers/types';
+import { CONTINUE_PROMPT, ChatProvider, ChatMessage, ToolCall, ToolSpec } from '../providers/types';
 import { Guardrails, autoApproves, loadGuardrails } from './guardrails';
 import { AGENT_TOOLS, READ_ONLY_TOOL_NAMES, SPAWN_SUBAGENT_TOOL, ToolApprover, executeTool } from './tools';
 
@@ -133,6 +133,12 @@ export class AgentRunner {
 			messages.push({ role: 'assistant', content: result.content, toolCalls: result.toolCalls });
 
 			if (!result.toolCalls.length) {
+				// A text-only step cut off by the max-token limit isn't the model being
+				// done — ask it to resume where it stopped (costs one step of budget).
+				if (result.truncated && result.content) {
+					messages.push({ role: 'user', content: CONTINUE_PROMPT });
+					continue;
+				}
 				return; // Model is done.
 			}
 

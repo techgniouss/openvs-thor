@@ -58,24 +58,25 @@ const INFERENCE_CANDIDATES: Record<AutoRole, Array<{ providerId: string; model: 
 	// models are listed first; reasoning-only models (o-series) come later as they have
 	// stricter API constraints.
 	plan: [
-		{ providerId: 'anthropic', model: 'claude-opus-4-5' },
+		{ providerId: 'anthropic', model: 'claude-fable-5' },
+		{ providerId: 'anthropic', model: 'claude-opus-4-8' },
 		{ providerId: 'openai', model: 'gpt-4o' },
-		{ providerId: 'anthropic', model: 'claude-sonnet-4-5' },
+		{ providerId: 'anthropic', model: 'claude-sonnet-5' },
 		{ providerId: 'nvidia', model: 'nvidia/llama-3.1-nemotron-70b-instruct' },
 		{ providerId: 'nvidia', model: 'meta/llama-3.3-70b-instruct' },
 	],
 	// Implementation drives the tool loop, so every candidate must be tool-capable.
 	code: [
-		{ providerId: 'anthropic', model: 'claude-sonnet-4-5' },
+		{ providerId: 'anthropic', model: 'claude-sonnet-5' },
 		{ providerId: 'openai', model: 'gpt-4o' },
-		{ providerId: 'anthropic', model: 'claude-sonnet-4-0' },
+		{ providerId: 'anthropic', model: 'claude-sonnet-4-5' },
 		{ providerId: 'nvidia', model: 'meta/llama-3.3-70b-instruct' },
 		{ providerId: 'nvidia', model: 'qwen/qwen2.5-coder-32b-instruct' },
 	],
 	// Review is a critique pass; tools are not needed.
 	review: [
 		{ providerId: 'openai', model: 'gpt-4o' },
-		{ providerId: 'anthropic', model: 'claude-sonnet-4-5' },
+		{ providerId: 'anthropic', model: 'claude-sonnet-5' },
 		{ providerId: 'anthropic', model: 'claude-haiku-4-5' },
 		{ providerId: 'nvidia', model: 'meta/llama-3.3-70b-instruct' },
 	],
