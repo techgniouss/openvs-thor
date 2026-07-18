@@ -74,9 +74,16 @@ to rebase against upstream VS Code.
 
 ### Part A — product.json
 
-- Remove the entire `defaultChatAgent` object (89–151). If any consumer requires
-  the key to exist, verify via typecheck; the code paths use optional chaining, so
-  removal is expected to be safe.
+- **Neutralize (do NOT remove) `defaultChatAgent`.** Removal crashes startup:
+  `defaultChatAgent` is typed *required* (`base/common/product.ts`) and hard-
+  dereferenced without optional chaining at several sites — `assertDefined` in
+  `welcomeOnboarding/onboardingVariationA` (module scope), `defaultAccount`,
+  `extensionGalleryService`, `chatWidget`, extension management — so `typecheck`
+  cannot catch the runtime hole. Instead replace the Copilot values with a
+  structurally-complete, neutralized agent: OpenVS naming, empty URLs/commands,
+  non-matching extension ids, zero GitHub Copilot references. Copilot chrome stays
+  hidden via `IChatEntitlementService.setForceHidden(true)` (Part B), which forces
+  `chatSetupHidden` through `withConfiguration()` on every context update.
 - Remove `"GitHub.copilot-chat"` from `builtInExtensionsEnabledWithAutoUpdates`
   (leave the array present, empty).
 - Remove the Copilot entries from `trustedExtensionAuthAccess` (drop the
