@@ -499,6 +499,16 @@
           "default": false,
           "description": "%config.auto.decompose%"
         },
+        "openvsChat.persona.thinking": {
+          "type": "boolean",
+          "default": true,
+          "description": "%config.persona.thinking%"
+        },
+        "openvsChat.persona.environment": {
+          "type": "boolean",
+          "default": true,
+          "description": "%config.persona.environment%"
+        },
         "openvsChat.systemPrompt": {
           "type": "string",
           "editPresentation": "multilineText",

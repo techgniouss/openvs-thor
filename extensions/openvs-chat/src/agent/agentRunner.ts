@@ -4,6 +4,8 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { McpToolset } from '../mcp/manager';
+import { SUBAGENT_PREAMBLE } from '../persona/prompts';
+import { TodoItem, UPDATE_TODOS_TOOL, parseTodoUpdate } from '../persona/todos';
 import { CONTINUE_PROMPT, ChatProvider, ChatMessage, ToolCall, ToolSpec } from '../providers/types';
 import { Guardrails, autoApproves, loadGuardrails } from './guardrails';
 import { AGENT_TOOLS, READ_ONLY_TOOL_NAMES, SPAWN_SUBAGENT_TOOL, ToolApprover, executeTool } from './tools';
@@ -23,6 +25,8 @@ export interface AgentCallbacks {
 	onToolEnd(call: ToolCall, result: string, isError: boolean): void;
 	/** An out-of-band note (e.g. reaching the step limit). */
 	onNote(text: string): void;
+	/** The agent replaced its visible task checklist (top-level agent only). */
+	onTodos?(items: TodoItem[]): void;
 }
 
 interface AgentParams {
@@ -91,6 +95,9 @@ export class AgentRunner {
 			return AGENT_TOOLS.filter(t => READ_ONLY_TOOL_NAMES.includes(t.name));
 		}
 		const base = [...AGENT_TOOLS];
+		if (this.depth === 0) {
+			base.push(UPDATE_TODOS_TOOL);
+		}
 		if (this.depth < this.guardrails.maxSubagentDepth && this.budget.spawned < this.guardrails.maxSubagents) {
 			base.push(SPAWN_SUBAGENT_TOOL);
 		}
@@ -166,6 +173,17 @@ export class AgentRunner {
 			}
 			if (call.name === SPAWN_SUBAGENT_TOOL.name) {
 				spawnCalls.push(call);
+				continue;
+			}
+			if (call.name === UPDATE_TODOS_TOOL.name) {
+				callbacks.onToolStart(call);
+				const parsed = parseTodoUpdate(call.args);
+				const outcome = 'error' in parsed
+					? { result: parsed.error, isError: true }
+					: (callbacks.onTodos?.(parsed.items),
+						{ result: `Checklist updated (${parsed.items.length} item(s)).`, isError: false });
+				callbacks.onToolEnd(call, outcome.result, outcome.isError);
+				outcomes.push({ call, ...outcome });
 				continue;
 			}
 			callbacks.onToolStart(call);
@@ -263,7 +281,7 @@ function subagentSystem(readOnly: boolean): string {
 	const role = readOnly
 		? 'You are a READ-ONLY research SUB-AGENT. You may only read, list and search files — you cannot write or run commands.'
 		: 'You are a SUB-AGENT with tools to read, list, write and edit files and run commands (writes/commands require user approval).';
-	return `${role} You were given one focused goal and do not see the parent conversation. ` +
+	return `${role} ${SUBAGENT_PREAMBLE} You were given one focused goal and do not see the parent conversation. ` +
 		`Accomplish exactly that goal using your tools, then end with a concise summary of what you found or changed. Do not ask follow-up questions.`;
 }
 

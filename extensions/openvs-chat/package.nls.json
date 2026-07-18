@@ -67,6 +67,8 @@
   "config.auto.codeModel": "Model used for the **implementation** phase in **Auto** mode. Format: `provider:model` (e.g. `anthropic:claude-sonnet-4-0`). Must be a tool-capable model. Leave empty to auto-select.",
   "config.auto.reviewModel": "Model used for the **review** phase in **Auto** mode. Format: `provider:model` (e.g. `openai:gpt-4o`). Leave empty to auto-select.",
   "config.auto.enableReview": "When using Auto mode in Agent, run a final review pass over the agent's changes with the review model.",
+  "config.persona.thinking": "Ask the model to reason inside a <thinking> block before answering (shown inline as \"🤔 Thinking…\"). Turn off for models that reason natively or to tighten output.",
+  "config.persona.environment": "Include a workspace environment snapshot (git branch and status, platform, open files) in the system prompt so answers are grounded in your project state.",
   "config.systemPrompt": "System prompt prepended to every conversation.",
   "config.maxTokens": "Maximum number of tokens to generate per response round. When a response hits this limit, the chat automatically continues it in place (up to 8 rounds), so long answers and big code blocks are not cut off midway. Non-inline Edit mode (which asks for a whole file back) always uses at least 8192 regardless of this setting."
 }

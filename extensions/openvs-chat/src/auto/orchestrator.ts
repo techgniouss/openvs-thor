@@ -6,6 +6,7 @@
 import { AgentCallbacks, AgentRunner } from '../agent/agentRunner';
 import { ToolApprover } from '../agent/tools';
 import { McpToolset } from '../mcp/manager';
+import { TodoItem } from '../persona/todos';
 import { ProviderRegistry } from '../providers/registry';
 import { ChatMessage, ToolCall, streamChatWithContinuation } from '../providers/types';
 import { AutoRole, RoleAssignment, RoleRouter } from './router';
@@ -24,6 +25,8 @@ export interface AutoCallbacks {
 	onToolEnd(call: ToolCall, result: string, isError: boolean): void;
 	/** An informational note (skipped review, model fallback, step limit, …). */
 	note(text: string): void;
+	/** The implementer's visible checklist changed. */
+	onTodos?(items: TodoItem[]): void;
 }
 
 export interface AutoRunParams {
@@ -300,6 +303,7 @@ function agentCallbacks(cb: AutoCallbacks, sink: ChangeSink): AgentCallbacks {
 		onToolStart: call => { recordChangeStart(sink, call); cb.onToolStart(call); },
 		onToolEnd: (call, result, isError) => { recordChangeEnd(sink, call, result, isError); cb.onToolEnd(call, result, isError); },
 		onNote: text => cb.note(text),
+		onTodos: items => cb.onTodos?.(items),
 	};
 }
 
