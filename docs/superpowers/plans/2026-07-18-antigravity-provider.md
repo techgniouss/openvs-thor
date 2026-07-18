@@ -14,7 +14,7 @@
 - No `any`/`unknown` unless unavoidable. `async`/`await` over `.then()`.
 - Constructor-injected dependencies; never stub globals or `any`-cast fakes in tests.
 - Keys/secrets live in VS Code `SecretStorage`, never plaintext `settings.json`.
-- Public OAuth values (client_id, endpoints, scopes) may be code constants; the `client_secret` must come from `ANTIGRAVITY_CLIENT_SECRET` env or SecretStorage only.
+- Public OAuth values (client_id, endpoints, scopes) may be code constants. `client_secret` resolution order: `ANTIGRAVITY_CLIENT_SECRET` env → SecretStorage → gitignored bundled file `extensions/openvs-chat/.secrets/antigravity.txt` (seeded into SecretStorage once on activation). Never a plaintext `settings.json` value; never committed. Only a `.example` + README are committed.
 - `client_id` (public): `1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com`
 - Auth URL: `https://accounts.google.com/o/oauth2/v2/auth` · Token URL: `https://oauth2.googleapis.com/token`
 - Loopback redirect: `http://localhost:51121/oauth-callback`
@@ -1219,10 +1219,84 @@ git commit -m "feat(antigravity): register provider behind experimental flag + c
 
 - [ ] **Step 1: Import the sign-in flow**
 
-Add near the other imports:
+Add near the other imports (note `fs`/`path` for the seed step):
 
 ```ts
+import * as fs from 'fs';
+import * as path from 'path';
 import { signInAntigravity } from './antigravity/auth';
+```
+
+- [ ] **Step 1a: Scaffold the gitignored secret file**
+
+```bash
+mkdir -p extensions/openvs-chat/.secrets
+printf 'GOCSPX-REPLACE-WITH-PUBLIC-VALUE\n' > extensions/openvs-chat/.secrets/antigravity.txt.example
+cat > extensions/openvs-chat/.secrets/README.md <<'EOF'
+# .secrets
+
+`antigravity.txt` holds the Antigravity Google OAuth client secret used for the
+experimental `antigravity` provider. It is **gitignored** — never commit it.
+
+Zero-prompt setup: copy the example and paste the public value:
+
+    cp antigravity.txt.example antigravity.txt
+    # edit antigravity.txt to contain the real GOCSPX-… value
+
+On activation the extension seeds this into SecretStorage once, so sign-in never prompts.
+The value is a Google *desktop-client* secret (not truly confidential) and is already
+public in the archived upstream repo. Keeping it out of git is deliberate.
+EOF
+```
+
+Append to the repo-root `.gitignore` (create the lines if absent):
+
+```
+# openvs-chat experimental antigravity secret (never commit)
+extensions/openvs-chat/.secrets/*
+!extensions/openvs-chat/.secrets/*.example
+!extensions/openvs-chat/.secrets/README.md
+```
+
+Also add to `extensions/openvs-chat/.vscodeignore` (so a packaged .vsix never ships it) — create the file if absent:
+
+```
+.secrets/antigravity.txt
+```
+
+Locally (NOT committed) create the real file so sign-in is zero-prompt in the dev host:
+
+```bash
+cp extensions/openvs-chat/.secrets/antigravity.txt.example extensions/openvs-chat/.secrets/antigravity.txt
+# then edit antigravity.txt to contain the real GOCSPX-… value
+```
+
+Verify it is ignored (must print nothing):
+
+```bash
+git status --porcelain extensions/openvs-chat/.secrets/antigravity.txt
+```
+
+- [ ] **Step 1b: Seed SecretStorage from the bundled file on activation**
+
+In `activate`, right after the `ProviderRegistry` is created, add:
+
+```ts
+	// Zero-prompt Antigravity: seed the client secret from the gitignored bundled file once.
+	void (async () => {
+		if (await registry.getAntigravityClientSecret()) {
+			return;
+		}
+		try {
+			const file = path.join(context.extensionPath, '.secrets', 'antigravity.txt');
+			const value = fs.readFileSync(file, 'utf8').trim();
+			if (value && !value.startsWith('GOCSPX-REPLACE')) {
+				await registry.setAntigravityClientSecret(value);
+			}
+		} catch {
+			// No bundled file: fall back to the one-time prompt in add-account.
+		}
+	})();
 ```
 
 - [ ] **Step 2: Register the commands in `activate`**

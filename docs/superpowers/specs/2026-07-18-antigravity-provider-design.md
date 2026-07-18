@@ -47,14 +47,28 @@ warning gating the first sign-in, and (c) as an in-panel caution banner.
 - **Models:** `gemini-3-pro-high`, `gemini-3-pro-low`, `claude-sonnet-4-6`,
   `claude-opus-4-6-thinking`, `gpt-oss-120b-medium`.
 
-## Credential handling (decision A, refined)
+## Credential handling (gitignored-override — opencode zero-prompt UX)
+
+Goal: match opencode's UX (click → Google login → done, no typing) **without committing a
+secret**. A Google *desktop/installed* OAuth client must send `client_secret` at token
+exchange, so zero-prompt requires the secret to be present on disk — but not in git.
 
 - `client_id` ships as a code default (public value; not a secret).
-- `client_secret` is read from `ANTIGRAVITY_CLIENT_SECRET` env, else from VS Code
-  **SecretStorage** (prompted once, on first sign-in). It is **never** a plaintext
-  `settings.json` value — this honors the repo rule "keys live in SecretStorage, never
-  plaintext settings" while keeping the ToS-violating credential choice explicitly in the
-  user's hands.
+- `client_secret` resolution order (first hit wins):
+  1. `ANTIGRAVITY_CLIENT_SECRET` env var.
+  2. VS Code **SecretStorage**.
+  3. A **gitignored** bundled file `extensions/openvs-chat/.secrets/antigravity.txt`,
+     prefilled with the public value. On activation, when nothing is in SecretStorage yet,
+     the extension **seeds SecretStorage once** from this file. After seeding, add-account
+     never prompts.
+- Committed to git: only `.secrets/antigravity.txt.example` (placeholder) and a `.secrets/README.md`.
+  `.gitignore` covers `extensions/openvs-chat/.secrets/` except the example/README.
+- Fresh clones without the file fall back to a **one-time prompt** (input box → stored in
+  SecretStorage), so the feature still works, just with one extra step.
+- The secret is **never** a plaintext `settings.json` value, and **never** committed.
+- Note: the Google desktop-client `client_secret` is not truly confidential (Google's own
+  docs say installed-app secrets "aren't treated as secret"); the value is already public in
+  the archived upstream repo. The gitignore keeps it out of *this* repo regardless.
 
 ## Scope (approved)
 
