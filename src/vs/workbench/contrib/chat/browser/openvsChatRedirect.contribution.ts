@@ -8,11 +8,13 @@ import { localize } from '../../../../nls.js';
 import { CommandsRegistry } from '../../../../platform/commands/common/commands.js';
 import { ServicesAccessor } from '../../../../platform/instantiation/common/instantiation.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
+import { Registry } from '../../../../platform/registry/common/platform.js';
 import { IWorkbenchContribution } from '../../../common/contributions.js';
-import { IViewDescriptorService, ViewContainerLocation } from '../../../common/views.js';
+import { Extensions as ViewExtensions, IViewContainersRegistry, IViewDescriptorService, ViewContainerLocation } from '../../../common/views.js';
 import { IChatEntitlementService } from '../../../services/chat/common/chatEntitlementService.js';
 import { IViewsService } from '../../../services/views/common/viewsService.js';
-import { CHAT_OPEN_ACTION_ID, getOpenChatActionIdForMode } from './actions/chatActions.js';
+import { ACTION_ID_OPEN_CHAT, CHAT_OPEN_ACTION_ID, getOpenChatActionIdForMode } from './actions/chatActions.js';
+import { ChatViewContainerId } from './chat.js';
 import { ChatMode } from '../common/chatModes.js';
 
 /**
@@ -54,17 +56,28 @@ export class OpenVSChatRedirectContribution extends Disposable implements IWorkb
 		// poking the `chatSetupHidden` context key directly.
 		chatEntitlementService.setForceHidden(true);
 
-		// The keybinding (Ctrl+Alt+I), the title-bar Chat button, and each
-		// mode-specific "Open Chat (Ask/Edit/Agent)" command all invoke their
-		// own `workbench.action.chat.open*` command; overriding all of them
-		// reroutes every entry point to the openvs-chat view. The native
-		// command's `{query, mode}` arguments are intentionally ignored here —
-		// forwarding query text into the webview is a separate follow-up.
+		// Reroute every native chat entry point — the title-bar Chat button and
+		// its icon variants, the toggle command, each mode-specific "Open Chat
+		// (Ask/Edit/Agent)" command, the new-chat-editor command, quick chat
+		// (both the toggle and its "open in chat view" escape hatch), and
+		// editor inline chat (plus its legacy `interactiveEditor.start` alias)
+		// — to the openvs-chat view. The native commands' `{query, mode}`
+		// arguments are intentionally ignored here — forwarding query text into
+		// the webview is a separate follow-up.
 		for (const commandId of [
 			CHAT_OPEN_ACTION_ID,
 			getOpenChatActionIdForMode(ChatMode.Ask),
 			getOpenChatActionIdForMode(ChatMode.Edit),
 			getOpenChatActionIdForMode(ChatMode.Agent),
+			'workbench.action.chat.toggle', // TOGGLE_CHAT_ACTION_ID (not exported)
+			ACTION_ID_OPEN_CHAT,
+			'workbench.action.openChat.copilotIcon',
+			'workbench.action.openChat.newSessionIcon',
+			'workbench.action.openChat.commentIcon',
+			'workbench.action.quickchat.toggle', // ASK_QUICK_QUESTION_ACTION_ID (not exported)
+			'workbench.action.quickchat.openInChatView',
+			'inlineChat.start', // ACTION_START in contrib/inlineChat/common/inlineChat.ts (not exported)
+			'interactiveEditor.start', // legacy alias of inlineChat.start
 		]) {
 			this._register(CommandsRegistry.registerCommand(commandId, this.openOpenVSChatView));
 		}
@@ -73,6 +86,26 @@ export class OpenVSChatRedirectContribution extends Disposable implements IWorkb
 		// for it to show up, then try immediately in case it already has.
 		this.relocateListener.value = this.viewDescriptorService.onDidChangeViewContainers(() => this.relocateOpenVSChatContainer());
 		this.relocateOpenVSChatContainer();
+
+		this.hideNativeChatContainer();
+	}
+
+	/**
+	 * Deregisters the native chat view container so its panel can no longer be
+	 * shown. Combined with the command reroutes above, this removes the last
+	 * way a user could reach the built-in Copilot/native chat surface — OpenVS
+	 * ships its own chat instead. Best-effort: if the container hasn't been
+	 * registered (e.g. Copilot is disabled/uninstalled), this is a no-op.
+	 *
+	 * This is intentionally aggressive. If any native-chat-dependent feature
+	 * (e.g. agent sessions, chat sessions) misbehaves as a result, this can be
+	 * reverted by removing this one call without touching the command reroutes.
+	 */
+	private hideNativeChatContainer(): void {
+		const container = this.viewDescriptorService.getViewContainerById(ChatViewContainerId);
+		if (container) {
+			Registry.as<IViewContainersRegistry>(ViewExtensions.ViewContainersRegistry).deregisterViewContainer(container);
+		}
 	}
 
 	/**
