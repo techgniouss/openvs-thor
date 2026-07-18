@@ -86,6 +86,44 @@
 			}
 		}
 	],
+	"defaultChatAgent": {
+		"extensionId": "openvs.thor",
+		"chatExtensionId": "openvs.thor-chat",
+		"chatExtensionOutputId": "openvs.thor-chat.OpenVS Thor Chat.log",
+		"chatExtensionOutputExtensionStateCommand": "",
+		"documentationUrl": "",
+		"skusDocumentationUrl": "",
+		"publicCodeMatchesUrl": "",
+		"managePlanUrl": "",
+		"upgradePlanUrl": "",
+		"signUpUrl": "",
+		"termsStatementUrl": "",
+		"privacyStatementUrl": "",
+		"provider": {
+			"default": { "id": "openvs", "name": "OpenVS" },
+			"enterprise": { "id": "openvs-enterprise", "name": "OpenVS" },
+			"google": { "id": "google", "name": "Google" },
+			"apple": { "id": "apple", "name": "Apple" }
+		},
+		"providerExtensionId": "",
+		"providerUriSetting": "openvs.thor.enterprise.uri",
+		"providerScopes": [[]],
+		"entitlementUrl": "",
+		"entitlementSignupLimitedUrl": "",
+		"tokenEntitlementUrl": "",
+		"mcpRegistryDataUrl": "",
+		"managedSettingsUrl": "",
+		"chatQuotaExceededContext": "openvs.thor.chat.quotaExceeded",
+		"completionsQuotaExceededContext": "openvs.thor.completions.quotaExceeded",
+		"walkthroughCommand": "",
+		"completionsMenuCommand": "",
+		"chatRefreshTokenCommand": "",
+		"generateCommitMessageCommand": "",
+		"resolveMergeConflictsCommand": "",
+		"completionsAdvancedSetting": "openvs.thor.advanced",
+		"completionsEnablementSetting": "openvs.thor.enable",
+		"nextEditSuggestionsSetting": "openvs.thor.nextEditSuggestions.enabled"
+	},
 	"onboardingKeymaps": [
 		{
 			"id": "vscode",
