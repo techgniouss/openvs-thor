@@ -1,0 +1,270 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) OpenVS. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import {
+	AgentRequest, AgentStep, ChatMessage, ChatProvider, ChatRequest, ModelEntry, ProviderInfo,
+	ToolCall, apiFetch, describeHttpError, readSSE,
+} from './types';
+
+const ANTHROPIC_VERSION = '2023-06-01';
+const OAUTH_BETA = 'oauth-2025-04-20';
+/**
+ * Subscription (Claude account) OAuth tokens are only served when the request
+ * identifies as Anthropic's first-party CLI, which requires this exact text as the
+ * first system block.
+ */
+const CLAUDE_CODE_SYSTEM = 'You are Claude Code, Anthropic\'s official CLI for Claude.';
+
+/** True when the credential came from the Claude web sign-in (not an API key). */
+function isOAuthToken(apiKey: string): boolean {
+	return apiKey.startsWith('sk-ant-oat');
+}
+
+/**
+ * Provider for the Anthropic Messages API (Claude). Anthropic differs from the
+ * OpenAI shape: the system prompt is a top-level field, messages carry content
+ * blocks, and tool calls arrive as `tool_use` blocks.
+ */
+export class AnthropicProvider implements ChatProvider {
+	readonly info: ProviderInfo = {
+		id: 'anthropic',
+		label: 'Anthropic (Claude)',
+		suggestedModels: [
+			'claude-sonnet-4-5',
+			'claude-opus-4-5',
+			'claude-haiku-4-5',
+			'claude-sonnet-4-0',
+			'claude-3-5-haiku-latest',
+		],
+		apiKeyUrl: 'https://console.anthropic.com/settings/keys',
+		requiresApiKey: true,
+		supportsTools: true,
+		// Claude 3 and 4 families support tool use.
+		toolModelPatterns: ['claude-3', 'claude-[a-z]+-4', 'claude-4'],
+		// Every Claude 3/3.5/3.7/4 model is multimodal.
+		visionModelPatterns: ['claude-3', 'claude-[a-z]+-4', 'claude-4'],
+	};
+
+	private url(baseUrl: string, path: string): string {
+		return `${baseUrl.replace(/\/+$/, '')}${path}`;
+	}
+
+	private headers(apiKey: string): Record<string, string> {
+		if (isOAuthToken(apiKey)) {
+			return {
+				'Content-Type': 'application/json',
+				'Authorization': `Bearer ${apiKey}`,
+				'anthropic-version': ANTHROPIC_VERSION,
+				'anthropic-beta': OAUTH_BETA,
+			};
+		}
+		return {
+			'Content-Type': 'application/json',
+			'x-api-key': apiKey,
+			'anthropic-version': ANTHROPIC_VERSION,
+		};
+	}
+
+	async streamChat(request: ChatRequest): Promise<void> {
+		const { system, messages } = splitSystem(request.messages);
+		const response = await apiFetch(this.url(request.baseUrl, '/messages'), {
+			method: 'POST',
+			headers: this.headers(request.apiKey),
+			body: JSON.stringify({
+				model: request.model,
+				max_tokens: request.maxTokens,
+				system: buildSystem(system, isOAuthToken(request.apiKey)),
+				messages: toAnthropicMessages(messages),
+				stream: true,
+			}),
+		}, request.signal);
+
+		if (!response.ok) {
+			throw new Error(await describeHttpError(this.info.label, response));
+		}
+
+		await readSSE(response, data => {
+			try {
+				const json = JSON.parse(data);
+				if (json?.type === 'content_block_delta' && typeof json?.delta?.text === 'string') {
+					request.onToken(json.delta.text);
+				} else if (json?.type === 'error') {
+					throw new Error(json?.error?.message ?? 'Anthropic stream error');
+				}
+			} catch (err) {
+				if (err instanceof Error && err.message.startsWith('Anthropic')) {
+					throw err;
+				}
+				// Skip malformed chunks.
+			}
+		}, request.signal);
+	}
+
+	async listModels(apiKey: string, baseUrl: string, signal: AbortSignal): Promise<ModelEntry[]> {
+		const response = await apiFetch(this.url(baseUrl, '/models'), {
+			method: 'GET',
+			headers: this.headers(apiKey),
+		}, signal);
+		if (!response.ok) {
+			// Subscription tokens are scoped to inference; if the models endpoint
+			// rejects them, fall back to the known-good models rather than failing.
+			if (isOAuthToken(apiKey) && (response.status === 401 || response.status === 403)) {
+				return this.info.suggestedModels.map(id => ({ id }));
+			}
+			throw new Error(await describeHttpError(this.info.label, response));
+		}
+		const json = await response.json();
+		const ids: string[] = (json?.data ?? [])
+			.map((m: { id?: string }) => m?.id)
+			.filter((id: unknown): id is string => typeof id === 'string');
+		return ids.sort((a, b) => a.localeCompare(b)).map(id => ({ id }));
+	}
+
+	async runAgentStep(request: AgentRequest): Promise<AgentStep> {
+		const { system, messages } = splitSystem(request.messages);
+		const response = await apiFetch(this.url(request.baseUrl, '/messages'), {
+			method: 'POST',
+			headers: this.headers(request.apiKey),
+			body: JSON.stringify({
+				model: request.model,
+				max_tokens: request.maxTokens,
+				system: buildSystem(system, isOAuthToken(request.apiKey)),
+				messages: toAnthropicMessages(messages),
+				tools: request.tools.map(t => ({
+					name: t.name,
+					description: t.description,
+					input_schema: t.parameters,
+				})),
+				stream: true,
+			}),
+		}, request.signal);
+
+		if (!response.ok) {
+			throw new Error(await describeHttpError(this.info.label, response));
+		}
+
+		// Accumulate streamed content blocks: text deltas plus tool_use blocks whose JSON
+		// input arrives as incremental `input_json_delta` fragments.
+		let content = '';
+		const blocks = new Map<number, { type?: string; id?: string; name?: string; json: string }>();
+		await readSSE(response, data => {
+			let event: any;
+			try {
+				event = JSON.parse(data);
+			} catch {
+				return;
+			}
+			if (event?.type === 'content_block_start') {
+				const cb = event.content_block ?? {};
+				blocks.set(event.index, { type: cb.type, id: cb.id, name: cb.name, json: '' });
+			} else if (event?.type === 'content_block_delta') {
+				const d = event.delta ?? {};
+				if (d.type === 'text_delta' && typeof d.text === 'string') {
+					content += d.text;
+					request.onToken?.(d.text);
+				} else if (d.type === 'input_json_delta' && typeof d.partial_json === 'string') {
+					const b = blocks.get(event.index);
+					if (b) { b.json += d.partial_json; }
+				}
+			} else if (event?.type === 'error') {
+				throw new Error(`Anthropic: ${event?.error?.message ?? 'stream error'}`);
+			}
+		}, request.signal);
+
+		const toolCalls: ToolCall[] = [...blocks.entries()]
+			.filter(([, b]) => b.type === 'tool_use')
+			.sort((a, b) => a[0] - b[0])
+			.map(([, b]) => {
+				let input: Record<string, unknown> = {};
+				try {
+					input = b.json ? JSON.parse(b.json) : {};
+				} catch {
+					input = { _raw: b.json };
+				}
+				return { id: b.id ?? '', name: b.name ?? 'unknown', args: input };
+			});
+		return { content, toolCalls };
+	}
+}
+
+/**
+ * Builds the top-level `system` field. API keys take the plain string; OAuth
+ * (subscription) tokens require the first-party CLI identity as the first block,
+ * with the real system prompt appended as a second block.
+ */
+function buildSystem(system: string, oauth: boolean): string | { type: 'text'; text: string }[] | undefined {
+	if (!oauth) {
+		return system || undefined;
+	}
+	const blocks: { type: 'text'; text: string }[] = [{ type: 'text', text: CLAUDE_CODE_SYSTEM }];
+	if (system) {
+		blocks.push({ type: 'text', text: system });
+	}
+	return blocks;
+}
+
+function splitSystem(messages: ChatMessage[]): { system: string; messages: ChatMessage[] } {
+	const system = messages.filter(m => m.role === 'system').map(m => m.content).join('\n\n');
+	return { system, messages: messages.filter(m => m.role !== 'system') };
+}
+
+type AnthropicBlock =
+	| { type: 'text'; text: string }
+	| { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }
+	| { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
+	| { type: 'tool_result'; tool_use_id: string; content: string };
+type AnthropicMsg = { role: 'user' | 'assistant'; content: AnthropicBlock[] };
+
+/**
+ * Maps internal messages (plain chat *and* tool calls/results) to Anthropic's block
+ * format. Anthropic requires strictly alternating user/assistant turns starting with a
+ * user turn, so this merges consecutive same-role messages into a single turn — without
+ * this, an attached-context user message followed by a history user message would be two
+ * consecutive `user` turns and the API would reject the request (HTTP 400).
+ */
+function toAnthropicMessages(messages: ChatMessage[]): AnthropicMsg[] {
+	const out: AnthropicMsg[] = [];
+	const append = (role: 'user' | 'assistant', blocks: AnthropicBlock[]) => {
+		if (!blocks.length) {
+			return;
+		}
+		const last = out[out.length - 1];
+		if (last && last.role === role) {
+			last.content.push(...blocks);
+		} else {
+			out.push({ role, content: blocks });
+		}
+	};
+
+	for (const m of messages) {
+		if (m.role === 'tool') {
+			append('user', [{ type: 'tool_result', tool_use_id: m.toolCallId ?? '', content: m.content }]);
+		} else if (m.role === 'assistant' && m.toolCalls?.length) {
+			const blocks: AnthropicBlock[] = [];
+			if (m.content) {
+				blocks.push({ type: 'text', text: m.content });
+			}
+			for (const tc of m.toolCalls) {
+				blocks.push({ type: 'tool_use', id: tc.id, name: tc.name, input: tc.args });
+			}
+			append('assistant', blocks);
+		} else if (m.content || m.images?.length) {
+			const blocks: AnthropicBlock[] = (m.images ?? []).map(img => ({
+				type: 'image',
+				source: { type: 'base64', media_type: img.mimeType, data: img.data },
+			}));
+			if (m.content) {
+				blocks.push({ type: 'text', text: m.content });
+			}
+			append(m.role === 'assistant' ? 'assistant' : 'user', blocks);
+		}
+	}
+
+	// Anthropic requires the first turn to be from the user.
+	if (out.length && out[0].role === 'assistant') {
+		out.unshift({ role: 'user', content: [{ type: 'text', text: '(continue)' }] });
+	}
+	return out;
+}
