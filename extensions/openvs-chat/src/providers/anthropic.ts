@@ -4,8 +4,9 @@
  *--------------------------------------------------------------------------------------------*/
 
 import {
-	AgentRequest, AgentStep, ChatMessage, ChatProvider, ChatRequest, ModelEntry, ProviderInfo,
-	StreamChatResult, ToolCall, apiFetch, describeHttpError, readSSE,
+	AgentRequest, AgentStep, ChatMessage, ChatProvider, ChatRequest, FinishReason, ModelEntry,
+	ProviderInfo, STREAM_FETCH_OPTS, StreamChatResult, ToolCall, apiFetch, describeHttpError,
+	normalizeFinishReason, readSSE, retryNotice,
 } from './types';
 
 const ANTHROPIC_VERSION = '2023-06-01';
@@ -83,31 +84,37 @@ export class AnthropicProvider implements ChatProvider {
 				messages: toAnthropicMessages(messages),
 				stream: true,
 			}),
-		}, request.signal);
+		}, request.signal, {
+			...STREAM_FETCH_OPTS,
+			onRetry: info => request.onNotice?.(retryNotice(this.info.label, info)),
+		});
 
 		if (!response.ok) {
 			throw new Error(await describeHttpError(this.info.label, response));
 		}
 
 		let truncated = false;
+		let finishReason: FinishReason | undefined;
 		await readSSE(response, data => {
+			// Parsing is the only thing guarded: a mid-stream `error` event must propagate,
+			// not be mistaken for a malformed chunk and swallowed (which used to return the
+			// partial answer as if it had completed normally).
+			let json: any;
 			try {
-				const json = JSON.parse(data);
-				if (json?.type === 'content_block_delta' && typeof json?.delta?.text === 'string') {
-					request.onToken(json.delta.text);
-				} else if (json?.type === 'message_delta' && json?.delta?.stop_reason === 'max_tokens') {
-					truncated = true;
-				} else if (json?.type === 'error') {
-					throw new Error(json?.error?.message ?? 'Anthropic stream error');
-				}
-			} catch (err) {
-				if (err instanceof Error && err.message.startsWith('Anthropic')) {
-					throw err;
-				}
-				// Skip malformed chunks.
+				json = JSON.parse(data);
+			} catch {
+				return;
 			}
-		}, request.signal);
-		return { truncated };
+			if (json?.type === 'content_block_delta' && typeof json?.delta?.text === 'string') {
+				request.onToken(json.delta.text);
+			} else if (json?.type === 'message_delta' && json?.delta?.stop_reason) {
+				finishReason = normalizeFinishReason(json.delta.stop_reason);
+				truncated = finishReason === 'length';
+			} else if (json?.type === 'error') {
+				throw new Error(`${this.info.label}: ${json?.error?.message ?? 'stream error'}`);
+			}
+		}, request.signal, { label: this.info.label, sawTerminal: () => finishReason !== undefined });
+		return { truncated, finishReason };
 	}
 
 	async listModels(apiKey: string, baseUrl: string, signal: AbortSignal): Promise<ModelEntry[]> {
@@ -147,7 +154,10 @@ export class AnthropicProvider implements ChatProvider {
 				})),
 				stream: true,
 			}),
-		}, request.signal);
+		}, request.signal, {
+			...STREAM_FETCH_OPTS,
+			onRetry: info => request.onNotice?.(retryNotice(this.info.label, info)),
+		});
 
 		if (!response.ok) {
 			throw new Error(await describeHttpError(this.info.label, response));
@@ -157,6 +167,7 @@ export class AnthropicProvider implements ChatProvider {
 		// input arrives as incremental `input_json_delta` fragments.
 		let content = '';
 		let truncated = false;
+		let finishReason: FinishReason | undefined;
 		const blocks = new Map<number, { type?: string; id?: string; name?: string; json: string }>();
 		await readSSE(response, data => {
 			let event: any;
@@ -165,8 +176,9 @@ export class AnthropicProvider implements ChatProvider {
 			} catch {
 				return;
 			}
-			if (event?.type === 'message_delta' && event?.delta?.stop_reason === 'max_tokens') {
-				truncated = true;
+			if (event?.type === 'message_delta' && event?.delta?.stop_reason) {
+				finishReason = normalizeFinishReason(event.delta.stop_reason);
+				truncated = finishReason === 'length';
 			}
 			if (event?.type === 'content_block_start') {
 				const cb = event.content_block ?? {};
@@ -181,9 +193,9 @@ export class AnthropicProvider implements ChatProvider {
 					if (b) { b.json += d.partial_json; }
 				}
 			} else if (event?.type === 'error') {
-				throw new Error(`Anthropic: ${event?.error?.message ?? 'stream error'}`);
+				throw new Error(`${this.info.label}: ${event?.error?.message ?? 'stream error'}`);
 			}
-		}, request.signal);
+		}, request.signal, { label: this.info.label, sawTerminal: () => finishReason !== undefined });
 
 		const toolCalls: ToolCall[] = [...blocks.entries()]
 			.filter(([, b]) => b.type === 'tool_use')
@@ -197,7 +209,7 @@ export class AnthropicProvider implements ChatProvider {
 				}
 				return { id: b.id ?? '', name: b.name ?? 'unknown', args: input };
 			});
-		return { content, toolCalls, truncated };
+		return { content, toolCalls, truncated, finishReason };
 	}
 }
 

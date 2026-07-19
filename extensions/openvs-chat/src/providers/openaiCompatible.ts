@@ -4,8 +4,9 @@
  *--------------------------------------------------------------------------------------------*/
 
 import {
-	AgentRequest, AgentStep, ApiFetchOptions, ChatMessage, ChatProvider, ChatRequest, ModelEntry,
-	ProviderInfo, RetryInfo, StreamChatResult, ToolCall, apiFetch, describeHttpError, readSSE,
+	AgentRequest, AgentStep, ApiFetchOptions, ChatMessage, ChatProvider, ChatRequest, FinishReason,
+	ModelEntry, ProviderInfo, RetryInfo, STREAM_FETCH_OPTS, StreamChatResult, ToolCall, apiFetch,
+	describeHttpError, normalizeFinishReason, readSSE, retryNotice,
 } from './types';
 
 /**
@@ -52,33 +53,23 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 	}
 
 	/**
-	 * Streaming chat POSTs get a longer first-byte window than the 60s default: free
-	 * tiers (notably NVIDIA's) queue requests server-side and can take well over a
-	 * minute to start responding on busy or cold models. One retry only — retrying a
-	 * queued request just re-enters the same queue.
+	 * Fetch options for a streaming POST, augmented with an `onRetry` hook that reports a
+	 * short, transient notice (rate limit / slow start) so an auto-retry doesn't look like
+	 * a silent hang. 429 gets its own patient budget inside {@link apiFetch}.
 	 */
-	private static readonly STREAM_FETCH_OPTS = { timeoutMs: 150_000, retries: 1 } as const;
+	private streamFetchOpts(onNotice?: (text: string) => void): ApiFetchOptions {
+		return {
+			...STREAM_FETCH_OPTS,
+			onRetry: (info: RetryInfo) => onNotice?.(retryNotice(this.info.label, info)),
+		};
+	}
 
 	/**
-	 * Fetch options for a streaming POST, augmented with an `onRetry` hook that streams a
-	 * short, transient notice (rate limit / slow start) to the user via `onToken` so an
-	 * auto-retry doesn't look like a silent hang. 429 gets its own patient budget inside
-	 * {@link apiFetch}.
+	 * Which field caps the reply for this model. OpenAI's reasoning models (o-series,
+	 * gpt-5) reject the legacy `max_tokens` outright with HTTP 400.
 	 */
-	private streamFetchOpts(onToken?: (delta: string) => void): ApiFetchOptions {
-		return {
-			...OpenAICompatibleProvider.STREAM_FETCH_OPTS,
-			onRetry: (info: RetryInfo) => {
-				if (!onToken) {
-					return;
-				}
-				const secs = Math.max(1, Math.ceil(info.delayMs / 1000));
-				const why = info.reason === 'rate-limit' ? `Rate limited by ${this.info.label}`
-					: info.reason === 'timeout' ? `${this.info.label} is slow to start`
-						: 'Transient error';
-				onToken(`\n\n> ⏳ ${why} — retrying in ${secs}s…\n\n`);
-			},
-		};
+	protected tokenLimitField(model: string): string {
+		return /^(o[1-9]|gpt-5)/i.test(model) ? 'max_completion_tokens' : 'max_tokens';
 	}
 
 	async streamChat(request: ChatRequest): Promise<StreamChatResult> {
@@ -88,11 +79,11 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 			body: JSON.stringify({
 				model: request.model,
 				messages: request.messages.map(m => serializeMessage(m, this.allowsContentWithToolCalls())),
-				max_tokens: request.maxTokens,
+				[this.tokenLimitField(request.model)]: request.maxTokens,
 				stream: true,
 				...this.extraBody(),
 			}),
-		}, request.signal, this.streamFetchOpts(request.onToken));
+		}, request.signal, this.streamFetchOpts(request.onNotice));
 
 		if (!response.ok) {
 			throw new Error(await describeHttpError(this.info.label, response));
@@ -103,11 +94,14 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 		// models look dead for minutes; surface it, separated from the final answer.
 		let phase: 'idle' | 'reasoning' | 'answer' = 'idle';
 		let truncated = false;
+		let finishReason: FinishReason | undefined;
 		await readSSE(response, data => {
 			try {
 				const json = JSON.parse(data);
-				if (json?.choices?.[0]?.finish_reason === 'length') {
-					truncated = true;
+				const raw = json?.choices?.[0]?.finish_reason;
+				if (raw) {
+					finishReason = normalizeFinishReason(raw);
+					truncated = finishReason === 'length';
 				}
 				const delta = json?.choices?.[0]?.delta;
 				const reasoning: string | undefined = delta?.reasoning_content;
@@ -129,8 +123,8 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 			} catch {
 				// Skip malformed chunks.
 			}
-		}, request.signal);
-		return { truncated };
+		}, request.signal, { label: this.info.label, sawTerminal: () => finishReason !== undefined });
+		return { truncated, finishReason };
 	}
 
 	async listModels(apiKey: string, baseUrl: string, signal: AbortSignal): Promise<ModelEntry[]> {
@@ -155,7 +149,7 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 			body: JSON.stringify({
 				model: request.model,
 				messages: request.messages.map(m => serializeMessage(m, this.allowsContentWithToolCalls())),
-				max_tokens: request.maxTokens,
+				[this.tokenLimitField(request.model)]: request.maxTokens,
 				tools: request.tools.map(t => ({
 					type: 'function',
 					function: { name: t.name, description: t.description, parameters: t.parameters },
@@ -164,7 +158,7 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 				stream: true,
 				...this.extraBody(),
 			}),
-		}, request.signal, this.streamFetchOpts(request.onToken));
+		}, request.signal, this.streamFetchOpts(request.onNotice));
 
 		if (!response.ok) {
 			throw new Error(await describeHttpError(this.info.label, response));
@@ -175,6 +169,7 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 		let content = '';
 		let reasoning = '';
 		let truncated = false;
+		let finishReason: FinishReason | undefined;
 		const acc = new Map<number, { id?: string; name?: string; args: string }>();
 		await readSSE(response, data => {
 			let json: any;
@@ -183,8 +178,10 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 			} catch {
 				return;
 			}
-			if (json?.choices?.[0]?.finish_reason === 'length') {
-				truncated = true;
+			const raw = json?.choices?.[0]?.finish_reason;
+			if (raw) {
+				finishReason = normalizeFinishReason(raw);
+				truncated = finishReason === 'length';
 			}
 			const delta = json?.choices?.[0]?.delta;
 			if (!delta) {
@@ -213,7 +210,7 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 				if (typeof tc.function?.arguments === 'string') { cur.args += tc.function.arguments; }
 				acc.set(index, cur);
 			}
-		}, request.signal);
+		}, request.signal, { label: this.info.label, sawTerminal: () => finishReason !== undefined });
 
 		const toolCalls: ToolCall[] = [...acc.entries()]
 			.sort((a, b) => a[0] - b[0])
@@ -228,7 +225,7 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 			});
 		// A reasoning model that produced no answer and no tool calls would otherwise
 		// yield an empty step; fall back to its reasoning so the agent loop can react.
-		return { content: content || (toolCalls.length ? '' : reasoning), toolCalls, truncated };
+		return { content: content || (toolCalls.length ? '' : reasoning), toolCalls, truncated, finishReason };
 	}
 }
 

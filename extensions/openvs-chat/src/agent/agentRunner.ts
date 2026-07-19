@@ -6,11 +6,54 @@
 import { McpToolset } from '../mcp/manager';
 import { SUBAGENT_PREAMBLE } from '../persona/prompts';
 import { TodoItem, UPDATE_TODOS_TOOL, parseTodoUpdate } from '../persona/todos';
-import { CONTINUE_PROMPT, ChatProvider, ChatMessage, ToolCall, ToolSpec } from '../providers/types';
+import { AgentStep, CONTINUE_PROMPT, ChatProvider, ChatMessage, ToolCall, ToolSpec } from '../providers/types';
+import { isContextLengthError, trimMessages } from './context';
 import { Guardrails, autoApproves, loadGuardrails } from './guardrails';
 import { AGENT_TOOLS, READ_ONLY_TOOL_NAMES, SPAWN_SUBAGENT_TOOL, ToolApprover, executeTool } from './tools';
 
 const MCP_PREFIX = 'mcp__';
+
+/**
+ * Why a run ended. Every terminal path maps onto one of these so the UI can always
+ * tell the user *why* it stopped — a run that just goes quiet is a bug, not an outcome.
+ */
+export type StopReason = 'done' | 'limit' | 'truncated' | 'filtered' | 'refused';
+
+/** The outcome of {@link AgentRunner.run}. */
+export interface RunResult {
+	readonly reason: StopReason;
+	/** Human-readable explanation shown to the user for non-`done` outcomes. */
+	readonly detail?: string;
+}
+
+/**
+ * How many consecutive max-token cutoffs are auto-resumed before giving up. These
+ * rounds deliberately don't consume the step budget: being cut off mid-sentence is
+ * the model making progress, not the model spending a turn.
+ */
+const MAX_TRUNCATION_ROUNDS = 8;
+
+/**
+ * Estimated-token ceiling for the conversation sent each step. Well under the window of
+ * every current tool-capable model, leaving room for the estimate being approximate and
+ * for the model's own reply.
+ */
+const DEFAULT_CONTEXT_TOKENS = 120_000;
+
+/** Floor for the adaptive budget, so repeated shrinking can't starve the conversation. */
+const MIN_CONTEXT_TOKENS = 8_000;
+
+/**
+ * Injected when a step produces prose but no tool call. Models routinely narrate a
+ * next action ("now I'll update the config") without performing it; treating that as
+ * "finished" was the main cause of runs stopping mid-task. One nudge per quiet
+ * stretch — if the model stays quiet after being asked, it really is done.
+ */
+const COMPLETION_CHECK_PROMPT =
+	'Before you finish: if the task is fully complete and verified, reply with a brief final ' +
+	'summary of what changed. If ANY part remains — files still to edit, commands still to run, ' +
+	'unchecked items on your checklist, or a next step you just described — do it now with your ' +
+	'tools instead of summarizing. Do not ask permission to continue; keep working.';
 
 export interface AgentCallbacks {
 	/** A new model step is beginning (open a fresh streaming bubble). */
@@ -58,6 +101,8 @@ interface AgentOptions {
 	 * without the run being restarted.
 	 */
 	steering?: () => string[];
+	/** Estimated-token ceiling for the conversation sent each step. 0 disables trimming. */
+	maxContextTokens?: number;
 }
 
 /**
@@ -74,6 +119,7 @@ export class AgentRunner {
 	private readonly readOnly: boolean;
 	private readonly mcp?: McpToolset;
 	private readonly steering?: () => string[];
+	private contextBudget: number;
 
 	constructor(
 		private readonly provider: ChatProvider,
@@ -87,6 +133,7 @@ export class AgentRunner {
 		this.readOnly = opts?.readOnly ?? false;
 		this.mcp = opts?.mcp;
 		this.steering = opts?.steering;
+		this.contextBudget = opts?.maxContextTokens ?? DEFAULT_CONTEXT_TOKENS;
 	}
 
 	/** The tools offered this run: read-only set for research sub-agents; otherwise the full set, plus delegation and any MCP tools. */
@@ -107,14 +154,16 @@ export class AgentRunner {
 		return base;
 	}
 
-	async run(seed: ChatMessage[], params: AgentParams, callbacks: AgentCallbacks): Promise<void> {
+	async run(seed: ChatMessage[], params: AgentParams, callbacks: AgentCallbacks): Promise<RunResult> {
 		if (!this.provider.runAgentStep) {
 			throw new Error(`${this.provider.info.label} does not support Agent mode.`);
 		}
 
 		const messages: ChatMessage[] = [...seed];
+		let truncationRounds = 0;
+		let nudged = false;
 
-		for (let step = 0; step < this.maxSteps; step++) {
+		for (let step = 0; step < this.maxSteps;) {
 			if (params.signal.aborted) {
 				throw new DOMException('Aborted', 'AbortError');
 			}
@@ -125,29 +174,51 @@ export class AgentRunner {
 			}
 
 			callbacks.onStepStart();
-			const result = await this.provider.runAgentStep({
-				messages,
-				tools: this.tools(),
-				model: params.model,
-				apiKey: params.apiKey,
-				baseUrl: params.baseUrl,
-				maxTokens: params.maxTokens,
-				signal: params.signal,
-				onToken: delta => callbacks.onToken(delta),
-			});
+			const result = await this.step(messages, params, callbacks);
 			callbacks.onStepEnd(result.content);
 
 			messages.push({ role: 'assistant', content: result.content, toolCalls: result.toolCalls });
 
+			// A provider-side block ends the run, but must never be mistaken for success.
+			if (result.finishReason === 'filtered' || result.finishReason === 'refused') {
+				return {
+					reason: result.finishReason,
+					detail: result.finishReason === 'filtered'
+						? 'The provider blocked this response with its content filter. Rephrase the request or switch models.'
+						: 'The model refused to continue with this request.',
+				};
+			}
+
 			if (!result.toolCalls.length) {
-				// A text-only step cut off by the max-token limit isn't the model being
-				// done — ask it to resume where it stopped (costs one step of budget).
-				if (result.truncated && result.content) {
+				// Cut off by the token limit mid-answer: resume where it stopped. This is
+				// the model making progress, so it doesn't spend a step of the budget.
+				if (result.truncated) {
+					if (truncationRounds >= MAX_TRUNCATION_ROUNDS) {
+						return {
+							reason: 'truncated',
+							detail: `The model kept hitting its output limit after ${MAX_TRUNCATION_ROUNDS} continuations. Raise "openvsChat.maxTokens" or ask for a smaller piece of work.`,
+						};
+					}
+					truncationRounds++;
 					messages.push({ role: 'user', content: CONTINUE_PROMPT });
 					continue;
 				}
-				return; // Model is done.
+				// In write-capable Agent mode, prose with no tool call usually means the model
+				// described a next action instead of taking it — ask once before believing
+				// it's done. Read-only Ask/Plan and research sub-agents legitimately end with
+				// a prose answer, so they finish immediately (no wasted round).
+				if (!this.readOnly && !nudged) {
+					nudged = true;
+					step++;
+					messages.push({ role: 'user', content: COMPLETION_CHECK_PROMPT });
+					continue;
+				}
+				return { reason: 'done' };
 			}
+
+			truncationRounds = 0;
+			nudged = false;
+			step++;
 
 			const outcomes = await this.runTools(result.toolCalls, params, callbacks);
 			for (const { call, result: toolResult } of outcomes) {
@@ -155,7 +226,45 @@ export class AgentRunner {
 			}
 		}
 
-		callbacks.onNote(`Reached the ${this.maxSteps}-step limit. Send "continue" to keep going.`);
+		return {
+			reason: 'limit',
+			detail: `Reached the ${this.maxSteps}-step limit. Send "continue" to keep going, or raise "openvsChat.agent.maxSteps".`,
+		};
+	}
+
+	/**
+	 * Asks the model for one step, keeping the conversation inside the context budget.
+	 * If the provider still rejects it as too long, the budget is halved and the step is
+	 * retried once — a run should shed old file dumps rather than die on a 400.
+	 */
+	private async step(
+		messages: ChatMessage[],
+		params: AgentParams,
+		callbacks: AgentCallbacks,
+	): Promise<AgentStep> {
+		const ask = (budget: number) => this.provider.runAgentStep!({
+			messages: trimMessages(messages, budget),
+			tools: this.tools(),
+			model: params.model,
+			apiKey: params.apiKey,
+			baseUrl: params.baseUrl,
+			maxTokens: params.maxTokens,
+			signal: params.signal,
+			onToken: delta => callbacks.onToken(delta),
+			onNotice: text => callbacks.onNote(text),
+		});
+		try {
+			return await ask(this.contextBudget);
+		} catch (err) {
+			if (!(err instanceof Error) || !isContextLengthError(err.message)) {
+				throw err;
+			}
+			// The estimate was optimistic for this model; keep the smaller budget for the
+			// rest of the run so every later step stays inside the real window.
+			this.contextBudget = Math.max(MIN_CONTEXT_TOKENS, Math.floor(this.contextBudget / 2));
+			callbacks.onNote(`The conversation outgrew the model's context window — trimming older tool output and retrying.`);
+			return ask(this.contextBudget);
+		}
 	}
 
 	/** Executes a step's tool calls: normal tools sequentially, sub-agents with parallel research. */
@@ -197,7 +306,7 @@ export class AgentRunner {
 		if (spawnCalls.length) {
 			const runOne = async (call: ToolCall) => {
 				callbacks.onToolStart(call);
-				const { result, isError } = await this.runSubagent(call, params);
+				const { result, isError } = await this.runSubagent(call, params, callbacks);
 				callbacks.onToolEnd(call, result, isError);
 				return { call, result, isError };
 			};
@@ -232,7 +341,11 @@ export class AgentRunner {
 	}
 
 	/** Runs a nested sub-agent for one delegation call, returning its summary as the tool result. */
-	private async runSubagent(call: ToolCall, params: AgentParams): Promise<{ result: string; isError: boolean }> {
+	private async runSubagent(
+		call: ToolCall,
+		params: AgentParams,
+		callbacks: AgentCallbacks,
+	): Promise<{ result: string; isError: boolean }> {
 		const goal = String(call.args.goal ?? '').trim();
 		const readOnly = call.args.readOnly === true;
 		if (!goal) {
@@ -252,8 +365,9 @@ export class AgentRunner {
 
 		const log: string[] = [];
 		let finalText = '';
+		let outcome: RunResult;
 		try {
-			await child.run(
+			outcome = await child.run(
 				[
 					{ role: 'system', content: subagentSystem(readOnly) },
 					{ role: 'user', content: goal },
@@ -265,15 +379,28 @@ export class AgentRunner {
 					onStepEnd: content => { if (content) { finalText = content; log.push(content); } },
 					onToolStart: c => log.push(`• ${c.name}(${shortArgs(c.args)})`),
 					onToolEnd: (_c, r, e) => log.push(`  ${e ? '⚠ ' : ''}${truncate(r, 300)}`),
-					onNote: t => log.push(t),
+					// Surfaced to the user too: a sub-agent that quietly ran out of budget
+					// used to be invisible, leaving its half-done work unexplained.
+					onNote: t => { log.push(t); callbacks.onNote(`Sub-agent: ${t}`); },
 				},
 			);
 		} catch (err) {
+			// An abort belongs to the whole run, not to this delegation — let it propagate
+			// instead of being reported to the model as a failed tool call.
+			if (err instanceof DOMException && err.name === 'AbortError') {
+				throw err;
+			}
 			return { result: `Sub-agent failed: ${err instanceof Error ? err.message : String(err)}`, isError: true };
 		}
 
 		const summary = finalText || '(sub-agent produced no summary)';
-		return { result: `${summary}\n\n[sub-agent activity]\n${truncate(log.join('\n'), 1500)}`, isError: false };
+		// The parent must know when the child stopped short, or it will treat a partial
+		// result as complete.
+		const unfinished = outcome.reason === 'done' ? '' : `\n\n[sub-agent stopped early: ${outcome.detail ?? outcome.reason}]`;
+		return {
+			result: `${summary}${unfinished}\n\n[sub-agent activity]\n${truncate(log.join('\n'), 1500)}`,
+			isError: false,
+		};
 	}
 }
 

@@ -176,7 +176,7 @@ export class AutoOrchestrator {
 		if (!provider) {
 			throw new Error(`${assignment.roleLabel} provider "${assignment.providerId}" is unavailable.`);
 		}
-		const { text } = await streamChatWithContinuation(provider, {
+		const { text, truncated } = await streamChatWithContinuation(provider, {
 			messages,
 			model: assignment.model,
 			apiKey: await this.apiKey(assignment.providerId),
@@ -184,7 +184,13 @@ export class AutoOrchestrator {
 			maxTokens,
 			signal,
 			onToken: delta => cb.token(delta),
+			onNotice: text => cb.note(text),
 		});
+		if (truncated) {
+			// A cut-off plan or review feeds the next phase; say so rather than passing a
+			// half-finished document downstream silently.
+			cb.note(`The ${assignment.roleLabel} output is still incomplete after several continuations — raise "openvsChat.maxTokens" for a fuller result.`);
+		}
 		return text;
 	}
 
@@ -212,7 +218,7 @@ export class AutoOrchestrator {
 			cb.phase('code', a, false);
 			const runner = new AgentRunner(provider, this.approver, this.maxSteps, { mcp: this.mcp });
 			try {
-				await runner.run(
+				const outcome = await runner.run(
 					seed,
 					{
 						model: a.model,
@@ -223,6 +229,9 @@ export class AutoOrchestrator {
 					},
 					agentCallbacks(cb, sink),
 				);
+				if (outcome.reason !== 'done' && outcome.detail) {
+					cb.note(outcome.detail);
+				}
 				return;
 			} catch (err) {
 				if (signal.aborted) {
@@ -276,7 +285,7 @@ export class AutoOrchestrator {
 			}
 			cb.note(`Step ${i + 1}/${steps.length}: ${steps[i]}`);
 			const runner = new AgentRunner(provider, this.approver, this.maxSteps, { budget, mcp: this.mcp });
-			await runner.run(
+			const outcome = await runner.run(
 				[
 					{ role: 'system', content: codeSystem(params.baseSystemPrompt) },
 					...ctxMessages,
@@ -286,6 +295,9 @@ export class AutoOrchestrator {
 				runParams,
 				agentCallbacks(cb, sink),
 			);
+			if (outcome.reason !== 'done' && outcome.detail) {
+				cb.note(`Step ${i + 1} stopped early — ${outcome.detail}`);
+			}
 		}
 	}
 
