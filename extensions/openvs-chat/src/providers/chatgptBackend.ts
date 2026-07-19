@@ -112,6 +112,8 @@ function systemText(messages: ChatMessage[]): string {
 interface StreamResult {
 	content: string;
 	toolCalls: ToolCall[];
+	/** True when the response stopped because it hit the model's output-token ceiling. */
+	truncated: boolean;
 }
 
 async function streamResponses(
@@ -131,6 +133,7 @@ async function streamResponses(
 	}
 
 	let content = '';
+	let truncated = false;
 	const toolCalls: ToolCall[] = [];
 	await readSSE(response, data => {
 		let event: any;
@@ -159,22 +162,28 @@ async function streamResponses(
 				}
 				break;
 			}
+			case 'response.incomplete':
+				if (event?.response?.incomplete_details?.reason === 'max_output_tokens') {
+					truncated = true;
+				}
+				break;
 			case 'response.failed':
 			case 'error':
 				throw new Error(`${label}: ${event?.response?.error?.message ?? event?.message ?? 'stream error'}`);
 		}
 	}, signal);
-	return { content, toolCalls };
+	return { content, toolCalls, truncated };
 }
 
-export async function chatgptStreamChat(label: string, request: ChatRequest): Promise<void> {
-	await streamResponses(label, request.apiKey, {
+export async function chatgptStreamChat(label: string, request: ChatRequest): Promise<{ truncated: boolean }> {
+	const { truncated } = await streamResponses(label, request.apiKey, {
 		model: normalizeModel(request.model),
 		instructions: systemText(request.messages),
 		input: toInputItems(request.messages),
 		store: false,
 		stream: true,
 	}, request.signal, request.onToken);
+	return { truncated };
 }
 
 export async function chatgptAgentStep(label: string, request: AgentRequest): Promise<AgentStep> {

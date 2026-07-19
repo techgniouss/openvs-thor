@@ -986,3 +986,19 @@ body.settings-window #settingsPanel {
 @media (prefers-reduced-motion: reduce) {
 	.working-word { animation: none; }
 }
+
+/* ---- Agent task checklist ---- */
+.todo-panel {
+	margin: 6px 8px 0;
+	padding: 6px 10px;
+	border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.35));
+	border-radius: 6px;
+	font-size: 12px;
+	background: var(--vscode-editorWidget-background);
+}
+.todo-panel.hidden { display: none; }
+.todo-title { font-weight: 600; margin-bottom: 4px; opacity: 0.8; }
+.todo-item { display: flex; gap: 6px; padding: 1px 0; align-items: baseline; }
+.todo-icon { flex: none; }
+.todo-completed { opacity: 0.55; text-decoration: line-through; }
+.todo-in_progress { font-weight: 600; }

@@ -5,7 +5,7 @@
 
 import { CHATGPT_MODELS, chatgptAgentStep, chatgptStreamChat, isChatGptToken } from './chatgptBackend';
 import { OpenAICompatibleProvider } from './openaiCompatible';
-import { AgentRequest, AgentStep, ChatRequest, ModelEntry, ProviderInfo } from './types';
+import { AgentRequest, AgentStep, ChatRequest, ModelEntry, ProviderInfo, StreamChatResult } from './types';
 
 /**
  * Provider for the OpenAI Chat Completions API (and any OpenAI-compatible endpoint,
@@ -27,7 +27,7 @@ export class OpenAIProvider extends OpenAICompatibleProvider {
 		visionModelPatterns: ['gpt-4o', 'gpt-4\\.1', 'gpt-4-turbo', 'gpt-5', '^o[0-9]'],
 	};
 
-	override async streamChat(request: ChatRequest): Promise<void> {
+	override async streamChat(request: ChatRequest): Promise<StreamChatResult> {
 		if (isChatGptToken(request.apiKey)) {
 			return chatgptStreamChat(this.info.label, request);
 		}

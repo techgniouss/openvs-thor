@@ -11,8 +11,11 @@ import { AUTO_ROLES, AutoRole, RoleRouter } from './auto/router';
 import { WebAuthManager } from './auth';
 import { McpManager } from './mcp/manager';
 import { supportsNativeSignIn } from './oauth';
+import { buildEnvContext } from './persona/envContext';
+import { modeDoctrine, personaBase } from './persona/prompts';
+import { ThinkingStreamParser, formatThinking } from './persona/thinking';
 import { ProviderRegistry } from './providers/registry';
-import { ChatMessage, ChatProvider, ModelEntry, entrySupportsTools, modelSupportsVision } from './providers/types';
+import { ChatMessage, ChatProvider, ModelEntry, entrySupportsTools, modelSupportsVision, streamChatWithContinuation } from './providers/types';
 import { RulesProvider } from './rules';
 import { SkillRegistry } from './skills';
 
@@ -110,7 +113,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 
 	/** The base system prompt: project rules + the configured system prompt + all active skills. */
 	private async baseSystem(): Promise<string> {
-		let base = await this.rules.composeSystem(this.registry.getSystemPrompt());
+		const env = vscode.workspace.getConfiguration('openvsChat').get<boolean>('persona.environment') !== false ? await buildEnvContext() : '';
+		let base = await this.rules.composeSystem(personaBase(env, this.registry.getSystemPrompt()));
 		for (const skillId of this.activeSkillIds()) {
 			const skill = await this.skills.get(skillId);
 			if (skill?.instructions) {
@@ -766,21 +770,33 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 				const maxSteps = vscode.workspace.getConfiguration('openvsChat').get<number>('agent.maxSteps') ?? 12;
 				await this.mcp.ensureStarted();
 				const orchestrator = new AutoOrchestrator(this.registry, this.router, this, maxSteps, this.mcp);
+				let stepThinking: ThinkingStreamParser | undefined;
+				post({ type: 'todos', items: [] });
 				await orchestrator.run(
 					{ history, contextText, baseSystemPrompt: await this.baseSystem(), signal: controller.signal },
 					{
-						phase: (role, a, streaming) => post({
-							type: 'autoPhase', role, label: a.roleLabel,
-							provider: a.providerLabel, model: a.model, source: a.source, streaming,
-						}),
-						token: delta => post({ type: 'token', delta }),
-						agentStepStart: () => post({ type: 'agentStepStart' }),
-						agentStepEnd: content => post({ type: 'agentStepEnd', content }),
+						phase: (role, a, streaming) => {
+							stepThinking?.flush();
+							stepThinking = streaming ? new ThinkingStreamParser(text => post({ type: 'token', delta: text })) : undefined;
+							post({
+								type: 'autoPhase', role, label: a.roleLabel,
+								provider: a.providerLabel, model: a.model, source: a.source, streaming,
+							});
+						},
+						token: delta => stepThinking ? stepThinking.push(delta) : post({ type: 'token', delta }),
+						agentStepStart: () => {
+							stepThinking?.flush();
+							stepThinking = new ThinkingStreamParser(text => post({ type: 'token', delta: text }));
+							post({ type: 'agentStepStart' });
+						},
+						agentStepEnd: content => { stepThinking?.flush(); stepThinking = undefined; post({ type: 'agentStepEnd', content: formatThinking(content) }); },
 						onToolStart: call => post({ type: 'toolStart', id: call.id, name: call.name, args: call.args }),
 						onToolEnd: (call, result, isError) => post({ type: 'toolEnd', id: call.id, name: call.name, result, isError }),
 						note: text => post({ type: 'info', message: text }),
+						onTodos: items => post({ type: 'todos', items }),
 					},
 				);
+				stepThinking?.flush();
 			} else {
 				// Ask/Plan → planning/reasoning model; inline Edit → implementation model.
 				const role: AutoRole = mode === 'edit' ? 'code' : 'plan';
@@ -834,12 +850,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		mode: ChatMode,
 		post: SessionPost,
 	): Promise<void> {
-		let full = '';
-		await provider.streamChat({
+		// Streams with transparent auto-continuation: a max-token cutoff is resumed
+		// in place (Claude-style) instead of the reply stopping midway.
+		const thinking = new ThinkingStreamParser(text => post({ type: 'token', delta: text }));
+		const { text: full } = await streamChatWithContinuation(provider, {
 			messages,
 			...params,
-			onToken: delta => { full += delta; post({ type: 'token', delta }); },
+			onToken: delta => thinking.push(delta),
 		});
+		thinking.flush();
 		if (mode === 'edit') {
 			// An odd number of ``` fences means the response was cut off mid code-block
 			// (almost always hitting the max-tokens limit on a large file). Surface that
@@ -889,10 +908,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 	): Promise<void> {
 		const configured = vscode.workspace.getConfiguration('openvsChat').get<number>('agent.maxSteps') ?? 12;
 		const runner = new AgentRunner(provider, this, Math.min(configured, 8), { readOnly: true });
+		let stepThinking: ThinkingStreamParser | undefined;
 		await runner.run(messages, params, {
-			onStepStart: () => post({ type: 'agentStepStart' }),
-			onToken: delta => post({ type: 'token', delta }),
-			onStepEnd: content => post({ type: 'agentStepEnd', content }),
+			onStepStart: () => { stepThinking = new ThinkingStreamParser(text => post({ type: 'token', delta: text })); post({ type: 'agentStepStart' }); },
+			onToken: delta => stepThinking?.push(delta),
+			onStepEnd: content => { stepThinking?.flush(); stepThinking = undefined; post({ type: 'agentStepEnd', content: formatThinking(content) }); },
 			onToolStart: call => post({ type: 'toolStart', id: call.id, name: call.name, args: call.args }),
 			onToolEnd: (call, result, isError) =>
 				post({ type: 'toolEnd', id: call.id, name: call.name, result, isError }),
@@ -930,14 +950,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 				return queued;
 			},
 		});
+		let stepThinking: ThinkingStreamParser | undefined;
+		post({ type: 'todos', items: [] });
 		await runner.run(messages, params, {
-			onStepStart: () => post({ type: 'agentStepStart' }),
-			onToken: delta => post({ type: 'token', delta }),
-			onStepEnd: content => post({ type: 'agentStepEnd', content }),
+			onStepStart: () => { stepThinking = new ThinkingStreamParser(text => post({ type: 'token', delta: text })); post({ type: 'agentStepStart' }); },
+			onToken: delta => stepThinking?.push(delta),
+			onStepEnd: content => { stepThinking?.flush(); stepThinking = undefined; post({ type: 'agentStepEnd', content: formatThinking(content) }); },
 			onToolStart: call => post({ type: 'toolStart', id: call.id, name: call.name, args: call.args }),
 			onToolEnd: (call, result, isError) =>
 				post({ type: 'toolEnd', id: call.id, name: call.name, result, isError }),
 			onNote: text => post({ type: 'info', message: text }),
+			onTodos: items => post({ type: 'todos', items }),
 		});
 	}
 
@@ -956,25 +979,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 	}
 
 	private buildSystemPrompt(mode: ChatMode, base: string, inline = false, readTools = false): string {
-		if (mode === 'edit') {
-			if (inline) {
-				return `${base}\n\nEDIT mode on a code selection. Return ONLY the revised code in one fenced block — no surrounding file, no commentary outside it.`;
-			}
-			return `${base}\n\nEDIT mode. The user gives a file; return the COMPLETE updated file in one fenced block, no commentary outside it unless asked.`;
-		}
-		if (mode === 'agent') {
-			return `${base}\n\nAGENT mode: you have tools to read, list, create and edit files and run commands in the workspace. Own the task — plan briefly, then execute: read what you need, write or edit files, run builds/tests to verify. Ask only when truly ambiguous; when done, summarize what changed. ${ChatViewProvider.CONCISE}`;
-		}
-		if (mode === 'plan') {
-			const tools = readTools
-				? ' You have READ-ONLY tools (read_file, list_dir, search_files) — use them to ground the plan in the real files before writing it.'
-				: '';
-			return `${base}\n\nPLAN mode.${tools} Produce a concrete plan for exactly the stated requirement: goal, assumptions, ordered steps naming the files/components each touches, and risks or open questions. Do NOT write full implementations or whole files, and never claim to have made changes — you can only plan. If ambiguous, state the interpretation you planned for. ${ChatViewProvider.CONCISE}`;
-		}
-		const tools = readTools
-			? ' You have READ-ONLY tools (read_file, list_dir, search_files) — use them freely to open, explore, trace and debug any file, not just the ones the user has open.'
-			: '';
-		return `${base}\n\nASK mode (read-only).${tools} Answer directly, grounded in the actual code when relevant. You cannot modify files or run commands — if a change is needed, describe it and suggest switching to Agent mode. ${ChatViewProvider.CONCISE}`;
+		const thinking = vscode.workspace.getConfiguration('openvsChat').get<boolean>('persona.thinking') !== false;
+		return `${base}\n\n${modeDoctrine(mode, { inline, readTools, thinking })}\n\n${ChatViewProvider.CONCISE}`;
 	}
 
 	private async resolveContext(mode: ChatMode, attached?: AttachedContext): Promise<AttachedContext | undefined> {

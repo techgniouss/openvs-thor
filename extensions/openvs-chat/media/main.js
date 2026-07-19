@@ -60,6 +60,32 @@
 	function cur() { return sessions.find(s => s.id === activeSessionId) || sessions[0]; }
 	function sessionFor(msg) { return sessions.find(s => s.id === msg.sessionId) || cur(); }
 
+	/** Known todo statuses; anything else from the host falls back to 'pending'. */
+	const TODO_STATUSES = ['pending', 'in_progress', 'completed'];
+
+	/** Renders the agent's task checklist for the active session (hidden when empty). */
+	function renderTodos() {
+		let panel = document.getElementById('todoPanel');
+		if (!panel) {
+			panel = document.createElement('div');
+			panel.id = 'todoPanel';
+			panel.className = 'todo-panel hidden';
+			els.messages.parentElement.insertBefore(panel, els.messages);
+		}
+		const items = (cur() && cur().todos) || [];
+		if (!items.length) {
+			panel.classList.add('hidden');
+			panel.innerHTML = '';
+			return;
+		}
+		const icon = s => s === 'completed' ? '●' : s === 'in_progress' ? '◐' : '○';
+		panel.innerHTML = '<div class="todo-title">Tasks</div>' + items.map(t => {
+			const status = TODO_STATUSES.includes(t.status) ? t.status : 'pending';
+			return `<div class="todo-item todo-${status}"><span class="todo-icon">${icon(status)}</span>${escapeHtml(t.content)}</div>`;
+		}).join('');
+		panel.classList.remove('hidden');
+	}
+
 	const $ = (id) => /** @type {HTMLElement} */ (document.getElementById(id));
 	const els = {
 		modeSelect: /** @type {HTMLSelectElement} */ ($('modeSelect')),
@@ -258,6 +284,7 @@
 		els.messages.innerHTML = '';
 		activeAssistantBody = null;
 		toolEls.clear();
+		renderTodos();
 		const isEmpty = s.messages.length === 0 && s.pending == null;
 		els.messages.classList.toggle('is-empty', isEmpty);
 		if (isEmpty) {
@@ -407,7 +434,7 @@
 	const tabsEl = $('tabs');
 
 	function createSession(activate = true) {
-		const s = { id: newSessionId(), title: '', messages: [], streaming: false, pending: null, queue: [] };
+		const s = { id: newSessionId(), title: '', messages: [], streaming: false, pending: null, queue: [], todos: [] };
 		sessions.push(s);
 		if (activate) {
 			activeSessionId = s.id;
@@ -489,7 +516,7 @@
 		if (index === -1) { return; }
 		const item = history.splice(index, 1)[0];
 		syncHistory();
-		const s = { id: item.id, title: item.title, messages: item.messages, streaming: false, pending: null, queue: [] };
+		const s = { id: item.id, title: item.title, messages: item.messages, streaming: false, pending: null, queue: [], todos: [] };
 		sessions.push(s);
 		activeSessionId = s.id;
 		els.historyPanel.classList.add('hidden');
@@ -1325,6 +1352,7 @@
 		s.messages = [];
 		s.title = '';
 		s.pending = null;
+		s.todos = [];
 		currentContext = null;
 		pendingImages = [];
 		saveState();
@@ -1780,6 +1808,12 @@
 			case 'mcp':
 				renderMcpList(msg.status, msg.toolCount || 0);
 				break;
+			case 'todos': {
+				const s = sessionFor(msg);
+				s.todos = Array.isArray(msg.items) ? msg.items : [];
+				if (s.id === activeSessionId) { renderTodos(); }
+				break;
+			}
 			case 'info':
 				addNotice(sessionFor(msg), msg.message, false);
 				break;

@@ -6,8 +6,9 @@
 import { AgentCallbacks, AgentRunner } from '../agent/agentRunner';
 import { ToolApprover } from '../agent/tools';
 import { McpToolset } from '../mcp/manager';
+import { TodoItem } from '../persona/todos';
 import { ProviderRegistry } from '../providers/registry';
-import { ChatMessage, ToolCall } from '../providers/types';
+import { ChatMessage, ToolCall, streamChatWithContinuation } from '../providers/types';
 import { AutoRole, RoleAssignment, RoleRouter } from './router';
 
 /** Events the orchestrator emits as it moves through the plan → code → review phases. */
@@ -24,6 +25,8 @@ export interface AutoCallbacks {
 	onToolEnd(call: ToolCall, result: string, isError: boolean): void;
 	/** An informational note (skipped review, model fallback, step limit, …). */
 	note(text: string): void;
+	/** The implementer's visible checklist changed. */
+	onTodos?(items: TodoItem[]): void;
 }
 
 export interface AutoRunParams {
@@ -173,17 +176,16 @@ export class AutoOrchestrator {
 		if (!provider) {
 			throw new Error(`${assignment.roleLabel} provider "${assignment.providerId}" is unavailable.`);
 		}
-		let full = '';
-		await provider.streamChat({
+		const { text } = await streamChatWithContinuation(provider, {
 			messages,
 			model: assignment.model,
 			apiKey: await this.apiKey(assignment.providerId),
 			baseUrl: this.registry.getBaseUrl(assignment.providerId),
 			maxTokens,
 			signal,
-			onToken: delta => { full += delta; cb.token(delta); },
+			onToken: delta => cb.token(delta),
 		});
-		return full;
+		return text;
 	}
 
 	/** Runs the implementation tool-loop, falling back to the next inferred model on an early model error. */
@@ -301,6 +303,7 @@ function agentCallbacks(cb: AutoCallbacks, sink: ChangeSink): AgentCallbacks {
 		onToolStart: call => { recordChangeStart(sink, call); cb.onToolStart(call); },
 		onToolEnd: (call, result, isError) => { recordChangeEnd(sink, call, result, isError); cb.onToolEnd(call, result, isError); },
 		onNote: text => cb.note(text),
+		onTodos: items => cb.onTodos?.(items),
 	};
 }
 

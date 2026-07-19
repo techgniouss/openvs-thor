@@ -80,6 +80,17 @@ export interface AgentRequest {
 export interface AgentStep {
 	readonly content: string;
 	readonly toolCalls: ToolCall[];
+	/** True when the step was cut off by the max-token limit before the model finished. */
+	readonly truncated?: boolean;
+}
+
+/** The outcome of a completed {@link ChatProvider.streamChat} call. */
+export interface StreamChatResult {
+	/**
+	 * True when the response was cut off by the max-token limit (`finish_reason:
+	 * "length"` / `stop_reason: "max_tokens"`) rather than finishing naturally.
+	 */
+	readonly truncated: boolean;
 }
 
 export interface ProviderInfo {
@@ -107,6 +118,12 @@ export interface ProviderInfo {
 	 * where we can't enumerate vision-capable models in advance.
 	 */
 	readonly visionModelPatterns: string[];
+	/**
+	 * True when the backend continues a trailing assistant turn in place (Anthropic's
+	 * prefill). Lets {@link streamChatWithContinuation} resume a cut-off response
+	 * seamlessly instead of asking for a continuation in a new user turn.
+	 */
+	readonly supportsAssistantPrefill?: boolean;
 }
 
 /**
@@ -160,6 +177,66 @@ export function modelSupportsVision(info: ProviderInfo, model: string): boolean 
 }
 
 /**
+ * How many automatic continuation rounds {@link streamChatWithContinuation} will run
+ * after a max-token cutoff before giving up. Each round gets a full `maxTokens` budget,
+ * so even a very large file comfortably completes within this cap.
+ */
+const MAX_CONTINUATION_ROUNDS = 8;
+
+/**
+ * Injected as a user turn to resume a response that hit the max-token limit, for
+ * backends without assistant prefill. Worded to prevent the two classic continuation
+ * artifacts: re-sending earlier content and re-opening a fresh code fence.
+ */
+export const CONTINUE_PROMPT =
+	'Your previous message was cut off mid-response by the output token limit. ' +
+	'Continue EXACTLY where it stopped: output only the continuation, without repeating ' +
+	'any earlier content and without any preamble or apology. If it stopped inside a ' +
+	'fenced code block, continue the code directly — do not open a new fence.';
+
+/**
+ * Streams a chat completion and, whenever the provider reports a max-token cutoff,
+ * transparently requests a continuation and keeps streaming — so long responses (big
+ * code blocks, whole files) arrive as one seamless message instead of stopping midway.
+ * Uses assistant prefill when the backend supports it (Anthropic), otherwise replays
+ * the partial answer as an assistant turn followed by {@link CONTINUE_PROMPT}.
+ * Returns the full accumulated text and whether it is still truncated after the
+ * round budget was exhausted.
+ */
+export async function streamChatWithContinuation(
+	provider: ChatProvider,
+	request: ChatRequest,
+): Promise<{ text: string; truncated: boolean }> {
+	let full = '';
+	let messages = request.messages;
+	for (let round = 0; ; round++) {
+		let chunk = '';
+		const result = await provider.streamChat({
+			...request,
+			messages,
+			onToken: delta => { chunk += delta; request.onToken(delta); },
+		});
+		full += chunk;
+		const truncated = !!result?.truncated;
+		// An empty chunk means the model made no progress; bail rather than loop.
+		if (!truncated || !chunk || round >= MAX_CONTINUATION_ROUNDS) {
+			return { text: full, truncated };
+		}
+		if (provider.info.supportsAssistantPrefill) {
+			// A trailing assistant turn is continued in place. Trailing whitespace must be
+			// stripped — Anthropic rejects prefill content that ends with it (HTTP 400).
+			messages = [...request.messages, { role: 'assistant', content: full.replace(/\s+$/, '') }];
+		} else {
+			messages = [
+				...request.messages,
+				{ role: 'assistant', content: full },
+				{ role: 'user', content: CONTINUE_PROMPT },
+			];
+		}
+	}
+}
+
+/**
  * A chat provider knows how to stream a completion from a specific backend.
  * Implementations must be self-contained and only use the global `fetch`.
  */
@@ -167,9 +244,11 @@ export interface ChatProvider {
 	readonly info: ProviderInfo;
 	/**
 	 * Stream a chat completion. Resolves when the stream completes, rejects on error
-	 * (including abort, which throws a DOMException named 'AbortError').
+	 * (including abort, which throws a DOMException named 'AbortError'). Providers
+	 * that can detect a max-token cutoff resolve with a {@link StreamChatResult};
+	 * resolving with nothing means "assume the response finished naturally".
 	 */
-	streamChat(request: ChatRequest): Promise<void>;
+	streamChat(request: ChatRequest): Promise<StreamChatResult | void>;
 	/** List the models available for the given key (id + metadata), for the model dropdown. */
 	listModels(apiKey: string, baseUrl: string, signal: AbortSignal): Promise<ModelEntry[]>;
 	/** Run one agent step with tools. Only meaningful when `info.supportsTools` is true. */

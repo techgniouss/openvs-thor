@@ -44,8 +44,8 @@ export class RulesProvider {
 	}
 
 	/**
-	 * Composes a full system prompt: rules first (highest priority), then the base prompt.
-	 * Used as the foundation every mode builds on.
+	 * Composes a full system prompt: the base/identity prompt leads, with project rules
+	 * appended after it. Used as the foundation every mode builds on.
 	 */
 	async composeSystem(base: string): Promise<string> {
 		const rules = await this.getRules();

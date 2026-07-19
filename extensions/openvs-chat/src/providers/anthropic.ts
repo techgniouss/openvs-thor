@@ -5,7 +5,7 @@
 
 import {
 	AgentRequest, AgentStep, ChatMessage, ChatProvider, ChatRequest, ModelEntry, ProviderInfo,
-	ToolCall, apiFetch, describeHttpError, readSSE,
+	StreamChatResult, ToolCall, apiFetch, describeHttpError, readSSE,
 } from './types';
 
 const ANTHROPIC_VERSION = '2023-06-01';
@@ -32,19 +32,23 @@ export class AnthropicProvider implements ChatProvider {
 		id: 'anthropic',
 		label: 'Anthropic (Claude)',
 		suggestedModels: [
+			'claude-fable-5',
+			'claude-sonnet-5',
+			'claude-opus-4-8',
 			'claude-sonnet-4-5',
-			'claude-opus-4-5',
 			'claude-haiku-4-5',
-			'claude-sonnet-4-0',
-			'claude-3-5-haiku-latest',
 		],
 		apiKeyUrl: 'https://console.anthropic.com/settings/keys',
 		requiresApiKey: true,
 		supportsTools: true,
-		// Claude 3 and 4 families support tool use.
-		toolModelPatterns: ['claude-3', 'claude-[a-z]+-4', 'claude-4'],
-		// Every Claude 3/3.5/3.7/4 model is multimodal.
-		visionModelPatterns: ['claude-3', 'claude-[a-z]+-4', 'claude-4'],
+		// Every Claude 3+ family model supports tool use (claude-3-*, claude-sonnet-4,
+		// claude-opus-4-8, claude-fable-5, claude-mythos-5, future claude-*-6, ...).
+		toolModelPatterns: ['claude-3', 'claude-[a-z]+-[4-9]', 'claude-[4-9]'],
+		// Every Claude 3+ family model is multimodal.
+		visionModelPatterns: ['claude-3', 'claude-[a-z]+-[4-9]', 'claude-[4-9]'],
+		// The Messages API continues a trailing assistant turn in place (prefill),
+		// which gives seamless auto-continuation after a max-token cutoff.
+		supportsAssistantPrefill: true,
 	};
 
 	private url(baseUrl: string, path: string): string {
@@ -67,7 +71,7 @@ export class AnthropicProvider implements ChatProvider {
 		};
 	}
 
-	async streamChat(request: ChatRequest): Promise<void> {
+	async streamChat(request: ChatRequest): Promise<StreamChatResult> {
 		const { system, messages } = splitSystem(request.messages);
 		const response = await apiFetch(this.url(request.baseUrl, '/messages'), {
 			method: 'POST',
@@ -85,11 +89,14 @@ export class AnthropicProvider implements ChatProvider {
 			throw new Error(await describeHttpError(this.info.label, response));
 		}
 
+		let truncated = false;
 		await readSSE(response, data => {
 			try {
 				const json = JSON.parse(data);
 				if (json?.type === 'content_block_delta' && typeof json?.delta?.text === 'string') {
 					request.onToken(json.delta.text);
+				} else if (json?.type === 'message_delta' && json?.delta?.stop_reason === 'max_tokens') {
+					truncated = true;
 				} else if (json?.type === 'error') {
 					throw new Error(json?.error?.message ?? 'Anthropic stream error');
 				}
@@ -100,6 +107,7 @@ export class AnthropicProvider implements ChatProvider {
 				// Skip malformed chunks.
 			}
 		}, request.signal);
+		return { truncated };
 	}
 
 	async listModels(apiKey: string, baseUrl: string, signal: AbortSignal): Promise<ModelEntry[]> {
@@ -148,6 +156,7 @@ export class AnthropicProvider implements ChatProvider {
 		// Accumulate streamed content blocks: text deltas plus tool_use blocks whose JSON
 		// input arrives as incremental `input_json_delta` fragments.
 		let content = '';
+		let truncated = false;
 		const blocks = new Map<number, { type?: string; id?: string; name?: string; json: string }>();
 		await readSSE(response, data => {
 			let event: any;
@@ -155,6 +164,9 @@ export class AnthropicProvider implements ChatProvider {
 				event = JSON.parse(data);
 			} catch {
 				return;
+			}
+			if (event?.type === 'message_delta' && event?.delta?.stop_reason === 'max_tokens') {
+				truncated = true;
 			}
 			if (event?.type === 'content_block_start') {
 				const cb = event.content_block ?? {};
@@ -185,7 +197,7 @@ export class AnthropicProvider implements ChatProvider {
 				}
 				return { id: b.id ?? '', name: b.name ?? 'unknown', args: input };
 			});
-		return { content, toolCalls };
+		return { content, toolCalls, truncated };
 	}
 }
 

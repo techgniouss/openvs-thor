@@ -89,7 +89,7 @@ export class ProviderRegistry {
 	}
 
 	getMaxTokens(): number {
-		return vscode.workspace.getConfiguration('openvsChat').get<number>('maxTokens') ?? 2048;
+		return vscode.workspace.getConfiguration('openvsChat').get<number>('maxTokens') ?? 8192;
 	}
 
 	getSystemPrompt(): string {

@@ -64,6 +64,11 @@ dist
 .npmrc.local
 .netrc
 
+# openvs-chat experimental antigravity client secret (never commit the real value)
+extensions/openvs-chat/.secrets/*
+!extensions/openvs-chat/.secrets/*.example
+!extensions/openvs-chat/.secrets/README.md
+
 # OS junk
 desktop.ini
 ehthumbs.db
