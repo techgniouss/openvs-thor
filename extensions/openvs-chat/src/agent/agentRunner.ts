@@ -5,8 +5,10 @@
 
 import { McpToolset } from '../mcp/manager';
 import { SUBAGENT_PREAMBLE } from '../persona/prompts';
+import { stripThinking } from '../persona/thinking';
 import { TodoItem, UPDATE_TODOS_TOOL, parseTodoUpdate } from '../persona/todos';
 import { AgentStep, CONTINUE_PROMPT, ChatProvider, ChatMessage, ToolCall, ToolSpec } from '../providers/types';
+import { compactMessages, shouldCompact } from './compaction';
 import { isContextLengthError, trimMessages } from './context';
 import { Guardrails, autoApproves, loadGuardrails } from './guardrails';
 import { AGENT_TOOLS, READ_ONLY_TOOL_NAMES, SPAWN_SUBAGENT_TOOL, ToolApprover, executeTool } from './tools';
@@ -103,6 +105,8 @@ interface AgentOptions {
 	steering?: () => string[];
 	/** Estimated-token ceiling for the conversation sent each step. 0 disables trimming. */
 	maxContextTokens?: number;
+	/** Model context window in tokens; enables auto-compaction at 70% of it. 0/absent disables compaction. */
+	contextWindow?: number;
 }
 
 /**
@@ -119,6 +123,7 @@ export class AgentRunner {
 	private readonly readOnly: boolean;
 	private readonly mcp?: McpToolset;
 	private readonly steering?: () => string[];
+	private readonly contextWindow: number;
 	private contextBudget: number;
 
 	constructor(
@@ -134,6 +139,7 @@ export class AgentRunner {
 		this.mcp = opts?.mcp;
 		this.steering = opts?.steering;
 		this.contextBudget = opts?.maxContextTokens ?? DEFAULT_CONTEXT_TOKENS;
+		this.contextWindow = opts?.contextWindow ?? 0;
 	}
 
 	/** The tools offered this run: read-only set for research sub-agents; otherwise the full set, plus delegation and any MCP tools. */
@@ -171,6 +177,17 @@ export class AgentRunner {
 			// Course corrections typed while the previous step ran enter the loop here.
 			for (const note of this.steering?.() ?? []) {
 				messages.push({ role: 'user', content: note });
+			}
+
+			// Compact ahead of the hard budget: replace old middle turns with a summary
+			// once past the trigger share of the model's window, so the model keeps a
+			// coherent task memory instead of trim markers.
+			if (this.contextWindow && shouldCompact(messages, this.contextWindow, this.contextBudget)) {
+				const compacted = await this.compact(messages, params);
+				if (compacted) {
+					messages.splice(0, messages.length, ...compacted.messages);
+					callbacks.onNote(`Compacted the conversation (~${Math.round(compacted.before / 1000)}k → ~${Math.round(compacted.after / 1000)}k tokens).`);
+				}
 			}
 
 			callbacks.onStepStart();
@@ -265,6 +282,25 @@ export class AgentRunner {
 			callbacks.onNote(`The conversation outgrew the model's context window — trimming older tool output and retrying.`);
 			return ask(this.contextBudget);
 		}
+	}
+
+	/** Runs the summarizer through the same provider/model; failures return undefined so the run falls back to trimming. */
+	private async compact(messages: ChatMessage[], params: AgentParams) {
+		return compactMessages(messages, async (toSummarize, maxTokens) => {
+			let text = '';
+			await this.provider.streamChat({
+				messages: toSummarize,
+				model: params.model,
+				apiKey: params.apiKey,
+				baseUrl: params.baseUrl,
+				maxTokens,
+				signal: params.signal,
+				onToken: delta => { text += delta; },
+			});
+			// Reasoning models stream their chain of thought through onToken too;
+			// the stored summary must not carry it.
+			return stripThinking(text);
+		});
 	}
 
 	/** Executes a step's tool calls: normal tools sequentially, sub-agents with parallel research. */

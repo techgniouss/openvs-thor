@@ -9,15 +9,21 @@ import { ToolCall, ToolSpec } from '../providers/types';
 import { Guardrails, autoApproves, autoApprovesWrites, checkCommand, checkPath, loadGuardrails } from './guardrails';
 
 const MAX_FILE_BYTES = 100_000;
+/** Default character cap for one read_file result — a whole-file dump eats the context budget for the rest of the run. */
+const MAX_READ_CHARS = 48_000;
 
 /** The tools exposed to the model in Agent mode. */
 export const AGENT_TOOLS: ToolSpec[] = [
 	{
 		name: 'read_file',
-		description: 'Read the contents of a text file in the workspace. Paths are relative to the workspace root.',
+		description: 'Read a text file in the workspace. Paths are relative to the workspace root. Large files are returned in pages — pass offset/limit to read a specific range instead of the whole file.',
 		parameters: {
 			type: 'object',
-			properties: { path: { type: 'string', description: 'Workspace-relative file path.' } },
+			properties: {
+				path: { type: 'string', description: 'Workspace-relative file path.' },
+				offset: { type: 'number', description: '1-based line number to start reading from. Omit to start at the top.' },
+				limit: { type: 'number', description: 'Maximum number of lines to return. Omit for as much as fits.' },
+			},
 			required: ['path'],
 		},
 	},
@@ -137,7 +143,9 @@ export async function executeTool(call: ToolCall, approver: ToolApprover, guardr
 	try {
 		switch (call.name) {
 			case 'read_file':
-				return await readFile(root, String(call.args.path ?? ''), g);
+				return await readFile(root, String(call.args.path ?? ''), g,
+					typeof call.args.offset === 'number' ? call.args.offset : undefined,
+					typeof call.args.limit === 'number' ? call.args.limit : undefined);
 			case 'list_dir':
 				return await listDir(root, String(call.args.path ?? '.'), g);
 			case 'search_files':
@@ -156,18 +164,43 @@ export async function executeTool(call: ToolCall, approver: ToolApprover, guardr
 	}
 }
 
-async function readFile(root: vscode.Uri, path: string, g: Guardrails): Promise<ToolResult> {
+async function readFile(root: vscode.Uri, path: string, g: Guardrails, offset?: number, limit?: number): Promise<ToolResult> {
 	const guard = checkPath(root, path, false, g);
 	if (!guard.ok) {
 		return { result: guard.reason ?? 'Path blocked.', isError: true };
 	}
 	const uri = resolve(root, path);
 	const bytes = await vscode.workspace.fs.readFile(uri);
-	if (bytes.byteLength > MAX_FILE_BYTES) {
-		const head = new TextDecoder().decode(bytes.slice(0, MAX_FILE_BYTES));
-		return { result: `${head}\n\n[truncated at ${MAX_FILE_BYTES} bytes]`, isError: false };
+	// Decode at most 10× the page cap: enough for any offset the model asks for in
+	// practice without pulling a multi-megabyte file through the decoder.
+	const text = new TextDecoder().decode(bytes.slice(0, Math.max(MAX_FILE_BYTES * 10, MAX_READ_CHARS)));
+	const lines = text.split('\n');
+	const start = offset && offset > 0 ? Math.min(offset - 1, lines.length) : 0;
+	const wanted = limit && limit > 0 ? lines.slice(start, start + limit) : lines.slice(start);
+
+	// Enforce the char cap even inside an explicit range.
+	const out: string[] = [];
+	let chars = 0;
+	for (const line of wanted) {
+		if (chars + line.length + 1 > MAX_READ_CHARS) {
+			break;
+		}
+		out.push(line);
+		chars += line.length + 1;
 	}
-	return { result: new TextDecoder().decode(bytes), isError: false };
+	const end = start + out.length;
+	const whole = start === 0 && end >= lines.length && bytes.byteLength <= MAX_FILE_BYTES * 10;
+	if (whole) {
+		return { result: out.join('\n'), isError: false };
+	}
+	if (start >= lines.length) {
+		const note = `\n\n[file has ${lines.length} lines; offset ${start + 1} is past the end of the file. No more lines to read.]`;
+		return { result: out.join('\n') + note, isError: false };
+	}
+	const note = end >= lines.length
+		? `\n\n[file has ${lines.length} lines; showing ${start + 1}–${end}. End of file reached; no more lines to read.]`
+		: `\n\n[file has ${lines.length} lines; showing ${start + 1}–${end}. Call read_file with offset=${end + 1} to continue.]`;
+	return { result: out.join('\n') + note, isError: false };
 }
 
 async function listDir(root: vscode.Uri, path: string, g: Guardrails): Promise<ToolResult> {
@@ -295,6 +328,18 @@ async function editFile(root: vscode.Uri, path: string, oldText: string, newText
 	return { result: `Replaced ${occurrences} occurrence(s) in ${path}.`, isError: false };
 }
 
+const MAX_CMD_OUTPUT = 16_000;
+
+/** Keeps the start (what ran) and the end (where errors land) of long command output. */
+function capCommandOutput(out: string): string {
+	if (out.length <= MAX_CMD_OUTPUT) {
+		return out;
+	}
+	const head = out.slice(0, 4_000);
+	const tail = out.slice(-12_000);
+	return `${head}\n[… ${out.length - 16_000} chars of output omitted …]\n${tail}`;
+}
+
 async function runCommand(root: vscode.Uri, command: string, approver: ToolApprover, g: Guardrails): Promise<ToolResult> {
 	if (!command.trim()) {
 		return { result: 'Empty command.', isError: true };
@@ -312,7 +357,7 @@ async function runCommand(root: vscode.Uri, command: string, approver: ToolAppro
 	return new Promise<ToolResult>(resolvePromise => {
 		exec(command, { cwd: root.fsPath, timeout: g.commandTimeoutMs, maxBuffer: 1_000_000 },
 			(error, stdout, stderr) => {
-				const out = [stdout, stderr].filter(Boolean).join('\n').slice(0, MAX_FILE_BYTES);
+				const out = capCommandOutput([stdout, stderr].filter(Boolean).join('\n'));
 				if (error && !stdout && !stderr) {
 					resolvePromise({ result: `Command failed: ${error.message}`, isError: true });
 				} else {

@@ -3,7 +3,7 @@
 //   node extensions/openvs-chat/scripts/test-persona-thinking.mjs
 import assert from 'node:assert/strict';
 
-const { ThinkingStreamParser, formatThinking } = await import(new URL('../out/persona/thinking.js', import.meta.url));
+const { ThinkingStreamParser, formatThinking, stripThinking } = await import(new URL('../out/persona/thinking.js', import.meta.url));
 
 /** Feeds deltas through a parser and returns everything it emitted. */
 const run = deltas => {
@@ -44,3 +44,20 @@ assert.equal(
 assert.equal(formatThinking('no tags'), 'no tags');
 
 console.log('test-persona-thinking: all assertions passed');
+
+// stripThinking: removes rendered thinking blocks from committed transcript text.
+{
+	const s = stripThinking;
+	assert.strictEqual(typeof s, 'function');
+	assert.strictEqual(s('🤔 *Thinking…*\n\nsome reasoning here\n\n---\n\nThe answer.'), 'The answer.');
+	// Multiple blocks (multi-step replies concatenated).
+	assert.strictEqual(
+		s('🤔 *Thinking…*\n\nA\n\n---\n\nfirst🤔 *Thinking…*\n\nB\n\n---\n\nsecond'),
+		'firstsecond');
+	// Unclosed block (stream ended mid-thinking): everything from the marker goes.
+	assert.strictEqual(s('answer part\n\n🤔 *Thinking…*\n\ndangling'), 'answer part');
+	// No block: text untouched (same string).
+	assert.strictEqual(s('plain answer with --- a rule'), 'plain answer with --- a rule');
+	assert.strictEqual(s(''), '');
+}
+console.log('test-persona-thinking stripThinking: all assertions passed');

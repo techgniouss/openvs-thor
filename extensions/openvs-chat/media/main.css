@@ -722,6 +722,12 @@ body.settings-window #settingsPanel {
 	white-space: pre-wrap; word-break: break-word;
 	font-family: var(--vscode-editor-font-family, monospace);
 }
+.tool-summary {
+	font-size: 0.85em; cursor: pointer; opacity: 0.8;
+	user-select: none;
+}
+.tool-summary:hover { opacity: 1; }
+details[open] > .tool-summary { margin-bottom: 4px; }
 
 /* ---- Edit apply bar ---- */
 .edit-apply {

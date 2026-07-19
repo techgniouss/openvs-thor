@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { AgentCallbacks, AgentRunner } from '../agent/agentRunner';
+import { contextWindowFor } from '../agent/contextWindow';
 import { ToolApprover } from '../agent/tools';
 import { McpToolset } from '../mcp/manager';
 import { TodoItem } from '../persona/todos';
@@ -216,7 +217,7 @@ export class AutoOrchestrator {
 				continue;
 			}
 			cb.phase('code', a, false);
-			const runner = new AgentRunner(provider, this.approver, this.maxSteps, { mcp: this.mcp });
+			const runner = new AgentRunner(provider, this.approver, this.maxSteps, { mcp: this.mcp, contextWindow: contextWindowFor(a.model) });
 			try {
 				const outcome = await runner.run(
 					seed,
@@ -284,7 +285,7 @@ export class AutoOrchestrator {
 				throw new DOMException('Aborted', 'AbortError');
 			}
 			cb.note(`Step ${i + 1}/${steps.length}: ${steps[i]}`);
-			const runner = new AgentRunner(provider, this.approver, this.maxSteps, { budget, mcp: this.mcp });
+			const runner = new AgentRunner(provider, this.approver, this.maxSteps, { budget, mcp: this.mcp, contextWindow: contextWindowFor(a.model) });
 			const outcome = await runner.run(
 				[
 					{ role: 'system', content: codeSystem(params.baseSystemPrompt) },

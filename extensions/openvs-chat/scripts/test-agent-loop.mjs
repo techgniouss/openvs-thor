@@ -181,4 +181,53 @@ const noopCallbacks = () => {
 	);
 }
 
+// 11. Auto-compaction: when the conversation passes 70% of contextWindow, the runner
+// summarizes old turns via streamChat before the next step.
+{
+	const big = 'x'.repeat(60_000); // ~15k estimated tokens per message
+	let streamChatCalls = 0;
+	const stepsSeen = [];
+	// Built on the file's fakeProvider shape, plus a streamChat the compactor can call.
+	const provider = {
+		...fakeProvider([]),
+		async streamChat(request) {
+			streamChatCalls++;
+			request.onToken('SUMMARY OF OLD TURNS');
+			return { truncated: false };
+		},
+		async runAgentStep(request) {
+			stepsSeen.push(request.messages);
+			return { content: 'done', toolCalls: [], truncated: false };
+		},
+	};
+	// contextWindow 50_000 → trigger at 35k estimated tokens; the big seed turns cross it.
+	const runner = new AgentRunner(provider, approver, 10, {
+		readOnly: true,
+		contextWindow: 50_000,
+		maxContextTokens: 1_000_000, // keep trimming out of the way so compaction is what's tested
+	});
+	const cb = noopCallbacks();
+	// The middle must hold at least MIN_COMPACTABLE (4) turns between the first user
+	// message and the 6 protected recent ones, or compaction correctly declines to run.
+	const seed = [
+		{ role: 'system', content: 'SYS' },
+		{ role: 'user', content: 'GOAL' },
+		{ role: 'assistant', content: big },
+		{ role: 'assistant', content: big },
+		{ role: 'assistant', content: big },
+		{ role: 'assistant', content: big },
+		{ role: 'user', content: 'q1' }, { role: 'assistant', content: 'a1' },
+		{ role: 'user', content: 'q2' }, { role: 'assistant', content: 'a2' },
+		{ role: 'user', content: 'q3' }, { role: 'assistant', content: 'a3' },
+	];
+	const result = await runner.run(seed, params, cb);
+	assert.strictEqual(result.reason, 'done');
+	assert.strictEqual(streamChatCalls, 1, 'summarizer ran exactly once');
+	assert.ok(cb.notes.some(n => n.includes('Compacted')), 'user was told about the compaction');
+	// The first model step already saw the compacted conversation: summary marker present, big turns gone.
+	const firstStep = stepsSeen[0];
+	assert.ok(firstStep.some(msg => msg.content.includes('SUMMARY OF OLD TURNS')));
+	assert.ok(!firstStep.some(msg => msg.content.length >= 60_000));
+}
+
 console.log('test-agent-loop: all assertions passed');
