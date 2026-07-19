@@ -4,7 +4,8 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as vscode from 'vscode';
-import { AgentRunner } from './agent/agentRunner';
+import { AgentRunner, RunResult } from './agent/agentRunner';
+import { trimMessages } from './agent/context';
 import { ToolApprover } from './agent/tools';
 import { AutoOrchestrator } from './auto/orchestrator';
 import { AUTO_ROLES, AutoRole, RoleRouter } from './auto/router';
@@ -29,6 +30,24 @@ export type InlineKind = 'explain' | 'fix' | 'doc' | 'optimize' | 'tests' | 'edi
 
 /** Sentinel provider id selecting the role-routed "Auto" pipeline instead of one provider. */
 const AUTO_PROVIDER = '__auto__';
+/**
+ * Default agent step budget. Sized for real work — reading a handful of files, editing
+ * several, running a build and fixing the fallout — rather than a quick Q&A.
+ */
+const DEFAULT_MAX_STEPS = 25;
+
+/** Default estimated-token ceiling for a conversation before old tool output is trimmed. */
+const DEFAULT_CONTEXT_TOKENS = 120_000;
+
+/** A unique id for one send, used to fence out messages from a superseded run. */
+function newRunId(): string {
+	return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** True for an abort raised by {@link AbortController}, which is never an error to report. */
+function isAbortError(err: unknown): boolean {
+	return err instanceof DOMException && err.name === 'AbortError';
+}
 const INLINE_KINDS: InlineKind[] = ['explain', 'fix', 'doc', 'optimize', 'tests', 'edit'];
 const ENHANCE_SYSTEM = 'You are a prompt engineer. Rewrite the user\'s message into a clear, specific, self-contained prompt for an AI coding assistant. Preserve intent and concrete details; add structure and obvious missing specifics, but do not invent requirements. Return ONLY the improved prompt — no preamble, code fences, or commentary.';
 
@@ -55,6 +74,8 @@ interface WebviewToHost {
 	approval?: string;
 	/** Which chat tab this message belongs to; enables parallel conversations. */
 	sessionId?: string;
+	/** Identifies one run within a tab, so a superseded run's messages can be ignored. */
+	runId?: string;
 	/** Archived conversations mirrored from the webview for cross-restart persistence. */
 	history?: HistoryEntry[];
 }
@@ -205,7 +226,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		};
 		webviewView.webview.html = this.getHtml(webviewView.webview);
 		webviewView.webview.onDidReceiveMessage(
-			(m: WebviewToHost) => this.handleMessage(m), undefined, this.context.subscriptions);
+			(m: WebviewToHost) => this.dispatchMessage(m), undefined, this.context.subscriptions);
 
 		const sub = vscode.workspace.onDidChangeConfiguration(e => {
 			if (e.affectsConfiguration('openvsChat')) {
@@ -291,6 +312,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 	}
 
 	// --- Message handling -------------------------------------------------------
+
+	/**
+	 * Entry point for webview messages. The listener can't await, so a rejection here
+	 * would otherwise vanish and leave the tab stuck mid-run with no explanation.
+	 */
+	private dispatchMessage(message: WebviewToHost): void {
+		void this.handleMessage(message).catch(err => {
+			if (isAbortError(err)) {
+				return;
+			}
+			const post = this.sessionPost(message.sessionId || 'default');
+			post({ type: 'error', message: err instanceof Error ? err.message : String(err) });
+			post({ type: 'done' });
+		});
+	}
 
 	private async handleMessage(message: WebviewToHost): Promise<void> {
 		switch (message.type) {
@@ -647,19 +683,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		}
 	}
 
-	/** Binds a session id (chat tab) into every message of a send pipeline. */
-	private sessionPost(sessionId: string): SessionPost {
-		return m => this.post({ ...m, sessionId });
+	/**
+	 * Binds a session id (chat tab) and a run id into every message of a send pipeline.
+	 * The run id lets the webview ignore stragglers from a superseded run: without it a
+	 * cancelled run's trailing `done` would end the run that replaced it, blanking the
+	 * bubble and re-enabling Send while the new answer was still streaming.
+	 */
+	private sessionPost(sessionId: string, runId = ''): SessionPost {
+		return m => this.post({ ...m, sessionId, runId });
 	}
 
 	private async handleSend(message: WebviewToHost): Promise<void> {
 		const mode: ChatMode = message.mode ?? 'ask';
 		const sessionId = message.sessionId || 'default';
-		const post = this.sessionPost(sessionId);
+		// The webview mints the id when it starts the run so it can fence messages from
+		// the moment it sends; the fallback covers programmatic sends (inline actions).
+		const runId = message.runId || newRunId();
+		const post = this.sessionPost(sessionId, runId);
 		const fail = (text: string) => { post({ type: 'error', message: text }); post({ type: 'done' }); };
 
 		if (message.provider === AUTO_PROVIDER) {
-			await this.handleAutoSend(mode, message, sessionId);
+			await this.handleAutoSend(mode, message, sessionId, runId);
 			return;
 		}
 
@@ -708,35 +752,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 			maxTokens: this.effectiveMaxTokens(mode, !!message.inline),
 		};
 
-		// Build the message list with system prompt and any attached/auto context.
-		const history: ChatMessage[] = message.messages ?? [];
-		const readTools = (mode === 'ask' || mode === 'plan') && !!provider.runAgentStep && this.modelToolCapable(providerId, provider, model);
-		const systemPrompt = this.buildSystemPrompt(mode, await this.baseSystem(), !!message.inline, readTools);
-		const messages: ChatMessage[] = [{ role: 'system', content: systemPrompt }];
-		const context = await this.resolveContext(mode, message.context);
-		if (context) {
-			messages.push({ role: 'user', content: `Context for the request:\n\n${context.content}` });
-		}
-		messages.push(...history);
-
 		// A re-send in the same tab supersedes that tab's previous request; other tabs run on.
 		this.activeRequests.get(sessionId)?.abort();
 		const controller = new AbortController();
 		this.activeRequests.set(sessionId, controller);
 
 		try {
+			// Built inside the try: a failure while assembling the prompt (rules file,
+			// environment probe, attached context) must still report an error and a `done`,
+			// or the tab stays stuck "streaming" forever.
+			const history: ChatMessage[] = message.messages ?? [];
+			const readTools = (mode === 'ask' || mode === 'plan') && !!provider.runAgentStep && this.modelToolCapable(providerId, provider, model);
+			const systemPrompt = this.buildSystemPrompt(mode, await this.baseSystem(), !!message.inline, readTools);
+			const messages: ChatMessage[] = [{ role: 'system', content: systemPrompt }];
+			const context = await this.resolveContext(mode, message.context);
+			if (context) {
+				messages.push({ role: 'user', content: `Context for the request:\n\n${context.content}` });
+			}
+			messages.push(...history);
+
 			if (mode === 'agent') {
-				await this.runAgent(provider, messages, { ...params, signal: controller.signal }, post, sessionId);
+				this.reportStop(post, await this.runAgent(provider, messages, { ...params, signal: controller.signal }, post, sessionId));
 			} else if (readTools) {
 				// Ask/Plan get the read-only tool loop when the model can call tools: the
 				// model reads/lists/searches whatever files it needs to answer or plan,
 				// but has no write or command tools, so it cannot change anything.
-				await this.runReadOnlyAgent(provider, messages, { ...params, signal: controller.signal }, post);
+				this.reportStop(post, await this.runReadOnlyAgent(provider, messages, { ...params, signal: controller.signal }, post));
 			} else {
 				await this.runStreaming(provider, messages, { ...params, signal: controller.signal }, mode, post);
 			}
 		} catch (err) {
-			if (!(err instanceof DOMException && err.name === 'AbortError') && !controller.signal.aborted) {
+			// Only a genuine abort is silent. Previously any error was dropped whenever the
+			// controller happened to be aborted, which hid real provider failures.
+			if (!isAbortError(err)) {
 				post({ type: 'error', message: err instanceof Error ? err.message : String(err) });
 			}
 		} finally {
@@ -749,13 +797,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 	}
 
 	/**
+	 * Turns a run's {@link RunResult} into the one status message the user sees. A run
+	 * that ends for any reason other than "finished" must say so — silence reads as the
+	 * chat having crashed mid-task.
+	 */
+	private reportStop(post: SessionPost, result: RunResult): void {
+		if (result.reason === 'done' || !result.detail) {
+			return;
+		}
+		if (result.reason === 'filtered' || result.reason === 'refused') {
+			post({ type: 'error', message: result.detail });
+			return;
+		}
+		post({ type: 'info', message: result.detail });
+	}
+
+	/**
 	 * Handles a send when the selected "provider" is Auto. In Agent mode this runs the
 	 * full plan → implement → review pipeline across the role-routed models; otherwise
 	 * it routes to the single best role model (plan for Ask/Plan, code for inline edits).
 	 */
-	private async handleAutoSend(mode: ChatMode, message: WebviewToHost, sessionId: string): Promise<void> {
+	private async handleAutoSend(mode: ChatMode, message: WebviewToHost, sessionId: string, runId: string): Promise<void> {
 		const history: ChatMessage[] = message.messages ?? [];
-		const post = this.sessionPost(sessionId);
+		const post = this.sessionPost(sessionId, runId);
 		const fail = (text: string) => { post({ type: 'error', message: text }); };
 
 		this.activeRequests.get(sessionId)?.abort();
@@ -767,7 +831,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 			const contextText = context?.content;
 
 			if (mode === 'agent') {
-				const maxSteps = vscode.workspace.getConfiguration('openvsChat').get<number>('agent.maxSteps') ?? 12;
+				const maxSteps = this.configuredMaxSteps();
 				await this.mcp.ensureStarted();
 				const orchestrator = new AutoOrchestrator(this.registry, this.router, this, maxSteps, this.mcp);
 				let stepThinking: ThinkingStreamParser | undefined;
@@ -832,7 +896,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 				}, mode, post);
 			}
 		} catch (err) {
-			if (!(err instanceof DOMException && err.name === 'AbortError') && !controller.signal.aborted) {
+			if (!isAbortError(err)) {
 				post({ type: 'error', message: err instanceof Error ? err.message : String(err) });
 			}
 		} finally {
@@ -853,12 +917,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		// Streams with transparent auto-continuation: a max-token cutoff is resumed
 		// in place (Claude-style) instead of the reply stopping midway.
 		const thinking = new ThinkingStreamParser(text => post({ type: 'token', delta: text }));
-		const { text: full } = await streamChatWithContinuation(provider, {
-			messages,
-			...params,
-			onToken: delta => thinking.push(delta),
-		});
-		thinking.flush();
+		let full = '';
+		let truncated = false;
+		try {
+			({ text: full, truncated } = await streamChatWithContinuation(provider, {
+				// A long chat would otherwise grow until the provider rejects it outright.
+				messages: trimMessages(messages, this.configuredContextTokens()),
+				...params,
+				onToken: delta => thinking.push(delta),
+				onNotice: text => post({ type: 'info', message: text }),
+			}));
+		} finally {
+			// Flushed even on failure, or text buffered inside an unclosed <thinking> tag
+			// is lost along with the error.
+			thinking.flush();
+		}
+		if (truncated) {
+			post({
+				type: 'info',
+				message: 'The reply is still incomplete after several automatic continuations — raise "openvsChat.maxTokens" or ask for a smaller piece at a time.',
+			});
+		}
 		if (mode === 'edit') {
 			// An odd number of ``` fences means the response was cut off mid code-block
 			// (almost always hitting the max-tokens limit on a large file). Surface that
@@ -905,11 +984,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		messages: ChatMessage[],
 		params: { model: string; apiKey: string; baseUrl: string; maxTokens: number; signal: AbortSignal },
 		post: SessionPost,
-	): Promise<void> {
-		const configured = vscode.workspace.getConfiguration('openvsChat').get<number>('agent.maxSteps') ?? 12;
-		const runner = new AgentRunner(provider, this, Math.min(configured, 8), { readOnly: true });
+	): Promise<RunResult> {
+		const configured = this.configuredMaxSteps();
+		const runner = new AgentRunner(provider, this, Math.min(configured, 8), {
+			readOnly: true,
+			maxContextTokens: this.configuredContextTokens(),
+		});
 		let stepThinking: ThinkingStreamParser | undefined;
-		await runner.run(messages, params, {
+		return runner.run(messages, params, {
 			onStepStart: () => { stepThinking = new ThinkingStreamParser(text => post({ type: 'token', delta: text })); post({ type: 'agentStepStart' }); },
 			onToken: delta => stepThinking?.push(delta),
 			onStepEnd: content => { stepThinking?.flush(); stepThinking = undefined; post({ type: 'agentStepEnd', content: formatThinking(content) }); },
@@ -926,8 +1008,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		params: { model: string; apiKey: string; baseUrl: string; maxTokens: number; signal: AbortSignal },
 		post: SessionPost,
 		sessionId: string,
-	): Promise<void> {
-		const maxSteps = vscode.workspace.getConfiguration('openvsChat').get<number>('agent.maxSteps') ?? 12;
+	): Promise<RunResult> {
+		const maxSteps = this.configuredMaxSteps();
 		await this.mcp.ensureStarted();
 		// Tell the model about connected MCP tools so it actually reaches for them.
 		const mcpTools = this.mcp.tools();
@@ -944,6 +1026,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		this.steerQueues.delete(sessionId);
 		const runner = new AgentRunner(provider, this, maxSteps, {
 			mcp: this.mcp,
+			maxContextTokens: this.configuredContextTokens(),
 			steering: () => {
 				const queued = this.steerQueues.get(sessionId) ?? [];
 				this.steerQueues.delete(sessionId);
@@ -952,7 +1035,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		});
 		let stepThinking: ThinkingStreamParser | undefined;
 		post({ type: 'todos', items: [] });
-		await runner.run(messages, params, {
+		return runner.run(messages, params, {
 			onStepStart: () => { stepThinking = new ThinkingStreamParser(text => post({ type: 'token', delta: text })); post({ type: 'agentStepStart' }); },
 			onToken: delta => stepThinking?.push(delta),
 			onStepEnd: content => { stepThinking?.flush(); stepThinking = undefined; post({ type: 'agentStepEnd', content: formatThinking(content) }); },
@@ -962,6 +1045,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 			onNote: text => post({ type: 'info', message: text }),
 			onTodos: items => post({ type: 'todos', items }),
 		});
+	}
+
+	/**
+	 * The agent step budget. Generous by default: a real task (read several files, edit a
+	 * few, run the build, fix what broke) routinely needs more than a dozen steps, and
+	 * stopping early is what makes the assistant feel like it gave up mid-job.
+	 */
+	private configuredMaxSteps(): number {
+		const configured = vscode.workspace.getConfiguration('openvsChat').get<number>('agent.maxSteps');
+		return typeof configured === 'number' && configured > 0 ? configured : DEFAULT_MAX_STEPS;
+	}
+
+	/** Estimated-token ceiling for the conversation, above which old tool output is trimmed. */
+	private configuredContextTokens(): number {
+		const configured = vscode.workspace.getConfiguration('openvsChat').get<number>('agent.maxContextTokens');
+		return typeof configured === 'number' && configured > 0 ? configured : DEFAULT_CONTEXT_TOKENS;
 	}
 
 	/**
@@ -1153,7 +1252,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		);
 		panel.webview.html = this.getHtml(panel.webview, true);
 		panel.webview.onDidReceiveMessage(
-			(m: WebviewToHost) => this.handleMessage(m), undefined, this.context.subscriptions);
+			(m: WebviewToHost) => this.dispatchMessage(m), undefined, this.context.subscriptions);
 		panel.onDidDispose(() => { this.settingsPanel = undefined; });
 		this.settingsPanel = panel;
 	}

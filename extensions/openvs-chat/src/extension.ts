@@ -8,9 +8,27 @@ import { WebAuthManager } from './auth';
 import { ChatViewProvider, InlineKind } from './chatViewProvider';
 import { McpManager } from './mcp/manager';
 import { ProviderRegistry } from './providers/registry';
+import { setStreamIdleTimeout } from './providers/types';
 import { SkillRegistry } from './skills';
 
+/**
+ * Providers only use `fetch`, so the stream stall timeout is pushed in from here and
+ * kept in step with the setting.
+ */
+function applyStreamIdleTimeout(): void {
+	const ms = vscode.workspace.getConfiguration('openvsChat').get<number>('stream.idleTimeoutMs');
+	if (typeof ms === 'number') {
+		setStreamIdleTimeout(ms);
+	}
+}
+
 export function activate(context: vscode.ExtensionContext): void {
+	applyStreamIdleTimeout();
+	context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
+		if (e.affectsConfiguration('openvsChat.stream.idleTimeoutMs')) {
+			applyStreamIdleTimeout();
+		}
+	}));
 	const registry = new ProviderRegistry(context.secrets);
 	const auth = new WebAuthManager(registry);
 	const mcp = new McpManager();

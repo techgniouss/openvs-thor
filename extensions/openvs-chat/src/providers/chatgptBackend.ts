@@ -5,8 +5,8 @@
 
 import { chatgptSessionId, decodeJwtClaims } from '../oauth';
 import {
-	AgentRequest, AgentStep, ChatMessage, ChatRequest, ToolCall,
-	apiFetch, describeHttpError, readSSE,
+	AgentRequest, AgentStep, ChatMessage, ChatRequest, FinishReason, STREAM_FETCH_OPTS,
+	StreamChatResult, ToolCall, apiFetch, describeHttpError, readSSE, retryNotice,
 } from './types';
 
 /**
@@ -114,6 +114,8 @@ interface StreamResult {
 	toolCalls: ToolCall[];
 	/** True when the response stopped because it hit the model's output-token ceiling. */
 	truncated: boolean;
+	/** Normalized stop reason, when the backend reported a terminal event. */
+	finishReason?: FinishReason;
 }
 
 async function streamResponses(
@@ -122,18 +124,23 @@ async function streamResponses(
 	body: Record<string, unknown>,
 	signal: AbortSignal,
 	onToken?: (delta: string) => void,
+	onNotice?: (text: string) => void,
 ): Promise<StreamResult> {
 	const response = await apiFetch(CHATGPT_RESPONSES_URL, {
 		method: 'POST',
 		headers: headers(accessToken),
 		body: JSON.stringify(body),
-	}, signal);
+	}, signal, {
+		...STREAM_FETCH_OPTS,
+		onRetry: info => onNotice?.(retryNotice(label, info)),
+	});
 	if (!response.ok) {
 		throw new Error(await describeHttpError(label, response));
 	}
 
 	let content = '';
 	let truncated = false;
+	let finishReason: FinishReason | undefined;
 	const toolCalls: ToolCall[] = [];
 	await readSSE(response, data => {
 		let event: any;
@@ -162,28 +169,35 @@ async function streamResponses(
 				}
 				break;
 			}
-			case 'response.incomplete':
-				if (event?.response?.incomplete_details?.reason === 'max_output_tokens') {
-					truncated = true;
-				}
+			case 'response.completed':
+				finishReason = toolCalls.length ? 'tool_calls' : 'stop';
 				break;
+			case 'response.incomplete': {
+				const reason = event?.response?.incomplete_details?.reason;
+				truncated = reason === 'max_output_tokens';
+				// Any other incomplete reason (content filter, …) is a real stop the user
+				// must hear about, not a quietly-shortened answer.
+				finishReason = truncated ? 'length' : 'filtered';
+				break;
+			}
 			case 'response.failed':
 			case 'error':
 				throw new Error(`${label}: ${event?.response?.error?.message ?? event?.message ?? 'stream error'}`);
 		}
-	}, signal);
-	return { content, toolCalls, truncated };
+	}, signal, { label, sawTerminal: () => finishReason !== undefined });
+	return { content, toolCalls, truncated, finishReason };
 }
 
-export async function chatgptStreamChat(label: string, request: ChatRequest): Promise<{ truncated: boolean }> {
-	const { truncated } = await streamResponses(label, request.apiKey, {
+export async function chatgptStreamChat(label: string, request: ChatRequest): Promise<StreamChatResult> {
+	const { truncated, finishReason } = await streamResponses(label, request.apiKey, {
 		model: normalizeModel(request.model),
 		instructions: systemText(request.messages),
 		input: toInputItems(request.messages),
+		max_output_tokens: request.maxTokens,
 		store: false,
 		stream: true,
-	}, request.signal, request.onToken);
-	return { truncated };
+	}, request.signal, request.onToken, request.onNotice);
+	return { truncated, finishReason };
 }
 
 export async function chatgptAgentStep(label: string, request: AgentRequest): Promise<AgentStep> {
@@ -191,6 +205,7 @@ export async function chatgptAgentStep(label: string, request: AgentRequest): Pr
 		model: normalizeModel(request.model),
 		instructions: systemText(request.messages),
 		input: toInputItems(request.messages),
+		max_output_tokens: request.maxTokens,
 		tools: request.tools.map(t => ({
 			type: 'function',
 			name: t.name,
@@ -202,5 +217,5 @@ export async function chatgptAgentStep(label: string, request: AgentRequest): Pr
 		parallel_tool_calls: false,
 		store: false,
 		stream: true,
-	}, request.signal, request.onToken);
+	}, request.signal, request.onToken, request.onNotice);
 }

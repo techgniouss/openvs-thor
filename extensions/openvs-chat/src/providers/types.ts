@@ -61,6 +61,11 @@ export interface ChatRequest {
 	readonly signal: AbortSignal;
 	/** Called with each streamed text fragment. */
 	readonly onToken: (delta: string) => void;
+	/**
+	 * Out-of-band transport status (auto-retry, slow start). Kept off {@link onToken} so
+	 * it renders as a UI notice instead of being spliced into the model's own answer.
+	 */
+	readonly onNotice?: (text: string) => void;
 }
 
 /** An agent step: ask the model what to do next (text and/or tool calls). */
@@ -74,7 +79,17 @@ export interface AgentRequest {
 	readonly signal: AbortSignal;
 	/** Called with streamed narration text as the step is produced (optional). */
 	readonly onToken?: (delta: string) => void;
+	/** Out-of-band transport status (auto-retry, slow start). See {@link ChatRequest.onNotice}. */
+	readonly onNotice?: (text: string) => void;
 }
+
+/**
+ * Why the model stopped producing a response, normalized across backends. `stop` is a
+ * natural finish, `length` a max-token cutoff, `tool_calls` a hand-off to tools, and
+ * `filtered` / `refused` a provider-side block — the last two must be surfaced rather
+ * than mistaken for a completed answer.
+ */
+export type FinishReason = 'stop' | 'length' | 'tool_calls' | 'filtered' | 'refused';
 
 /** The model's response to a single agent step. */
 export interface AgentStep {
@@ -82,6 +97,8 @@ export interface AgentStep {
 	readonly toolCalls: ToolCall[];
 	/** True when the step was cut off by the max-token limit before the model finished. */
 	readonly truncated?: boolean;
+	/** Normalized stop reason reported by the backend, when it reported one. */
+	readonly finishReason?: FinishReason;
 }
 
 /** The outcome of a completed {@link ChatProvider.streamChat} call. */
@@ -91,6 +108,31 @@ export interface StreamChatResult {
 	 * "length"` / `stop_reason: "max_tokens"`) rather than finishing naturally.
 	 */
 	readonly truncated: boolean;
+	/** Normalized stop reason reported by the backend, when it reported one. */
+	readonly finishReason?: FinishReason;
+}
+
+/** Maps a raw backend stop reason onto the normalized {@link FinishReason} set. */
+export function normalizeFinishReason(raw: string | undefined | null): FinishReason | undefined {
+	switch (raw) {
+		case 'length':
+		case 'max_tokens':
+			return 'length';
+		case 'tool_calls':
+		case 'tool_use':
+		case 'function_call':
+			return 'tool_calls';
+		case 'content_filter':
+			return 'filtered';
+		case 'refusal':
+			return 'refused';
+		case 'stop':
+		case 'end_turn':
+		case 'stop_sequence':
+			return 'stop';
+		default:
+			return raw ? 'stop' : undefined;
+	}
 }
 
 export interface ProviderInfo {
@@ -256,46 +298,137 @@ export interface ChatProvider {
 }
 
 /**
+ * Default inter-chunk idle timeout for streaming responses. A stream that stops
+ * producing bytes for this long is treated as dead: without it a stalled provider
+ * leaves the UI "typing" forever, because {@link apiFetch}'s timeout only covers
+ * response *headers*.
+ */
+const DEFAULT_STREAM_IDLE_MS = 120_000;
+
+let streamIdleMs = DEFAULT_STREAM_IDLE_MS;
+
+/**
+ * Overrides the inter-chunk idle timeout used by {@link readSSE}. Providers stay
+ * self-contained (fetch only), so the workspace setting is pushed in from the host.
+ */
+export function setStreamIdleTimeout(ms: number): void {
+	streamIdleMs = Number.isFinite(ms) && ms > 0 ? ms : DEFAULT_STREAM_IDLE_MS;
+}
+
+/** Options controlling {@link readSSE}'s stall detection and end-of-stream validation. */
+export interface ReadSSEOptions {
+	/** Abort if no bytes arrive for this many ms. Defaults to the configured idle timeout. */
+	readonly idleMs?: number;
+	/** Provider label used in stall / truncated-stream error messages. */
+	readonly label?: string;
+	/**
+	 * Called once the body ends, to report whether the provider's own terminal event
+	 * (`[DONE]`, `message_stop`, a `finish_reason`, …) was ever seen. Returning false
+	 * means the connection dropped mid-response, which {@link readSSE} turns into an
+	 * error instead of letting it masquerade as a complete answer.
+	 */
+	readonly sawTerminal?: () => boolean;
+}
+
+/** Reads one chunk, rejecting if the stream stalls for longer than `idleMs`. */
+async function readChunk(
+	reader: ReadableStreamDefaultReader<Uint8Array>,
+	idleMs: number,
+	label: string,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+	if (idleMs <= 0) {
+		return reader.read();
+	}
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const stalled = new Promise<never>((_resolve, reject) => {
+		timer = setTimeout(() => {
+			// Reject before cancelling: `cancel()` settles the in-flight `read()` synchronously,
+			// and whichever promise settles first wins the race — cancelling first would make
+			// the stall look like a clean end of stream.
+			reject(new Error(`${label}: the response stalled — no data for ${Math.round(idleMs / 1000)}s. The connection was dropped; send "continue" to resume.`));
+			void reader.cancel().catch(() => { /* already closed */ });
+		}, idleMs);
+	});
+	try {
+		return await Promise.race([reader.read(), stalled]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+/**
  * Reads a `text/event-stream` (SSE) HTTP response body line by line and invokes
  * `onEvent` with each `data:` payload (excluding the trailing `[DONE]` sentinel).
+ * Rejects when the stream stalls, is aborted, or ends without the provider's terminal
+ * event — a silent mid-response disconnect must never look like a finished answer.
  */
 export async function readSSE(
 	response: Response,
 	onEvent: (data: string) => void,
 	signal: AbortSignal,
+	opts?: ReadSSEOptions,
 ): Promise<void> {
 	if (!response.body) {
 		throw new Error('Response had no body to stream.');
 	}
+	const label = opts?.label ?? 'The provider';
+	const idleMs = opts?.idleMs ?? streamIdleMs;
 	const reader = response.body.getReader();
 	const decoder = new TextDecoder();
 	let buffer = '';
+	let sawDone = false;
+	/** Emits every complete `data:` line held in `buffer`. */
+	const drain = (): void => {
+		let newlineIndex: number;
+		while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+			const line = buffer.slice(0, newlineIndex).trim();
+			buffer = buffer.slice(newlineIndex + 1);
+			emit(line);
+		}
+	};
+	const emit = (line: string): void => {
+		if (!line.startsWith('data:')) {
+			return;
+		}
+		const data = line.slice('data:'.length).trim();
+		if (data === '[DONE]') {
+			sawDone = true;
+			return;
+		}
+		if (data.length === 0) {
+			return;
+		}
+		onEvent(data);
+	};
 	try {
 		while (true) {
 			if (signal.aborted) {
 				throw new DOMException('Aborted', 'AbortError');
 			}
-			const { done, value } = await reader.read();
+			const { done, value } = await readChunk(reader, idleMs, label);
 			if (done) {
 				break;
 			}
 			buffer += decoder.decode(value, { stream: true });
-			let newlineIndex: number;
-			while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
-				const line = buffer.slice(0, newlineIndex).trim();
-				buffer = buffer.slice(newlineIndex + 1);
-				if (!line.startsWith('data:')) {
-					continue;
-				}
-				const data = line.slice('data:'.length).trim();
-				if (data === '[DONE]' || data.length === 0) {
-					continue;
-				}
-				onEvent(data);
-			}
+			drain();
+		}
+		// A final event can arrive without its trailing newline; it carries the
+		// `finish_reason`, so dropping it would lose the truncation signal.
+		buffer += decoder.decode();
+		drain();
+		const tail = buffer.trim();
+		if (tail) {
+			emit(tail);
 		}
 	} finally {
 		reader.releaseLock();
+	}
+	if (signal.aborted) {
+		throw new DOMException('Aborted', 'AbortError');
+	}
+	const terminal = opts?.sawTerminal ? opts.sawTerminal() || sawDone : true;
+	if (!terminal) {
+		throw new Error(`${label}: the response ended before it was complete — the connection was dropped mid-stream. Send "continue" to resume.`);
 	}
 }
 
@@ -321,6 +454,22 @@ export interface ApiFetchOptions {
 	 * feedback to the user. Never called for a caller-initiated abort.
 	 */
 	readonly onRetry?: (info: RetryInfo) => void;
+}
+
+/**
+ * Fetch options shared by every streaming chat POST: a long first-byte window (free tiers
+ * queue requests server-side and can take over a minute to start on a cold model) and a
+ * single retry, since retrying a queued request just re-enters the same queue.
+ */
+export const STREAM_FETCH_OPTS = { timeoutMs: 150_000, retries: 1 } as const;
+
+/** Wording for the "retrying in Ns…" notice shown while {@link apiFetch} backs off. */
+export function retryNotice(label: string, info: RetryInfo): string {
+	const secs = Math.max(1, Math.ceil(info.delayMs / 1000));
+	const why = info.reason === 'rate-limit' ? `Rate limited by ${label}`
+		: info.reason === 'timeout' ? `${label} is slow to start`
+			: `Transient ${label} error`;
+	return `${why} — retrying in ${secs}s…`;
 }
 
 /** Links a caller's AbortSignal to a child controller, returning an unlink function. */

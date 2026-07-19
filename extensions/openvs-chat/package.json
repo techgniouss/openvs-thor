@@ -350,8 +350,18 @@
         },
         "openvsChat.agent.maxSteps": {
           "type": "number",
-          "default": 12,
+          "default": 25,
           "description": "%config.agent.maxSteps%"
+        },
+        "openvsChat.agent.maxContextTokens": {
+          "type": "number",
+          "default": 120000,
+          "description": "%config.agent.maxContextTokens%"
+        },
+        "openvsChat.stream.idleTimeoutMs": {
+          "type": "number",
+          "default": 120000,
+          "description": "%config.stream.idleTimeoutMs%"
         },
         "openvsChat.agent.commandTimeoutMs": {
           "type": "number",
