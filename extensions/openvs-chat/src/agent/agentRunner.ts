@@ -8,7 +8,7 @@ import { SUBAGENT_PREAMBLE } from '../persona/prompts';
 import { stripThinking } from '../persona/thinking';
 import { TodoItem, UPDATE_TODOS_TOOL, parseTodoUpdate } from '../persona/todos';
 import { AgentStep, CONTINUE_PROMPT, ChatProvider, ChatMessage, ToolCall, ToolSpec } from '../providers/types';
-import { compactMessages, shouldCompact } from './compaction';
+import { COMPACT_MARKER, compactMessages, compactionThreshold, shouldCompact } from './compaction';
 import { isContextLengthError, trimMessages } from './context';
 import { Guardrails, autoApproves, loadGuardrails } from './guardrails';
 import { AGENT_TOOLS, READ_ONLY_TOOL_NAMES, SPAWN_SUBAGENT_TOOL, ToolApprover, executeTool } from './tools';
@@ -72,6 +72,13 @@ export interface AgentCallbacks {
 	onNote(text: string): void;
 	/** The agent replaced its visible task checklist (top-level agent only). */
 	onTodos?(items: TodoItem[]): void;
+	/**
+	 * The run compacted its own conversation. Reported for visibility only — do NOT feed
+	 * `replaced` to the webview's compaction accounting: mid-run the array also holds
+	 * tool turns the webview never stored, so its count would over-advance and drop
+	 * recent turns the summary never covered.
+	 */
+	onCompacted?(summary: string, replaced: number): void;
 }
 
 interface AgentParams {
@@ -131,6 +138,8 @@ export class AgentRunner {
 	private readonly steering?: () => string[];
 	private readonly contextWindow: number;
 	private readonly keepHead?: number;
+	/** Set once compacting stops paying for itself, so the run doesn't re-summarize every few steps. */
+	private compactionExhausted = false;
 	private contextBudget: number;
 
 	constructor(
@@ -190,11 +199,26 @@ export class AgentRunner {
 			// Compact ahead of the hard budget: replace old middle turns with a summary
 			// once past the trigger share of the model's window, so the model keeps a
 			// coherent task memory instead of trim markers.
-			if (this.contextWindow && shouldCompact(messages, this.contextWindow, this.contextBudget)) {
+			if (this.contextWindow && !this.compactionExhausted && shouldCompact(messages, this.contextWindow, this.contextBudget)) {
 				const compacted = await this.compact(messages, params);
 				if (compacted) {
 					messages.splice(0, messages.length, ...compacted.messages);
 					callbacks.onNote(`Compacted the conversation (~${Math.round(compacted.before / 1000)}k → ~${Math.round(compacted.after / 1000)}k tokens).`);
+					const summary = compacted.messages.find(m => m.content.startsWith(COMPACT_MARKER));
+					if (summary) {
+						callbacks.onCompacted?.(summary.content, compacted.replaced);
+					}
+					// Still over the line afterwards means the protected head alone exceeds
+					// the threshold — summarizing again would cost a request per few steps
+					// and shrink nothing. Hand the rest of the run to the trim instead.
+					if (compacted.after >= compactionThreshold(this.contextWindow, this.contextBudget)) {
+						this.compactionExhausted = true;
+						callbacks.onNote('The conversation is still near the context limit after compacting — older tool output will be trimmed from here on.');
+					}
+				} else {
+					// Nothing summarizable, or the summarizer failed: retrying every step
+					// would repeat that cost for the same outcome.
+					this.compactionExhausted = true;
 				}
 			}
 

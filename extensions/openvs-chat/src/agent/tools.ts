@@ -172,8 +172,11 @@ async function readFile(root: vscode.Uri, path: string, g: Guardrails, offset?: 
 	const uri = resolve(root, path);
 	const bytes = await vscode.workspace.fs.readFile(uri);
 	// Decode at most 10× the page cap: enough for any offset the model asks for in
-	// practice without pulling a multi-megabyte file through the decoder.
-	const text = new TextDecoder().decode(bytes.slice(0, Math.max(MAX_FILE_BYTES * 10, MAX_READ_CHARS)));
+	// practice without pulling a multi-megabyte file through the decoder. `stream: true`
+	// keeps a multi-byte sequence straddling the cut from decoding as U+FFFD.
+	const decodeLimit = Math.max(MAX_FILE_BYTES * 10, MAX_READ_CHARS);
+	const partial = bytes.byteLength > decodeLimit;
+	const text = new TextDecoder().decode(bytes.slice(0, decodeLimit), { stream: partial });
 	const lines = text.split('\n');
 	const start = offset && offset > 0 ? Math.min(offset - 1, lines.length) : 0;
 	const wanted = limit && limit > 0 ? lines.slice(start, start + limit) : lines.slice(start);
@@ -194,12 +197,23 @@ async function readFile(root: vscode.Uri, path: string, g: Guardrails, offset?: 
 		return { result: out.join('\n'), isError: false };
 	}
 	if (start >= lines.length) {
-		const note = `\n\n[file has ${lines.length} lines; offset ${start + 1} is past the end of the file. No more lines to read.]`;
+		const note = `\n\n[file has ${lines.length}${partial ? '+' : ''} lines; offset ${start + 1} is past the end of the file. No more lines to read.]`;
 		return { result: out.join('\n') + note, isError: false };
 	}
+	// A single line longer than the cap (minified bundle, lockfile, long data row) fills
+	// no lines at all. Return the head of that line and point past it — a note offering
+	// the offset just used would send a compliant model round the same call forever.
+	if (!out.length) {
+		const head = wanted[0].slice(0, MAX_READ_CHARS);
+		const note = `\n\n[line ${start + 1} is ${wanted[0].length} characters; showing its first ${head.length}. `
+			+ (start + 1 < lines.length
+				? `Call read_file with offset=${start + 2} to continue past it.]`
+				: 'It is the last line of the file.]');
+		return { result: head + note, isError: false };
+	}
 	const note = end >= lines.length
-		? `\n\n[file has ${lines.length} lines; showing ${start + 1}–${end}. End of file reached; no more lines to read.]`
-		: `\n\n[file has ${lines.length} lines; showing ${start + 1}–${end}. Call read_file with offset=${end + 1} to continue.]`;
+		? `\n\n[file has ${lines.length}${partial ? '+' : ''} lines; showing ${start + 1}–${end}. End of file reached; no more lines to read.]`
+		: `\n\n[file has ${lines.length}${partial ? '+' : ''} lines; showing ${start + 1}–${end}. Call read_file with offset=${end + 1} to continue.]`;
 	return { result: out.join('\n') + note, isError: false };
 }
 
@@ -329,15 +343,18 @@ async function editFile(root: vscode.Uri, path: string, oldText: string, newText
 }
 
 const MAX_CMD_OUTPUT = 16_000;
+/** Split of that cap: enough head to identify what ran, the rest for the tail where errors land. */
+const CMD_HEAD_CHARS = 4_000;
+const CMD_TAIL_CHARS = MAX_CMD_OUTPUT - CMD_HEAD_CHARS;
 
 /** Keeps the start (what ran) and the end (where errors land) of long command output. */
 function capCommandOutput(out: string): string {
 	if (out.length <= MAX_CMD_OUTPUT) {
 		return out;
 	}
-	const head = out.slice(0, 4_000);
-	const tail = out.slice(-12_000);
-	return `${head}\n[… ${out.length - 16_000} chars of output omitted …]\n${tail}`;
+	const head = out.slice(0, CMD_HEAD_CHARS);
+	const tail = out.slice(-CMD_TAIL_CHARS);
+	return `${head}\n[… ${out.length - head.length - tail.length} chars of output omitted …]\n${tail}`;
 }
 
 async function runCommand(root: vscode.Uri, command: string, approver: ToolApprover, g: Guardrails): Promise<ToolResult> {

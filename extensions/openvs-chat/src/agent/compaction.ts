@@ -69,6 +69,40 @@ export function shouldCompact(messages: ChatMessage[], contextWindow: number, tr
 }
 
 /**
+ * Rewrites tool calls and tool results as plain prose turns.
+ *
+ * The summarizer is a normal chat completion with no `tools` declared, and the slice it
+ * summarizes is cut at a fixed offset from the tail — so it routinely ends mid tool
+ * sequence. Sent as-is that is an invalid request: OpenAI rejects an assistant
+ * `tool_calls` with no answering `tool` messages, and Anthropic rejects `tool_use` /
+ * `tool_result` blocks whenever `tools` is undefined, which is always here. Both 400s
+ * were swallowed by the caller's catch, so compaction silently degraded to the lossy
+ * trim it exists to replace. Flattening keeps the same information as text.
+ */
+function flattenToolTurns(messages: ChatMessage[]): ChatMessage[] {
+	return messages.map(m => {
+		if (m.role === 'tool') {
+			return { role: 'user' as const, content: `[tool result] ${m.content}` };
+		}
+		if (m.toolCalls?.length) {
+			const calls = m.toolCalls.map(c => `[tool call: ${c.name}(${safeArgs(c.args)})]`).join('\n');
+			return { role: 'assistant' as const, content: m.content ? `${m.content}\n${calls}` : calls };
+		}
+		return m;
+	});
+}
+
+/** Compact, non-throwing rendering of tool arguments for the summarizer transcript. */
+function safeArgs(args: Record<string, unknown>): string {
+	try {
+		const s = JSON.stringify(args) ?? '';
+		return s.length > 200 ? `${s.slice(0, 200)}…` : s;
+	} catch {
+		return '';
+	}
+}
+
+/**
  * Index just past the first user turn, or -1 when there is none. Only a safe default
  * when the first user turn really is the task — see {@link compactMessages}'s `keepHead`.
  */
@@ -105,7 +139,7 @@ export async function compactMessages(
 	let summary: string;
 	try {
 		summary = (await summarize(
-			[...messages.slice(0, end), { role: 'user', content: SUMMARY_PROMPT }],
+			[...flattenToolTurns(messages.slice(0, end)), { role: 'user', content: SUMMARY_PROMPT }],
 			SUMMARY_MAX_TOKENS,
 		)).trim();
 	} catch {

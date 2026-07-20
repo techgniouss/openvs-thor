@@ -231,3 +231,48 @@ const noopCallbacks = () => {
 }
 
 console.log('test-agent-loop: all assertions passed');
+
+// 12. Compaction that fails to get under the threshold is not retried every few steps:
+// when the protected head alone exceeds it, summarizing again costs a request and
+// shrinks nothing, so the run falls through to trimming instead.
+{
+	const big = 'x'.repeat(60_000);
+	let streamChatCalls = 0;
+	let steps = 0;
+	const provider = {
+		...fakeProvider([]),
+		async streamChat(request) {
+			streamChatCalls++;
+			request.onToken('SUMMARY');
+			return { truncated: false };
+		},
+		async runAgentStep() {
+			steps++;
+			// Keep requesting tools so the loop keeps going and re-evaluates compaction.
+			return steps < 8
+				? { content: '', toolCalls: [{ id: 'c' + steps, name: 'list_dir', args: { path: '.' } }], truncated: false }
+				: { content: 'done', toolCalls: [], truncated: false };
+		},
+	};
+	// Window 30k => threshold 21k, but keepHead protects two 15k-token seed messages, so
+	// the head alone (~30k) can never fit — exactly the condition that used to
+	// re-summarize forever.
+	const runner = new AgentRunner(provider, approver, 20, {
+		readOnly: true,
+		contextWindow: 30_000,
+		maxContextTokens: 1_000_000,
+		keepHead: 3,
+	});
+	const cb = noopCallbacks();
+	const seed = [
+		{ role: 'system', content: 'SYS' },
+		{ role: 'user', content: big },
+		{ role: 'user', content: big },
+		...Array.from({ length: 8 }, (_, i) => ({ role: 'assistant', content: 'work ' + i })),
+		...Array.from({ length: 6 }, (_, i) => ({ role: 'user', content: 'recent ' + i })),
+	];
+	const result = await runner.run(seed, params, cb);
+	assert.strictEqual(result.reason, 'done');
+	assert.strictEqual(streamChatCalls, 1, 'compaction is attempted once, not once per step');
+	assert.ok(cb.notes.some(n => n.includes('still near the context limit')), 'the user is told trimming takes over');
+}

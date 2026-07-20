@@ -109,10 +109,12 @@ console.log('test-compaction thresholds: all assertions passed');
 		...Array.from({ length: 8 }, (_, i) => ({ role: 'assistant', content: 'work ' + i })),
 		...Array.from({ length: 6 }, (_, i) => ({ role: 'user', content: 'recent ' + i })),
 	];
-	// Without keepHead the request is lost — the bug this parameter exists to fix.
+	// HAZARD PIN, not an endorsement: omitting keepHead on an assembled request loses the
+	// request itself. No caller may do this — every call site passes a real head — and
+	// this assertion exists so that if one ever stops, the cost is visible here.
 	const naive = await m.compactMessages(assembled, async () => 'SUMMARY');
 	assert.ok(!naive.messages.some(x => x.content === 'THE ACTUAL REQUEST'),
-		'default behavior drops the request when a context blob leads');
+		'omitting keepHead on an assembled request drops the request — callers must pass one');
 
 	// With keepHead the head is preserved verbatim and only later turns are summarized.
 	const res = await m.compactMessages(assembled, async () => 'SUMMARY', 3);
@@ -123,8 +125,41 @@ console.log('test-compaction thresholds: all assertions passed');
 	// replaced counts only post-head messages, so it stays in the webview's terms.
 	assert.strictEqual(res.replaced, assembled.length - 3 - 6);
 
-	// keepHead of 0 and an out-of-range keepHead are both handled without throwing.
+	// Out-of-range keepHead leaves nothing compactable rather than throwing.
 	assert.strictEqual(await m.compactMessages(assembled, async () => 'S', 999), undefined);
-	assert.ok(await m.compactMessages(assembled, async () => 'S', 0));
+	// keepHead 0 protects nothing — including the system prompt, which then lands in the
+	// compacted region. Callers must pass a real head; this pins the consequence so the
+	// behavior is a documented hazard rather than a surprise.
+	const noHead = await m.compactMessages(assembled, async () => 'S', 0);
+	assert.strictEqual(noHead.messages[0].role, 'user', 'keepHead 0 drops the system prompt');
+	assert.ok(noHead.messages[0].content.startsWith(m.COMPACT_MARKER));
 }
 console.log('test-compaction keepHead: all assertions passed');
+
+// The summarizer payload must be a plain chat request: no assistant tool_calls and no
+// role:'tool' turns. It is sent with no `tools` declared, and the slice is cut at a
+// fixed offset from the tail, so unflattened it is an invalid request — OpenAI rejects
+// an unanswered tool_calls, Anthropic rejects tool blocks when tools is undefined.
+{
+	const msgs = [
+		{ role: 'system', content: 'SYS' },
+		{ role: 'user', content: 'REQ' },
+	];
+	for (let i = 0; i < 8; i++) {
+		msgs.push({ role: 'assistant', content: big(3_000), toolCalls: [{ id: 'c' + i, name: 'read_file', args: { path: 'a.ts' } }] });
+		msgs.push({ role: 'tool', content: big(3_000), toolCallId: 'c' + i });
+	}
+	for (let i = 0; i < 6; i++) { msgs.push({ role: 'user', content: 'recent ' + i }); }
+
+	let sent;
+	const res = await m.compactMessages(msgs, async payload => { sent = payload; return 'SUMMARY'; }, 2);
+	assert.ok(res, 'compaction ran');
+	assert.ok(!sent.some(x => x.toolCalls?.length), 'no assistant tool_calls reach the summarizer');
+	assert.ok(!sent.some(x => x.role === 'tool'), 'no tool-role turns reach the summarizer');
+	// The information survives as text rather than being dropped.
+	assert.ok(sent.some(x => x.content.includes('[tool call: read_file(')), 'tool calls survive as prose');
+	assert.ok(sent.some(x => x.content.startsWith('[tool result]')), 'tool results survive as prose');
+	// The compacted conversation itself still carries real tool structure where it is valid.
+	assert.ok(res.messages.slice(0, 2).every(x => !x.toolCalls), 'head unchanged');
+}
+console.log('test-compaction summarizer payload: all assertions passed');
