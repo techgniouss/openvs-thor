@@ -69,20 +69,35 @@ export function shouldCompact(messages: ChatMessage[], contextWindow: number, tr
 }
 
 /**
- * Replaces the compactable middle of `messages` (everything between the first user
- * turn and the last {@link KEEP_RECENT_TURNS}) with one summary turn produced by
- * `summarize`. Returns undefined when there is too little to compact or the
- * summarizer fails/returns nothing — callers then fall back to plain trimming.
+ * Index just past the first user turn, or -1 when there is none. Only a safe default
+ * when the first user turn really is the task — see {@link compactMessages}'s `keepHead`.
+ */
+function firstTurnEnd(messages: ChatMessage[]): number {
+	const firstUser = messages.findIndex(m => m.role === 'user');
+	return firstUser === -1 ? -1 : firstUser + 1;
+}
+
+/**
+ * Replaces the compactable middle of `messages` (everything between the head and the
+ * last {@link KEEP_RECENT_TURNS}) with one summary turn produced by `summarize`.
+ * Returns undefined when there is too little to compact or the summarizer
+ * fails/returns nothing — callers then fall back to plain trimming.
+ *
+ * `keepHead` is how many leading messages to preserve verbatim. Pass it whenever the
+ * caller knows the layout: an assembled request is `[system, attached context?, the
+ * request, …]`, and the default — preserve through the first user turn — would then
+ * protect the bulky context blob while summarizing away the request itself. Omit it
+ * only for a bare conversation whose first user turn genuinely is the task.
  */
 export async function compactMessages(
 	messages: ChatMessage[],
 	summarize: (messages: ChatMessage[], maxTokens: number) => Promise<string>,
+	keepHead?: number,
 ): Promise<{ messages: ChatMessage[]; before: number; after: number; replaced: number } | undefined> {
-	const firstUser = messages.findIndex(m => m.role === 'user');
-	if (firstUser === -1) {
+	const start = keepHead === undefined ? firstTurnEnd(messages) : Math.min(Math.max(keepHead, 0), messages.length);
+	if (start < 0) {
 		return undefined;
 	}
-	const start = firstUser + 1;
 	const end = messages.length - KEEP_RECENT_TURNS;
 	if (end - start < MIN_COMPACTABLE) {
 		return undefined;

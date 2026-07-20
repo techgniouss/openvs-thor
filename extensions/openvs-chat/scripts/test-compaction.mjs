@@ -97,3 +97,34 @@ console.log('test-compaction: all assertions passed');
 	assert.strictEqual(m.shouldCompact(msgs, 32_000, 17_408), true, 'budget-aware threshold fires');
 }
 console.log('test-compaction thresholds: all assertions passed');
+
+// keepHead: an assembled request is [system, attached context, the request, ...]. The
+// default "preserve through the first user turn" would protect the bulky context blob
+// and summarize away the request itself — keepHead is what prevents that.
+{
+	const assembled = [
+		{ role: 'system', content: 'SYSTEM' },
+		{ role: 'user', content: 'Context for the request:\n\n' + big(40_000) },
+		{ role: 'user', content: 'THE ACTUAL REQUEST' },
+		...Array.from({ length: 8 }, (_, i) => ({ role: 'assistant', content: 'work ' + i })),
+		...Array.from({ length: 6 }, (_, i) => ({ role: 'user', content: 'recent ' + i })),
+	];
+	// Without keepHead the request is lost — the bug this parameter exists to fix.
+	const naive = await m.compactMessages(assembled, async () => 'SUMMARY');
+	assert.ok(!naive.messages.some(x => x.content === 'THE ACTUAL REQUEST'),
+		'default behavior drops the request when a context blob leads');
+
+	// With keepHead the head is preserved verbatim and only later turns are summarized.
+	const res = await m.compactMessages(assembled, async () => 'SUMMARY', 3);
+	assert.deepStrictEqual(res.messages.slice(0, 3), assembled.slice(0, 3), 'head kept verbatim');
+	assert.ok(res.messages.some(x => x.content === 'THE ACTUAL REQUEST'), 'the request survives');
+	assert.ok(res.messages[3].content.startsWith(m.COMPACT_MARKER), 'summary follows the head');
+	assert.deepStrictEqual(res.messages.slice(4), assembled.slice(-6), 'recent turns kept verbatim');
+	// replaced counts only post-head messages, so it stays in the webview's terms.
+	assert.strictEqual(res.replaced, assembled.length - 3 - 6);
+
+	// keepHead of 0 and an out-of-range keepHead are both handled without throwing.
+	assert.strictEqual(await m.compactMessages(assembled, async () => 'S', 999), undefined);
+	assert.ok(await m.compactMessages(assembled, async () => 'S', 0));
+}
+console.log('test-compaction keepHead: all assertions passed');

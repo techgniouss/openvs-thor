@@ -764,28 +764,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 			// Built inside the try: a failure while assembling the prompt (rules file,
 			// environment probe, attached context) must still report an error and a `done`,
 			// or the tab stays stuck "streaming" forever.
-			const history: ChatMessage[] = await this.compactHistory(
+			const history: ChatMessage[] = this.sanitizeHistory(message.messages ?? []);
+			const readTools = (mode === 'ask' || mode === 'plan') && !!provider.runAgentStep && this.modelToolCapable(providerId, provider, model);
+			const systemPrompt = this.buildSystemPrompt(mode, await this.baseSystem(), !!message.inline, readTools);
+			const assembled: ChatMessage[] = [{ role: 'system', content: systemPrompt }];
+			const context = await this.resolveContext(mode, message.context);
+			if (context) {
+				assembled.push({ role: 'user', content: `Context for the request:\n\n${context.content}` });
+			}
+			assembled.push(...history);
+
+			// Compact the assembled request, protecting the system prompt, any attached
+			// context, and the request itself.
+			const keepHead = assembled.length - history.length + 1;
+			const messages = await this.compactHistory(
 				provider,
-				this.sanitizeHistory(message.messages ?? []),
+				assembled,
+				keepHead,
 				{ model, apiKey: apiKey ?? '', baseUrl: params.baseUrl, maxTokens: params.maxTokens, signal: controller.signal },
 				post,
 			);
-			const readTools = (mode === 'ask' || mode === 'plan') && !!provider.runAgentStep && this.modelToolCapable(providerId, provider, model);
-			const systemPrompt = this.buildSystemPrompt(mode, await this.baseSystem(), !!message.inline, readTools);
-			const messages: ChatMessage[] = [{ role: 'system', content: systemPrompt }];
-			const context = await this.resolveContext(mode, message.context);
-			if (context) {
-				messages.push({ role: 'user', content: `Context for the request:\n\n${context.content}` });
-			}
-			messages.push(...history);
 
 			if (mode === 'agent') {
-				this.reportStop(post, await this.runAgent(provider, messages, { ...params, signal: controller.signal }, post, sessionId));
+				this.reportStop(post, await this.runAgent(provider, messages, { ...params, signal: controller.signal }, post, sessionId, keepHead));
 			} else if (readTools) {
 				// Ask/Plan get the read-only tool loop when the model can call tools: the
 				// model reads/lists/searches whatever files it needs to answer or plan,
 				// but has no write or command tools, so it cannot change anything.
-				this.reportStop(post, await this.runReadOnlyAgent(provider, messages, { ...params, signal: controller.signal }, post));
+				this.reportStop(post, await this.runReadOnlyAgent(provider, messages, { ...params, signal: controller.signal }, post, keepHead));
 			} else {
 				await this.runStreaming(provider, messages, { ...params, signal: controller.signal }, mode, post);
 			}
@@ -992,12 +998,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		messages: ChatMessage[],
 		params: { model: string; apiKey: string; baseUrl: string; maxTokens: number; signal: AbortSignal },
 		post: SessionPost,
+		keepHead?: number,
 	): Promise<RunResult> {
 		const configured = this.configuredMaxSteps();
 		const runner = new AgentRunner(provider, this, Math.min(configured, 8), {
 			readOnly: true,
 			maxContextTokens: this.configuredContextTokens(params.model, params.maxTokens),
 			contextWindow: contextWindowFor(params.model),
+			keepHead,
 		});
 		let stepThinking: ThinkingStreamParser | undefined;
 		return runner.run(messages, params, {
@@ -1017,6 +1025,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		params: { model: string; apiKey: string; baseUrl: string; maxTokens: number; signal: AbortSignal },
 		post: SessionPost,
 		sessionId: string,
+		keepHead?: number,
 	): Promise<RunResult> {
 		const maxSteps = this.configuredMaxSteps();
 		await this.mcp.ensureStarted();
@@ -1037,6 +1046,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 			mcp: this.mcp,
 			maxContextTokens: this.configuredContextTokens(params.model, params.maxTokens),
 			contextWindow: contextWindowFor(params.model),
+			keepHead,
 			steering: () => {
 				const queued = this.steerQueues.get(sessionId) ?? [];
 				this.steerQueues.delete(sessionId);
@@ -1083,22 +1093,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 	}
 
 	/**
-	 * Compacts an oversized incoming history before dispatch: old turns are replaced by
-	 * a model-written summary and the webview is told to persist the replacement, so
-	 * the next send arrives already compacted instead of paying the summary again.
+	 * Compacts an oversized request before dispatch: old turns are replaced by a
+	 * model-written summary and the webview is told to persist the replacement, so the
+	 * next send arrives already compacted instead of paying the summary again.
+	 *
+	 * Takes the fully assembled `messages`, not the bare history, for two reasons: the
+	 * system prompt and any attached context are what actually push a request over the
+	 * threshold, and every dispatch path (agent, read-only tool loop, plain streaming)
+	 * then gets the same treatment. `keepHead` covers `[system, context?, the request]`
+	 * so compaction can never summarize away the request itself.
+	 *
+	 * `replaced` counts only messages after the head, all of which came from the
+	 * webview's payload, so the count it reports stays in the webview's terms.
 	 */
 	private async compactHistory(
 		provider: ChatProvider,
-		history: ChatMessage[],
+		messages: ChatMessage[],
+		keepHead: number,
 		params: { model: string; apiKey: string; baseUrl: string; maxTokens: number; signal: AbortSignal },
 		post: SessionPost,
 	): Promise<ChatMessage[]> {
 		// The trim budget is passed too, so compaction always precedes the lossy trim.
 		const trimBudget = this.configuredContextTokens(params.model, params.maxTokens);
-		if (!shouldCompact(history, contextWindowFor(params.model), trimBudget)) {
-			return history;
+		if (!shouldCompact(messages, contextWindowFor(params.model), trimBudget)) {
+			return messages;
 		}
-		const res = await compactMessages(history, async (toSummarize, maxTokens) => {
+		const res = await compactMessages(messages, async (toSummarize, maxTokens) => {
 			let text = '';
 			await provider.streamChat({
 				messages: toSummarize,
@@ -1110,9 +1130,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 				onToken: delta => { text += delta; },
 			});
 			return stripThinking(text);
-		});
+		}, keepHead);
 		if (!res) {
-			return history;
+			return messages;
 		}
 		const summaryMsg = res.messages.find(m => m.content.startsWith(COMPACT_MARKER));
 		post({ type: 'compacted', summary: summaryMsg?.content ?? '', replaced: res.replaced });

@@ -107,6 +107,12 @@ interface AgentOptions {
 	maxContextTokens?: number;
 	/** Model context window in tokens; enables auto-compaction at 70% of it. 0/absent disables compaction. */
 	contextWindow?: number;
+	/**
+	 * How many leading seed messages compaction must preserve verbatim. The seed is
+	 * `[system, attached context?, the request, …]`, so without this compaction would
+	 * keep the context blob and summarize away the request. See `compactMessages`.
+	 */
+	keepHead?: number;
 }
 
 /**
@@ -124,6 +130,7 @@ export class AgentRunner {
 	private readonly mcp?: McpToolset;
 	private readonly steering?: () => string[];
 	private readonly contextWindow: number;
+	private readonly keepHead?: number;
 	private contextBudget: number;
 
 	constructor(
@@ -140,6 +147,7 @@ export class AgentRunner {
 		this.steering = opts?.steering;
 		this.contextBudget = opts?.maxContextTokens ?? DEFAULT_CONTEXT_TOKENS;
 		this.contextWindow = opts?.contextWindow ?? 0;
+		this.keepHead = opts?.keepHead;
 	}
 
 	/** The tools offered this run: read-only set for research sub-agents; otherwise the full set, plus delegation and any MCP tools. */
@@ -300,7 +308,7 @@ export class AgentRunner {
 			// Reasoning models stream their chain of thought through onToken too;
 			// the stored summary must not carry it.
 			return stripThinking(text);
-		});
+		}, this.keepHead);
 	}
 
 	/** Executes a step's tool calls: normal tools sequentially, sub-agents with parallel research. */
