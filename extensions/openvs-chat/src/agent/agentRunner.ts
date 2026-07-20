@@ -5,9 +5,11 @@
 
 import { McpToolset } from '../mcp/manager';
 import { SUBAGENT_PREAMBLE } from '../persona/prompts';
+import { stripThinking } from '../persona/thinking';
 import { TodoItem, UPDATE_TODOS_TOOL, parseTodoUpdate } from '../persona/todos';
 import { AgentStep, CONTINUE_PROMPT, ChatProvider, ChatMessage, ToolCall, ToolSpec } from '../providers/types';
-import { isContextLengthError, trimMessages } from './context';
+import { canCompact, compactMessages, compactionThreshold, shouldCompact } from './compaction';
+import { estimateMessagesTokens, isContextLengthError, trimMessages } from './context';
 import { Guardrails, autoApproves, loadGuardrails } from './guardrails';
 import { AGENT_TOOLS, READ_ONLY_TOOL_NAMES, SPAWN_SUBAGENT_TOOL, ToolApprover, executeTool } from './tools';
 
@@ -42,6 +44,13 @@ const DEFAULT_CONTEXT_TOKENS = 120_000;
 
 /** Floor for the adaptive budget, so repeated shrinking can't starve the conversation. */
 const MIN_CONTEXT_TOKENS = 8_000;
+
+/**
+ * Consecutive summarizer failures tolerated before compaction is abandoned for the run.
+ * More than one because a single failure is usually a rate limit or a network blip, and
+ * giving up on the first would forfeit compaction for the rest of a long run.
+ */
+const MAX_SUMMARIZER_FAILURES = 2;
 
 /**
  * Injected when a step produces prose but no tool call. Models routinely narrate a
@@ -103,6 +112,14 @@ interface AgentOptions {
 	steering?: () => string[];
 	/** Estimated-token ceiling for the conversation sent each step. 0 disables trimming. */
 	maxContextTokens?: number;
+	/** Model context window in tokens; enables auto-compaction at 70% of it. 0/absent disables compaction. */
+	contextWindow?: number;
+	/**
+	 * How many leading seed messages compaction must preserve verbatim. The seed is
+	 * `[system, attached context?, the request, …]`, so without this compaction would
+	 * keep the context blob and summarize away the request. See `compactMessages`.
+	 */
+	keepHead?: number;
 }
 
 /**
@@ -119,6 +136,12 @@ export class AgentRunner {
 	private readonly readOnly: boolean;
 	private readonly mcp?: McpToolset;
 	private readonly steering?: () => string[];
+	private readonly contextWindow: number;
+	private readonly keepHead?: number;
+	/** Set once compacting stops paying for itself, so the run doesn't re-summarize every few steps. */
+	private compactionExhausted = false;
+	/** Consecutive summarizer failures; reset by any success, so a one-off blip isn't terminal. */
+	private summarizerFailures = 0;
 	private contextBudget: number;
 
 	constructor(
@@ -134,6 +157,8 @@ export class AgentRunner {
 		this.mcp = opts?.mcp;
 		this.steering = opts?.steering;
 		this.contextBudget = opts?.maxContextTokens ?? DEFAULT_CONTEXT_TOKENS;
+		this.contextWindow = opts?.contextWindow ?? 0;
+		this.keepHead = opts?.keepHead;
 	}
 
 	/** The tools offered this run: read-only set for research sub-agents; otherwise the full set, plus delegation and any MCP tools. */
@@ -171,6 +196,36 @@ export class AgentRunner {
 			// Course corrections typed while the previous step ran enter the loop here.
 			for (const note of this.steering?.() ?? []) {
 				messages.push({ role: 'user', content: note });
+			}
+
+			// Compact ahead of the hard budget: replace old middle turns with a summary
+			// once past the trigger share of the model's window, so the model keeps a
+			// coherent task memory instead of trim markers.
+			// `canCompact` is checked separately from the result: "not enough middle yet"
+			// is transient and resolves as the run grows, so it must never be mistaken for
+			// a failure — doing so used to disable compaction for a whole run at step 0.
+			if (this.contextWindow && !this.compactionExhausted
+				&& shouldCompact(messages, this.contextWindow, this.contextBudget)
+				&& canCompact(messages, this.keepHead)) {
+				const compacted = await this.compact(messages, params);
+				if (compacted) {
+					this.summarizerFailures = 0;
+					messages.splice(0, messages.length, ...compacted.messages);
+					callbacks.onNote(`Compacted the conversation (~${Math.round(compacted.before / 1000)}k → ~${Math.round(compacted.after / 1000)}k tokens).`);
+					// Give up only when the protected head ALONE is over the threshold —
+					// nothing further can shrink it, so summarizing again would buy nothing.
+					// Judging by the post-compaction total instead would misfire whenever the
+					// verbatim recent turns are merely bulky: those roll into the compactable
+					// middle within a step or two, and compacting them does pay off.
+					const head = messages.slice(0, this.keepHead ?? 0);
+					if (estimateMessagesTokens(head) >= compactionThreshold(this.contextWindow, this.contextBudget)) {
+						this.compactionExhausted = true;
+						callbacks.onNote('The conversation is still near the context limit after compacting — older tool output will be trimmed from here on.');
+					}
+				} else if (++this.summarizerFailures >= MAX_SUMMARIZER_FAILURES) {
+					// Persistent failure (not a one-off rate limit), so stop paying for it.
+					this.compactionExhausted = true;
+				}
 			}
 
 			callbacks.onStepStart();
@@ -265,6 +320,25 @@ export class AgentRunner {
 			callbacks.onNote(`The conversation outgrew the model's context window — trimming older tool output and retrying.`);
 			return ask(this.contextBudget);
 		}
+	}
+
+	/** Runs the summarizer through the same provider/model; failures return undefined so the run falls back to trimming. */
+	private async compact(messages: ChatMessage[], params: AgentParams) {
+		return compactMessages(messages, async (toSummarize, maxTokens) => {
+			let text = '';
+			await this.provider.streamChat({
+				messages: toSummarize,
+				model: params.model,
+				apiKey: params.apiKey,
+				baseUrl: params.baseUrl,
+				maxTokens,
+				signal: params.signal,
+				onToken: delta => { text += delta; },
+			});
+			// Reasoning models stream their chain of thought through onToken too;
+			// the stored summary must not carry it.
+			return stripThinking(text);
+		}, this.keepHead);
 	}
 
 	/** Executes a step's tool calls: normal tools sequentially, sub-agents with parallel research. */

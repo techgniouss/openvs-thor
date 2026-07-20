@@ -181,4 +181,142 @@ const noopCallbacks = () => {
 	);
 }
 
+// 11. Auto-compaction: when the conversation passes 70% of contextWindow, the runner
+// summarizes old turns via streamChat before the next step.
+{
+	const big = 'x'.repeat(60_000); // ~15k estimated tokens per message
+	let streamChatCalls = 0;
+	const stepsSeen = [];
+	// Built on the file's fakeProvider shape, plus a streamChat the compactor can call.
+	const provider = {
+		...fakeProvider([]),
+		async streamChat(request) {
+			streamChatCalls++;
+			request.onToken('SUMMARY OF OLD TURNS');
+			return { truncated: false };
+		},
+		async runAgentStep(request) {
+			stepsSeen.push(request.messages);
+			return { content: 'done', toolCalls: [], truncated: false };
+		},
+	};
+	// contextWindow 50_000 → trigger at 35k estimated tokens; the big seed turns cross it.
+	const runner = new AgentRunner(provider, approver, 10, {
+		readOnly: true,
+		contextWindow: 50_000,
+		maxContextTokens: 1_000_000, // keep trimming out of the way so compaction is what's tested
+	});
+	const cb = noopCallbacks();
+	// The middle must hold at least MIN_COMPACTABLE (4) turns between the first user
+	// message and the 6 protected recent ones, or compaction correctly declines to run.
+	const seed = [
+		{ role: 'system', content: 'SYS' },
+		{ role: 'user', content: 'GOAL' },
+		{ role: 'assistant', content: big },
+		{ role: 'assistant', content: big },
+		{ role: 'assistant', content: big },
+		{ role: 'assistant', content: big },
+		{ role: 'user', content: 'q1' }, { role: 'assistant', content: 'a1' },
+		{ role: 'user', content: 'q2' }, { role: 'assistant', content: 'a2' },
+		{ role: 'user', content: 'q3' }, { role: 'assistant', content: 'a3' },
+	];
+	const result = await runner.run(seed, params, cb);
+	assert.strictEqual(result.reason, 'done');
+	assert.strictEqual(streamChatCalls, 1, 'summarizer ran exactly once');
+	assert.ok(cb.notes.some(n => n.includes('Compacted')), 'user was told about the compaction');
+	// The first model step already saw the compacted conversation: summary marker present, big turns gone.
+	const firstStep = stepsSeen[0];
+	assert.ok(firstStep.some(msg => msg.content.includes('SUMMARY OF OLD TURNS')));
+	assert.ok(!firstStep.some(msg => msg.content.length >= 60_000));
+}
+
+
+// 12. Compaction that fails to get under the threshold is not retried every few steps:
+// when the protected head alone exceeds it, summarizing again costs a request and
+// shrinks nothing, so the run falls through to trimming instead.
+{
+	const big = 'x'.repeat(60_000);
+	let streamChatCalls = 0;
+	let steps = 0;
+	const provider = {
+		...fakeProvider([]),
+		async streamChat(request) {
+			streamChatCalls++;
+			request.onToken('SUMMARY');
+			return { truncated: false };
+		},
+		async runAgentStep() {
+			steps++;
+			// Keep requesting tools so the loop keeps going and re-evaluates compaction.
+			return steps < 8
+				? { content: '', toolCalls: [{ id: 'c' + steps, name: 'list_dir', args: { path: '.' } }], truncated: false }
+				: { content: 'done', toolCalls: [], truncated: false };
+		},
+	};
+	// Window 30k => threshold 21k, but keepHead protects two 15k-token seed messages, so
+	// the head alone (~30k) can never fit — exactly the condition that used to
+	// re-summarize forever.
+	const runner = new AgentRunner(provider, approver, 20, {
+		readOnly: true,
+		contextWindow: 30_000,
+		maxContextTokens: 1_000_000,
+		keepHead: 3,
+	});
+	const cb = noopCallbacks();
+	const seed = [
+		{ role: 'system', content: 'SYS' },
+		{ role: 'user', content: big },
+		{ role: 'user', content: big },
+		...Array.from({ length: 8 }, (_, i) => ({ role: 'assistant', content: 'work ' + i })),
+		...Array.from({ length: 6 }, (_, i) => ({ role: 'user', content: 'recent ' + i })),
+	];
+	const result = await runner.run(seed, params, cb);
+	assert.strictEqual(result.reason, 'done');
+	assert.strictEqual(streamChatCalls, 1, 'compaction is attempted once, not once per step');
+	assert.ok(cb.notes.some(n => n.includes('still near the context limit')), 'the user is told trimming takes over');
+}
+
+// 13. Crossing the threshold BEFORE there is enough middle to summarize is transient, not
+// a failure: the run must still compact once the middle has grown. Treating that early
+// "nothing to compact yet" as terminal used to disable compaction for the whole run.
+{
+	let streamChatCalls = 0;
+	let steps = 0;
+	const provider = {
+		...fakeProvider([]),
+		async streamChat(request) {
+			streamChatCalls++;
+			request.onToken('SUMMARY');
+			return { truncated: false };
+		},
+		async runAgentStep() {
+			steps++;
+			return steps < 12
+				? { content: 'x'.repeat(40_000), toolCalls: [{ id: 'c' + steps, name: 'list_dir', args: { path: '.' } }], truncated: false }
+				: { content: 'done', toolCalls: [], truncated: false };
+		},
+	};
+	// The seed is small, so the protected head can never be the problem. Bulk arrives from
+	// the run itself: the threshold (21k) is crossed around step 3, but keepHead 4 means
+	// nothing is compactable until the array reaches 14 messages (~step 5).
+	const seed = [
+		{ role: 'system', content: 'SYS' },
+		{ role: 'user', content: 'CONTEXT' },
+		{ role: 'assistant', content: 'plan' },
+		{ role: 'user', content: 'implement' },
+	];
+	const runner = new AgentRunner(provider, approver, 20, {
+		readOnly: true,
+		contextWindow: 30_000,
+		maxContextTokens: 1_000_000,
+		keepHead: seed.length,
+	});
+	const cb = noopCallbacks();
+	const result = await runner.run(seed, params, cb);
+	assert.strictEqual(result.reason, 'done');
+	assert.ok(streamChatCalls >= 1, 'compaction still happens once the run accumulates a middle');
+	assert.ok(!cb.notes.some(n => n.includes('still near the context limit')),
+		'a small head is never reported as exhausted');
+}
+
 console.log('test-agent-loop: all assertions passed');

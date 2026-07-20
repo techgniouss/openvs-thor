@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { AgentCallbacks, AgentRunner } from '../agent/agentRunner';
+import { contextWindowFor } from '../agent/contextWindow';
 import { ToolApprover } from '../agent/tools';
 import { McpToolset } from '../mcp/manager';
 import { TodoItem } from '../persona/todos';
@@ -216,7 +217,13 @@ export class AutoOrchestrator {
 				continue;
 			}
 			cb.phase('code', a, false);
-			const runner = new AgentRunner(provider, this.approver, this.maxSteps, { mcp: this.mcp });
+			// The whole seed is the task definition (system prompt, context, plan, the
+			// instruction); only what the agent produces during the run may be compacted.
+			const runner = new AgentRunner(provider, this.approver, this.maxSteps, {
+				mcp: this.mcp,
+				contextWindow: contextWindowFor(a.model),
+				keepHead: seed.length,
+			});
 			try {
 				const outcome = await runner.run(
 					seed,
@@ -284,17 +291,21 @@ export class AutoOrchestrator {
 				throw new DOMException('Aborted', 'AbortError');
 			}
 			cb.note(`Step ${i + 1}/${steps.length}: ${steps[i]}`);
-			const runner = new AgentRunner(provider, this.approver, this.maxSteps, { budget, mcp: this.mcp });
-			const outcome = await runner.run(
-				[
-					{ role: 'system', content: codeSystem(params.baseSystemPrompt) },
-					...ctxMessages,
-					{ role: 'assistant', content: `Overall plan:\n\n${planText}` },
-					{ role: 'user', content: `Complete ONLY this step of the plan, using the tools:\n\n${steps[i]}` },
-				],
-				runParams,
-				agentCallbacks(cb, sink),
-			);
+			const stepSeed: ChatMessage[] = [
+				{ role: 'system', content: codeSystem(params.baseSystemPrompt) },
+				...ctxMessages,
+				{ role: 'assistant', content: `Overall plan:\n\n${planText}` },
+				{ role: 'user', content: `Complete ONLY this step of the plan, using the tools:\n\n${steps[i]}` },
+			];
+			// Protect the whole seed: compacting away "Complete ONLY this step" would let
+			// the agent drift onto the rest of the plan.
+			const runner = new AgentRunner(provider, this.approver, this.maxSteps, {
+				budget,
+				mcp: this.mcp,
+				contextWindow: contextWindowFor(a.model),
+				keepHead: stepSeed.length,
+			});
+			const outcome = await runner.run(stepSeed, runParams, agentCallbacks(cb, sink));
 			if (outcome.reason !== 'done' && outcome.detail) {
 				cb.note(`Step ${i + 1} stopped early — ${outcome.detail}`);
 			}

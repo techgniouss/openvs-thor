@@ -355,8 +355,14 @@
         },
         "openvsChat.agent.maxContextTokens": {
           "type": "number",
-          "default": 120000,
+          "default": 0,
           "description": "%config.agent.maxContextTokens%"
+        },
+        "openvsChat.ask.autoContext": {
+          "type": "string",
+          "enum": ["active", "tabs", "off"],
+          "default": "active",
+          "description": "%config.ask.autoContext%"
         },
         "openvsChat.stream.idleTimeoutMs": {
           "type": "number",

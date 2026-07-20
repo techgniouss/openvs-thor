@@ -81,7 +81,7 @@ export class AnthropicProvider implements ChatProvider {
 				model: request.model,
 				max_tokens: request.maxTokens,
 				system: buildSystem(system, isOAuthToken(request.apiKey)),
-				messages: toAnthropicMessages(messages),
+				messages: withCacheBreakpoint(toAnthropicMessages(messages)),
 				stream: true,
 			}),
 		}, request.signal, {
@@ -146,7 +146,7 @@ export class AnthropicProvider implements ChatProvider {
 				model: request.model,
 				max_tokens: request.maxTokens,
 				system: buildSystem(system, isOAuthToken(request.apiKey)),
-				messages: toAnthropicMessages(messages),
+				messages: withCacheBreakpoint(toAnthropicMessages(messages)),
 				tools: request.tools.map(t => ({
 					name: t.name,
 					description: t.description,
@@ -214,18 +214,25 @@ export class AnthropicProvider implements ChatProvider {
 }
 
 /**
- * Builds the top-level `system` field. API keys take the plain string; OAuth
- * (subscription) tokens require the first-party CLI identity as the first block,
- * with the real system prompt appended as a second block.
+ * Builds the top-level `system` field. OAuth (subscription) tokens require the
+ * first-party CLI identity as the first block, with the real system prompt appended
+ * as a second block; API keys skip that identity block. Always returns an array (never
+ * a plain string) so the last block can carry a cache breakpoint.
  */
-function buildSystem(system: string, oauth: boolean): string | { type: 'text'; text: string }[] | undefined {
-	if (!oauth) {
-		return system || undefined;
+function buildSystem(system: string, oauth: boolean): ({ type: 'text'; text: string } & CacheControl)[] | undefined {
+	const blocks: ({ type: 'text'; text: string } & CacheControl)[] = [];
+	if (oauth) {
+		blocks.push({ type: 'text', text: CLAUDE_CODE_SYSTEM });
 	}
-	const blocks: { type: 'text'; text: string }[] = [{ type: 'text', text: CLAUDE_CODE_SYSTEM }];
 	if (system) {
 		blocks.push({ type: 'text', text: system });
 	}
+	if (!blocks.length) {
+		return undefined;
+	}
+	// One breakpoint after the system prompt: tools + system form a stable prefix
+	// the API can serve from cache on every subsequent step of a run.
+	blocks[blocks.length - 1].cache_control = { type: 'ephemeral' };
 	return blocks;
 }
 
@@ -234,11 +241,12 @@ function splitSystem(messages: ChatMessage[]): { system: string; messages: ChatM
 	return { system, messages: messages.filter(m => m.role !== 'system') };
 }
 
-type AnthropicBlock =
+type CacheControl = { cache_control?: { type: 'ephemeral' } };
+type AnthropicBlock = CacheControl & (
 	| { type: 'text'; text: string }
 	| { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }
 	| { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
-	| { type: 'tool_result'; tool_use_id: string; content: string };
+	| { type: 'tool_result'; tool_use_id: string; content: string });
 type AnthropicMsg = { role: 'user' | 'assistant'; content: AnthropicBlock[] };
 
 /**
@@ -291,4 +299,18 @@ function toAnthropicMessages(messages: ChatMessage[]): AnthropicMsg[] {
 		out.unshift({ role: 'user', content: [{ type: 'text', text: '(continue)' }] });
 	}
 	return out;
+}
+
+/**
+ * Marks the final content block as a cache breakpoint, so the whole conversation up
+ * to this request is a cache hit on the next step (the API caches the longest
+ * previously-seen prefix; the moving breakpoint extends it step by step).
+ */
+function withCacheBreakpoint(msgs: AnthropicMsg[]): AnthropicMsg[] {
+	const last = msgs[msgs.length - 1];
+	const block = last?.content[last.content.length - 1];
+	if (block) {
+		block.cache_control = { type: 'ephemeral' };
+	}
+	return msgs;
 }

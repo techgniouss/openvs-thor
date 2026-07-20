@@ -78,3 +78,22 @@ export function formatThinking(text: string): string {
 	parser.flush();
 	return out;
 }
+
+/**
+ * Matches a rendered thinking block: the OPEN_MARK, lazily up to the CLOSE_MARK
+ * separator or end of text (a stream that died inside a thinking block never
+ * emitted the separator — everything after the marker was reasoning).
+ */
+const THINKING_BLOCK = /🤔 \*Thinking…\*\n\n[\s\S]*?(?:\n\n---\n\n|$)/g;
+
+/**
+ * Removes rendered thinking blocks from a committed reply. The transcript shown to
+ * the user keeps them, but re-sending past reasoning as history on every subsequent
+ * turn is pure token waste — the model never needs its own stale thinking back.
+ */
+export function stripThinking(text: string): string {
+	if (!text.includes(OPEN_MARK)) {
+		return text;
+	}
+	return text.replace(THINKING_BLOCK, '').trim();
+}

@@ -117,7 +117,7 @@ export function trimMessages(messages: ChatMessage[], budget: number): ChatMessa
 }
 
 /** Removes `tool` messages whose matching assistant tool_call id is not present earlier. */
-function dropOrphanToolResults(messages: ChatMessage[]): ChatMessage[] {
+export function dropOrphanToolResults(messages: ChatMessage[]): ChatMessage[] {
 	const seen = new Set<string>();
 	const out: ChatMessage[] = [];
 	for (const m of messages) {

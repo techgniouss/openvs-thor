@@ -5,7 +5,9 @@
 
 import * as vscode from 'vscode';
 import { AgentRunner, RunResult } from './agent/agentRunner';
+import { COMPACT_MARKER, compactMessages, shouldCompact } from './agent/compaction';
 import { trimMessages } from './agent/context';
+import { contextBudgetFor, contextWindowFor } from './agent/contextWindow';
 import { ToolApprover } from './agent/tools';
 import { AutoOrchestrator } from './auto/orchestrator';
 import { AUTO_ROLES, AutoRole, RoleRouter } from './auto/router';
@@ -14,7 +16,7 @@ import { McpManager } from './mcp/manager';
 import { supportsNativeSignIn } from './oauth';
 import { buildEnvContext } from './persona/envContext';
 import { modeDoctrine, personaBase } from './persona/prompts';
-import { ThinkingStreamParser, formatThinking } from './persona/thinking';
+import { ThinkingStreamParser, formatThinking, stripThinking } from './persona/thinking';
 import { ProviderRegistry } from './providers/registry';
 import { ChatMessage, ChatProvider, ModelEntry, entrySupportsTools, modelSupportsVision, streamChatWithContinuation } from './providers/types';
 import { RulesProvider } from './rules';
@@ -35,9 +37,6 @@ const AUTO_PROVIDER = '__auto__';
  * several, running a build and fixing the fallout — rather than a quick Q&A.
  */
 const DEFAULT_MAX_STEPS = 25;
-
-/** Default estimated-token ceiling for a conversation before old tool output is trimmed. */
-const DEFAULT_CONTEXT_TOKENS = 120_000;
 
 /** A unique id for one send, used to fence out messages from a superseded run. */
 function newRunId(): string {
@@ -136,10 +135,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 	private async baseSystem(): Promise<string> {
 		const env = vscode.workspace.getConfiguration('openvsChat').get<boolean>('persona.environment') !== false ? await buildEnvContext() : '';
 		let base = await this.rules.composeSystem(personaBase(env, this.registry.getSystemPrompt()));
+		const MAX_SKILL_CHARS = 16_000;
 		for (const skillId of this.activeSkillIds()) {
 			const skill = await this.skills.get(skillId);
 			if (skill?.instructions) {
-				base = `${base}\n\n## Active skill: ${skill.name}\n${skill.instructions}`;
+				const instructions = skill.instructions.length > MAX_SKILL_CHARS
+					? `${skill.instructions.slice(0, MAX_SKILL_CHARS)}\n\n…[skill truncated to fit the prompt budget]`
+					: skill.instructions;
+				base = `${base}\n\n## Active skill: ${skill.name}\n${instructions}`;
 			}
 		}
 		return base;
@@ -761,23 +764,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 			// Built inside the try: a failure while assembling the prompt (rules file,
 			// environment probe, attached context) must still report an error and a `done`,
 			// or the tab stays stuck "streaming" forever.
-			const history: ChatMessage[] = message.messages ?? [];
+			const history: ChatMessage[] = this.sanitizeHistory(message.messages ?? []);
 			const readTools = (mode === 'ask' || mode === 'plan') && !!provider.runAgentStep && this.modelToolCapable(providerId, provider, model);
 			const systemPrompt = this.buildSystemPrompt(mode, await this.baseSystem(), !!message.inline, readTools);
-			const messages: ChatMessage[] = [{ role: 'system', content: systemPrompt }];
+			const assembled: ChatMessage[] = [{ role: 'system', content: systemPrompt }];
 			const context = await this.resolveContext(mode, message.context);
 			if (context) {
-				messages.push({ role: 'user', content: `Context for the request:\n\n${context.content}` });
+				assembled.push({ role: 'user', content: `Context for the request:\n\n${context.content}` });
 			}
-			messages.push(...history);
+			assembled.push(...history);
+
+			// Compact the assembled request, protecting the system prompt, any attached
+			// context, and the request itself.
+			const keepHead = assembled.length - history.length + 1;
+			const messages = await this.compactHistory(
+				provider,
+				assembled,
+				keepHead,
+				{ model, apiKey: apiKey ?? '', baseUrl: params.baseUrl, maxTokens: params.maxTokens, signal: controller.signal },
+				post,
+			);
 
 			if (mode === 'agent') {
-				this.reportStop(post, await this.runAgent(provider, messages, { ...params, signal: controller.signal }, post, sessionId));
+				this.reportStop(post, await this.runAgent(provider, messages, { ...params, signal: controller.signal }, post, sessionId, keepHead));
 			} else if (readTools) {
 				// Ask/Plan get the read-only tool loop when the model can call tools: the
 				// model reads/lists/searches whatever files it needs to answer or plan,
 				// but has no write or command tools, so it cannot change anything.
-				this.reportStop(post, await this.runReadOnlyAgent(provider, messages, { ...params, signal: controller.signal }, post));
+				this.reportStop(post, await this.runReadOnlyAgent(provider, messages, { ...params, signal: controller.signal }, post, keepHead));
 			} else {
 				await this.runStreaming(provider, messages, { ...params, signal: controller.signal }, mode, post);
 			}
@@ -818,7 +832,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 	 * it routes to the single best role model (plan for Ask/Plan, code for inline edits).
 	 */
 	private async handleAutoSend(mode: ChatMode, message: WebviewToHost, sessionId: string, runId: string): Promise<void> {
-		const history: ChatMessage[] = message.messages ?? [];
+		const history: ChatMessage[] = this.sanitizeHistory(message.messages ?? []);
 		const post = this.sessionPost(sessionId, runId);
 		const fail = (text: string) => { post({ type: 'error', message: text }); };
 
@@ -922,7 +936,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		try {
 			({ text: full, truncated } = await streamChatWithContinuation(provider, {
 				// A long chat would otherwise grow until the provider rejects it outright.
-				messages: trimMessages(messages, this.configuredContextTokens()),
+				messages: trimMessages(messages, this.configuredContextTokens(params.model, params.maxTokens)),
 				...params,
 				onToken: delta => thinking.push(delta),
 				onNotice: text => post({ type: 'info', message: text }),
@@ -984,11 +998,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		messages: ChatMessage[],
 		params: { model: string; apiKey: string; baseUrl: string; maxTokens: number; signal: AbortSignal },
 		post: SessionPost,
+		keepHead?: number,
 	): Promise<RunResult> {
 		const configured = this.configuredMaxSteps();
 		const runner = new AgentRunner(provider, this, Math.min(configured, 8), {
 			readOnly: true,
-			maxContextTokens: this.configuredContextTokens(),
+			maxContextTokens: this.configuredContextTokens(params.model, params.maxTokens),
+			contextWindow: contextWindowFor(params.model),
+			keepHead,
 		});
 		let stepThinking: ThinkingStreamParser | undefined;
 		return runner.run(messages, params, {
@@ -1008,6 +1025,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		params: { model: string; apiKey: string; baseUrl: string; maxTokens: number; signal: AbortSignal },
 		post: SessionPost,
 		sessionId: string,
+		keepHead?: number,
 	): Promise<RunResult> {
 		const maxSteps = this.configuredMaxSteps();
 		await this.mcp.ensureStarted();
@@ -1026,7 +1044,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		this.steerQueues.delete(sessionId);
 		const runner = new AgentRunner(provider, this, maxSteps, {
 			mcp: this.mcp,
-			maxContextTokens: this.configuredContextTokens(),
+			maxContextTokens: this.configuredContextTokens(params.model, params.maxTokens),
+			contextWindow: contextWindowFor(params.model),
+			keepHead,
 			steering: () => {
 				const queued = this.steerQueues.get(sessionId) ?? [];
 				this.steerQueues.delete(sessionId);
@@ -1057,10 +1077,67 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		return typeof configured === 'number' && configured > 0 ? configured : DEFAULT_MAX_STEPS;
 	}
 
-	/** Estimated-token ceiling for the conversation, above which old tool output is trimmed. */
-	private configuredContextTokens(): number {
+	/**
+	 * Estimated-token ceiling for the conversation sent to `model`, above which old
+	 * tool output is trimmed. Derived from the model's context window unless the user
+	 * pinned an explicit openvsChat.agent.maxContextTokens.
+	 */
+	private configuredContextTokens(model: string, maxOutputTokens: number): number {
 		const configured = vscode.workspace.getConfiguration('openvsChat').get<number>('agent.maxContextTokens');
-		return typeof configured === 'number' && configured > 0 ? configured : DEFAULT_CONTEXT_TOKENS;
+		return contextBudgetFor(model, maxOutputTokens, typeof configured === 'number' ? configured : 0);
+	}
+
+	/** History arrives from the webview with rendered thinking blocks still in past assistant turns; never re-send those. */
+	private sanitizeHistory(history: ChatMessage[]): ChatMessage[] {
+		return history.map(m => m.role === 'assistant' ? { ...m, content: stripThinking(m.content) } : m);
+	}
+
+	/**
+	 * Compacts an oversized request before dispatch: old turns are replaced by a
+	 * model-written summary and the webview is told to persist the replacement, so the
+	 * next send arrives already compacted instead of paying the summary again.
+	 *
+	 * Takes the fully assembled `messages`, not the bare history, for two reasons: the
+	 * system prompt and any attached context are what actually push a request over the
+	 * threshold, and every dispatch path (agent, read-only tool loop, plain streaming)
+	 * then gets the same treatment. `keepHead` covers `[system, context?, the request]`
+	 * so compaction can never summarize away the request itself.
+	 *
+	 * `replaced` counts only messages after the head, all of which came from the
+	 * webview's payload, so the count it reports stays in the webview's terms.
+	 */
+	private async compactHistory(
+		provider: ChatProvider,
+		messages: ChatMessage[],
+		keepHead: number,
+		params: { model: string; apiKey: string; baseUrl: string; maxTokens: number; signal: AbortSignal },
+		post: SessionPost,
+	): Promise<ChatMessage[]> {
+		// The trim budget is passed too, so compaction always precedes the lossy trim.
+		const trimBudget = this.configuredContextTokens(params.model, params.maxTokens);
+		if (!shouldCompact(messages, contextWindowFor(params.model), trimBudget)) {
+			return messages;
+		}
+		const res = await compactMessages(messages, async (toSummarize, maxTokens) => {
+			let text = '';
+			await provider.streamChat({
+				messages: toSummarize,
+				model: params.model,
+				apiKey: params.apiKey,
+				baseUrl: params.baseUrl,
+				maxTokens,
+				signal: params.signal,
+				onToken: delta => { text += delta; },
+			});
+			return stripThinking(text);
+		}, keepHead);
+		if (!res) {
+			return messages;
+		}
+		const summaryMsg = res.messages.find(m => m.content.startsWith(COMPACT_MARKER));
+		post({ type: 'compacted', summary: summaryMsg?.content ?? '', replaced: res.replaced });
+		post({ type: 'info', message: `Compacted ${res.replaced} earlier message(s) (~${Math.round(res.before / 1000)}k → ~${Math.round(res.after / 1000)}k tokens).` });
+		return res.messages;
 	}
 
 	/**
@@ -1107,25 +1184,33 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		// editor tabs when nothing was attached explicitly. Plan intentionally gets only
 		// the user's requirement (plus anything they attached) — it plans, it doesn't read.
 		if (mode === 'ask' && !attached) {
-			return this.openEditorsContext();
+			const auto = vscode.workspace.getConfiguration('openvsChat').get<string>('ask.autoContext') ?? 'active';
+			if (auto === 'off') {
+				return undefined;
+			}
+			return this.openEditorsContext(auto === 'active');
 		}
 		return attached;
 	}
 
 	/**
-	 * Collects the content of the files open in editor tabs (active editor first) so Ask
-	 * mode can answer questions about what's loaded, capped per file and in total so a
-	 * wall of tabs can't blow the prompt budget.
+	 * Collects the URIs of the files open in editor tabs (active editor first, deduped) and
+	 * renders them via {@link filesContext} so Ask mode can answer questions about what's
+	 * loaded. When `activeOnly` is set, only the active editor is included.
 	 */
-	private async openEditorsContext(): Promise<AttachedContext | undefined> {
-		const PER_FILE_CHARS = 8_000;
-		const TOTAL_CHARS = 32_000;
+	private async openEditorsContext(activeOnly = false): Promise<AttachedContext | undefined> {
 		const active = vscode.window.activeTextEditor?.document.uri;
 		const seen = new Set<string>();
 		const uris: vscode.Uri[] = [];
 		if (active) {
 			seen.add(active.toString());
 			uris.push(active);
+		}
+		// Active-only means exactly that: with no focused editor there is nothing to
+		// attach. Falling through to the tab sweep here would quietly attach every open
+		// file — the expensive behavior this setting exists to avoid.
+		if (activeOnly) {
+			return this.filesContext(uris);
 		}
 		for (const group of vscode.window.tabGroups.all) {
 			for (const tab of group.tabs) {
@@ -1135,6 +1220,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 				}
 			}
 		}
+		return this.filesContext(uris);
+	}
+
+	/** Renders the given files (per-file and total capped) as one attached-context block. */
+	private async filesContext(uris: vscode.Uri[]): Promise<AttachedContext | undefined> {
+		const PER_FILE_CHARS = 8_000;
+		const TOTAL_CHARS = 32_000;
+		const active = vscode.window.activeTextEditor?.document.uri;
 		const parts: string[] = [];
 		let total = 0;
 		let included = 0;
