@@ -230,7 +230,6 @@ const noopCallbacks = () => {
 	assert.ok(!firstStep.some(msg => msg.content.length >= 60_000));
 }
 
-console.log('test-agent-loop: all assertions passed');
 
 // 12. Compaction that fails to get under the threshold is not retried every few steps:
 // when the protected head alone exceeds it, summarizing again costs a request and
@@ -276,3 +275,48 @@ console.log('test-agent-loop: all assertions passed');
 	assert.strictEqual(streamChatCalls, 1, 'compaction is attempted once, not once per step');
 	assert.ok(cb.notes.some(n => n.includes('still near the context limit')), 'the user is told trimming takes over');
 }
+
+// 13. Crossing the threshold BEFORE there is enough middle to summarize is transient, not
+// a failure: the run must still compact once the middle has grown. Treating that early
+// "nothing to compact yet" as terminal used to disable compaction for the whole run.
+{
+	let streamChatCalls = 0;
+	let steps = 0;
+	const provider = {
+		...fakeProvider([]),
+		async streamChat(request) {
+			streamChatCalls++;
+			request.onToken('SUMMARY');
+			return { truncated: false };
+		},
+		async runAgentStep() {
+			steps++;
+			return steps < 12
+				? { content: 'x'.repeat(40_000), toolCalls: [{ id: 'c' + steps, name: 'list_dir', args: { path: '.' } }], truncated: false }
+				: { content: 'done', toolCalls: [], truncated: false };
+		},
+	};
+	// The seed is small, so the protected head can never be the problem. Bulk arrives from
+	// the run itself: the threshold (21k) is crossed around step 3, but keepHead 4 means
+	// nothing is compactable until the array reaches 14 messages (~step 5).
+	const seed = [
+		{ role: 'system', content: 'SYS' },
+		{ role: 'user', content: 'CONTEXT' },
+		{ role: 'assistant', content: 'plan' },
+		{ role: 'user', content: 'implement' },
+	];
+	const runner = new AgentRunner(provider, approver, 20, {
+		readOnly: true,
+		contextWindow: 30_000,
+		maxContextTokens: 1_000_000,
+		keepHead: seed.length,
+	});
+	const cb = noopCallbacks();
+	const result = await runner.run(seed, params, cb);
+	assert.strictEqual(result.reason, 'done');
+	assert.ok(streamChatCalls >= 1, 'compaction still happens once the run accumulates a middle');
+	assert.ok(!cb.notes.some(n => n.includes('still near the context limit')),
+		'a small head is never reported as exhausted');
+}
+
+console.log('test-agent-loop: all assertions passed');

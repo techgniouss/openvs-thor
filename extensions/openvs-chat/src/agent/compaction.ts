@@ -69,6 +69,16 @@ export function shouldCompact(messages: ChatMessage[], contextWindow: number, tr
 }
 
 /**
+ * Whether there is currently enough middle to be worth summarizing. Distinct from a
+ * compaction *failure*: this is transient — a run that has not yet accumulated enough
+ * turns will qualify a few steps later — so callers must not treat it as terminal.
+ */
+export function canCompact(messages: ChatMessage[], keepHead?: number): boolean {
+	const start = keepHead === undefined ? firstTurnEnd(messages) : Math.min(Math.max(keepHead, 0), messages.length);
+	return start >= 0 && (messages.length - KEEP_RECENT_TURNS) - start >= MIN_COMPACTABLE;
+}
+
+/**
  * Rewrites tool calls and tool results as plain prose turns.
  *
  * The summarizer is a normal chat completion with no `tools` declared, and the slice it

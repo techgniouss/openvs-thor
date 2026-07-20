@@ -211,8 +211,11 @@ async function readFile(root: vscode.Uri, path: string, g: Guardrails, offset?: 
 				: 'It is the last line of the file.]');
 		return { result: head + note, isError: false };
 	}
-	const note = end >= lines.length
-		? `\n\n[file has ${lines.length}${partial ? '+' : ''} lines; showing ${start + 1}–${end}. End of file reached; no more lines to read.]`
+	// `partial` means the decode limit cut the file short, so `lines.length` is a lower
+	// bound — reaching it is NOT end of file, and saying so would tell the model a large
+	// file is fully read when it is not.
+	const note = end >= lines.length && !partial
+		? `\n\n[file has ${lines.length} lines; showing ${start + 1}–${end}. End of file reached; no more lines to read.]`
 		: `\n\n[file has ${lines.length}${partial ? '+' : ''} lines; showing ${start + 1}–${end}. Call read_file with offset=${end + 1} to continue.]`;
 	return { result: out.join('\n') + note, isError: false };
 }

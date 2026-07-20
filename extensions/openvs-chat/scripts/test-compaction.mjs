@@ -66,7 +66,6 @@ assert.strictEqual(await m.compactMessages(convo(20, 4_000), async () => '   '),
 	assert.ok(!res.messages.some(x => x.role === 'tool'), 'orphan tool result dropped');
 }
 
-console.log('test-compaction: all assertions passed');
 
 // compactionThreshold: normally 70% of the window, but never above the point where the
 // lossy trim would already have kicked in — trimming must never get first crack.
@@ -96,7 +95,6 @@ console.log('test-compaction: all assertions passed');
 	assert.strictEqual(m.shouldCompact(msgs, 32_000), false, 'window-only threshold would not fire');
 	assert.strictEqual(m.shouldCompact(msgs, 32_000, 17_408), true, 'budget-aware threshold fires');
 }
-console.log('test-compaction thresholds: all assertions passed');
 
 // keepHead: an assembled request is [system, attached context, the request, ...]. The
 // default "preserve through the first user turn" would protect the bulky context blob
@@ -134,7 +132,6 @@ console.log('test-compaction thresholds: all assertions passed');
 	assert.strictEqual(noHead.messages[0].role, 'user', 'keepHead 0 drops the system prompt');
 	assert.ok(noHead.messages[0].content.startsWith(m.COMPACT_MARKER));
 }
-console.log('test-compaction keepHead: all assertions passed');
 
 // The summarizer payload must be a plain chat request: no assistant tool_calls and no
 // role:'tool' turns. It is sent with no `tools` declared, and the slice is cut at a
@@ -159,7 +156,11 @@ console.log('test-compaction keepHead: all assertions passed');
 	// The information survives as text rather than being dropped.
 	assert.ok(sent.some(x => x.content.includes('[tool call: read_file(')), 'tool calls survive as prose');
 	assert.ok(sent.some(x => x.content.startsWith('[tool result]')), 'tool results survive as prose');
-	// The compacted conversation itself still carries real tool structure where it is valid.
-	assert.ok(res.messages.slice(0, 2).every(x => !x.toolCalls), 'head unchanged');
+	// Flattening applies ONLY to the summarizer payload: the compacted conversation the
+	// model goes on to use keeps its real tool structure, minus anything orphaned.
+	assert.deepStrictEqual(res.messages.slice(0, 2), msgs.slice(0, 2), 'head kept verbatim');
+	assert.deepStrictEqual(res.messages.slice(-6), msgs.slice(-6), 'recent turns kept verbatim');
+	assert.ok(!res.messages.some(x => x.content.startsWith('[tool result]')),
+		'the conversation itself is not flattened');
 }
-console.log('test-compaction summarizer payload: all assertions passed');
+console.log('test-compaction: all assertions passed');
