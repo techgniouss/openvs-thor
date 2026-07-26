@@ -1,0 +1,22 @@
+# Files and directories ignored by Graphify analysis
+node_modules/
+out/
+out-*/
+.build/
+build/
+dist/
+coverage/
+test-results/
+.git/
+.vscode-test/
+extensions/**/out/
+extensions/**/dist/
+graphify-out/
+.graphify/
+*.snap
+*.snap.actual
+*.log
+package-lock.json
+cglicenses.json
+cgmanifest.json
+ThirdPartyNotices.txt

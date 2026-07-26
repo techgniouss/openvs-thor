@@ -5,9 +5,40 @@
 
 import * as vscode from 'vscode';
 
+/**
+ * When the agent stops for permission, laxest last:
+ * - `always` — every write and every command is confirmed.
+ * - `auto-edits` — file edits inside the workspace go through; commands are confirmed.
+ * - `yolo` — nothing is confirmed; only the hard guardrails below still apply.
+ *
+ * Read-only tools have never prompted under any policy, which is what retired the former
+ * fourth rung `auto-readonly`: it was indistinguishable from `always` in behaviour while
+ * its label implied that `always` prompted for reads.
+ */
+export type ApprovalPolicy = 'always' | 'auto-edits' | 'yolo';
+
+/** The shipped policy, used for an unset or unrecognized setting. */
+export const DEFAULT_APPROVAL: ApprovalPolicy = 'auto-edits';
+
+/** Every policy the setting and the webview picker accept, strictest first. */
+export const APPROVAL_POLICIES: readonly ApprovalPolicy[] = ['always', 'auto-edits', 'yolo'];
+
+/**
+ * Reads a stored policy. A value written by an older build (`auto-readonly`) resolves to
+ * the rung that matches how it actually behaved, rather than falling through to the
+ * default and quietly *loosening* a setting the user chose to tighten.
+ */
+export function parseApprovalPolicy(raw: string | undefined): ApprovalPolicy {
+	const value = (raw ?? '').trim();
+	if ((APPROVAL_POLICIES as readonly string[]).includes(value)) {
+		return value as ApprovalPolicy;
+	}
+	return value === 'auto-readonly' ? 'always' : DEFAULT_APPROVAL;
+}
+
 /** Hard, code-enforced limits on what the agent's tools may do (vs. soft "rules"). */
 export interface Guardrails {
-	readonly approval: 'always' | 'auto-readonly' | 'auto-edits' | 'yolo';
+	readonly approval: ApprovalPolicy;
 	readonly deniedCommands: RegExp[];
 	readonly allowedCommands: RegExp[];
 	readonly protectedPaths: string[];
@@ -15,6 +46,8 @@ export interface Guardrails {
 	readonly maxSubagents: number;
 	readonly maxSubagentDepth: number;
 	readonly parallelResearch: boolean;
+	/** Shell `run_command` executes through; empty means the platform default. */
+	readonly shell: string;
 }
 
 function compile(patterns: string[]): RegExp[] {
@@ -33,7 +66,7 @@ function compile(patterns: string[]): RegExp[] {
 export function loadGuardrails(): Guardrails {
 	const cfg = vscode.workspace.getConfiguration('openvsChat');
 	return {
-		approval: (cfg.get<string>('guardrails.approval') as Guardrails['approval']) || 'auto-edits',
+		approval: parseApprovalPolicy(cfg.get<string>('guardrails.approval')),
 		deniedCommands: compile(cfg.get<string[]>('guardrails.deniedCommands') ?? []),
 		allowedCommands: compile(cfg.get<string[]>('guardrails.allowedCommands') ?? []),
 		protectedPaths: cfg.get<string[]>('guardrails.protectedPaths') ?? [],
@@ -41,6 +74,7 @@ export function loadGuardrails(): Guardrails {
 		maxSubagents: cfg.get<number>('agent.maxSubagents') ?? 4,
 		maxSubagentDepth: cfg.get<number>('agent.maxSubagentDepth') ?? 2,
 		parallelResearch: cfg.get<boolean>('agent.parallelResearch') ?? true,
+		shell: cfg.get<string>('agent.shell')?.trim() ?? '',
 	};
 }
 
@@ -70,11 +104,36 @@ function globToRegExp(glob: string): RegExp {
 }
 
 /**
+ * Normalizes a model-supplied workspace-relative path into the form both the guardrail
+ * check and the filesystem resolution use.
+ *
+ * Only leading separators and `./` segments are removed. A leading dot must survive: a
+ * regex like `/^[./\\]+/` also eats the dot of a dotfile, so `.env` became `env`,
+ * `.gitignore` became `gitignore` and `.github/workflows/ci.yml` was written to
+ * `github/workflows/ci.yml` — silently, and at a path the guardrail never inspected,
+ * because the two sites normalized differently. `..` is deliberately preserved so
+ * {@link checkPath} can reject the escape rather than quietly rebasing it into the root.
+ */
+export function normalizeWorkspacePath(relativePath: string): string {
+	let clean = relativePath.trim().replace(/\\/g, '/');
+	// Looped rather than a single pass: the two prefixes can interleave (`.//./src`), and
+	// `^\.\/` can never match `../`, so `..` still reaches the escape check intact.
+	for (let previous = ''; clean !== previous;) {
+		previous = clean;
+		clean = clean.replace(/^\/+/, '').replace(/^\.\//, '');
+	}
+	return clean;
+}
+
+/**
  * Validates a workspace-relative path: it must resolve to somewhere inside the workspace
  * root (no `..` escape), and — for writes — must not match a protected path pattern.
  */
 export function checkPath(root: vscode.Uri, relativePath: string, forWrite: boolean, g: Guardrails): GuardrailCheck {
-	const clean = relativePath.replace(/^[/\\]+/, '');
+	const clean = normalizeWorkspacePath(relativePath);
+	if (!clean) {
+		return { ok: false, reason: 'An empty path was supplied.' };
+	}
 	const target = vscode.Uri.joinPath(root, clean);
 	const rootPath = root.fsPath.replace(/[/\\]+$/, '');
 	if (target.fsPath !== rootPath && !target.fsPath.startsWith(rootPath + '/') && !target.fsPath.startsWith(rootPath + '\\')) {

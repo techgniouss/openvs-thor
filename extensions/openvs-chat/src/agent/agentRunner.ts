@@ -11,7 +11,7 @@ import { AgentStep, CONTINUE_PROMPT, ChatProvider, ChatMessage, ToolCall, ToolSp
 import { canCompact, compactMessages, compactionThreshold, shouldCompact } from './compaction';
 import { estimateMessagesTokens, isContextLengthError, trimMessages } from './context';
 import { Guardrails, autoApproves, loadGuardrails } from './guardrails';
-import { AGENT_TOOLS, READ_ONLY_TOOL_NAMES, SPAWN_SUBAGENT_TOOL, ToolApprover, executeTool } from './tools';
+import { AGENT_TOOLS, ASK_USER_TOOL, AskOption, MAX_ASK_OPTIONS, READ_ONLY_TOOL_NAMES, SPAWN_SUBAGENT_TOOL, ToolApprover, detectVerificationCommands, executeTool } from './tools';
 
 const MCP_PREFIX = 'mcp__';
 
@@ -19,7 +19,7 @@ const MCP_PREFIX = 'mcp__';
  * Why a run ended. Every terminal path maps onto one of these so the UI can always
  * tell the user *why* it stopped — a run that just goes quiet is a bug, not an outcome.
  */
-export type StopReason = 'done' | 'limit' | 'truncated' | 'filtered' | 'refused';
+export type StopReason = 'done' | 'limit' | 'truncated' | 'filtered' | 'refused' | 'stalled';
 
 /** The outcome of {@link AgentRunner.run}. */
 export interface RunResult {
@@ -53,6 +53,15 @@ const MIN_CONTEXT_TOKENS = 8_000;
 const MAX_SUMMARIZER_FAILURES = 2;
 
 /**
+ * How many consecutive empty replies are retried before the run gives up. A step with
+ * neither text nor a tool call is never an answer — it means the turn was lost (gateway
+ * cut the stream after its terminal event, an empty completion, a reasoning-only reply
+ * whose visible text never arrived). Like truncation, these rounds don't consume the
+ * step budget: no work was done, so no budget was spent.
+ */
+const MAX_EMPTY_ROUNDS = 3;
+
+/**
  * Injected when a step produces prose but no tool call. Models routinely narrate a
  * next action ("now I'll update the config") without performing it; treating that as
  * "finished" was the main cause of runs stopping mid-task. One nudge per quiet
@@ -62,7 +71,58 @@ const COMPLETION_CHECK_PROMPT =
 	'Before you finish: if the task is fully complete and verified, reply with a brief final ' +
 	'summary of what changed. If ANY part remains — files still to edit, commands still to run, ' +
 	'unchecked items on your checklist, or a next step you just described — do it now with your ' +
-	'tools instead of summarizing. Do not ask permission to continue; keep working.';
+	'tools instead of summarizing. Do not stop to ask whether to continue; if you truly need a ' +
+	'decision from the user, call ask_user instead of describing the question.';
+
+/**
+ * How many times each reason may push the model back to work within one quiet stretch.
+ *
+ * The evidence-backed reasons get two attempts: an open checklist item or an unverified
+ * write is a concrete, checkable claim, and a model that ignored the first reminder
+ * often complies with the second. The generic "are you actually done?" gets one — it has
+ * no evidence behind it, so if the model stays quiet after being asked, it really is
+ * done and asking again is just noise. All counters reset whenever the model does real
+ * tool work, so a long task is never capped overall.
+ */
+const NUDGE_LIMITS: Record<string, number> = { todos: 2, verify: 2, generic: 1 };
+
+/**
+ * Injected when the model stops while its own checklist still has open items. Models
+ * routinely declare victory with half their plan outstanding; quoting the list back is
+ * far more effective than a generic "are you done?", and it also restores a checklist
+ * that compaction may have summarized away.
+ */
+function unfinishedTodoPrompt(items: TodoItem[]): string {
+	const open = items.filter(t => t.status !== 'completed');
+	const rendered = open.map(t => `- [${t.status}] ${t.content}`).join('\n');
+	return 'You stopped, but your own checklist still has open items:\n'
+		+ `${rendered}\n\n`
+		+ 'Either finish them now with your tools, or — if one is genuinely no longer needed — call '
+		+ 'update_todos to correct the list and say why. Do not end the task with items outstanding.';
+}
+
+/**
+ * Injected when the model wrote to the workspace and then stopped without ever running a
+ * verification command. "It should compile" is not evidence, and handing back an
+ * unverified change is the failure the user notices.
+ *
+ * `commands` are the ones this workspace actually offers, so the nudge names something
+ * real instead of gesturing at "the tests". The gate does not fire at all when the list
+ * is empty — see {@link AgentRunner.completionNudge}.
+ */
+function verifyPrompt(commands: string[]): string {
+	return 'You changed files in this run but never ran a command to check them. Run '
+		+ `${commands.map(c => `\`${c}\``).join(' or ')} with run_command now and fix anything it reports. `
+		+ 'Do not summarize the work as finished until it passes.';
+}
+
+/**
+ * Injected after an empty reply. Deliberately short and concrete: the previous request
+ * is unchanged, so the most likely fix is simply asking again for the next action.
+ */
+const EMPTY_REPLY_PROMPT =
+	'Your last reply arrived empty. Continue the task from where you left off: state the ' +
+	'next action and take it with your tools now.';
 
 export interface AgentCallbacks {
 	/** A new model step is beginning (open a fresh streaming bubble). */
@@ -143,6 +203,20 @@ export class AgentRunner {
 	/** Consecutive summarizer failures; reset by any success, so a one-off blip isn't terminal. */
 	private summarizerFailures = 0;
 	private contextBudget: number;
+	/** The model's latest checklist, so completion can be checked against its own plan. */
+	private todos: TodoItem[] = [];
+	/** True once this run wrote to the workspace with no successful command run since. */
+	private unverifiedWrites = false;
+	/** How often each completion-nudge reason has fired in the current quiet stretch. */
+	private readonly nudgeCounts = new Map<string, number>();
+	/**
+	 * Read-only calls already answered since the workspace (or the transcript) last
+	 * changed, keyed by {@link repeatKey}. Cleared by anything that can invalidate a
+	 * result — a write, a command, an MCP call, a sub-agent, a compaction.
+	 */
+	private readonly answeredReads = new Set<string>();
+	/** Memoized workspace probe for verification commands; undefined until first needed. */
+	private verifyCommands?: Promise<string[]>;
 
 	constructor(
 		private readonly provider: ChatProvider,
@@ -164,11 +238,15 @@ export class AgentRunner {
 	/** The tools offered this run: read-only set for research sub-agents; otherwise the full set, plus delegation and any MCP tools. */
 	private tools(): ToolSpec[] {
 		if (this.readOnly) {
-			return AGENT_TOOLS.filter(t => READ_ONLY_TOOL_NAMES.includes(t.name));
+			const readTools = AGENT_TOOLS.filter(t => READ_ONLY_TOOL_NAMES.includes(t.name));
+			// The top-level read-only loop is Ask/Plan, where the user is present and a
+			// clarifying question is often the right move. Research sub-agents are not
+			// (nobody is watching them), so they never get it.
+			return this.depth === 0 ? [...readTools, ASK_USER_TOOL] : readTools;
 		}
 		const base = [...AGENT_TOOLS];
 		if (this.depth === 0) {
-			base.push(UPDATE_TODOS_TOOL);
+			base.push(UPDATE_TODOS_TOOL, ASK_USER_TOOL);
 		}
 		if (this.depth < this.guardrails.maxSubagentDepth && this.budget.spawned < this.guardrails.maxSubagents) {
 			base.push(SPAWN_SUBAGENT_TOOL);
@@ -186,7 +264,7 @@ export class AgentRunner {
 
 		const messages: ChatMessage[] = [...seed];
 		let truncationRounds = 0;
-		let nudged = false;
+		let emptyRounds = 0;
 
 		for (let step = 0; step < this.maxSteps;) {
 			if (params.signal.aborted) {
@@ -211,6 +289,10 @@ export class AgentRunner {
 				if (compacted) {
 					this.summarizerFailures = 0;
 					messages.splice(0, messages.length, ...compacted.messages);
+					// Summarizing replaces the turns that held those results, so "you already
+					// read that, scroll up" stops being true — the model may legitimately
+					// need to read it again.
+					this.answeredReads.clear();
 					callbacks.onNote(`Compacted the conversation (~${Math.round(compacted.before / 1000)}k → ~${Math.round(compacted.after / 1000)}k tokens).`);
 					// Give up only when the protected head ALONE is over the threshold —
 					// nothing further can shrink it, so summarizing again would buy nothing.
@@ -232,7 +314,17 @@ export class AgentRunner {
 			const result = await this.step(messages, params, callbacks);
 			callbacks.onStepEnd(result.content);
 
-			messages.push({ role: 'assistant', content: result.content, toolCalls: result.toolCalls });
+			// An assistant turn with neither text nor tool calls carries nothing, and several
+			// backends reject an empty assistant message outright — so it is never recorded.
+			// Whitespace-only counts as empty here and below, so the two stay in agreement:
+			// treating "\n" as content while the retry path treats it as empty would reset
+			// the empty counter on every round and loop forever.
+			const productive = !!result.content.trim() || result.toolCalls.length > 0;
+			if (productive) {
+				messages.push({ role: 'assistant', content: result.content, toolCalls: result.toolCalls });
+				// The turn arrived, so any earlier empty replies were a transient blip.
+				emptyRounds = 0;
+			}
 
 			// A provider-side block ends the run, but must never be mistaken for success.
 			if (result.finishReason === 'filtered' || result.finishReason === 'refused') {
@@ -258,26 +350,53 @@ export class AgentRunner {
 					messages.push({ role: 'user', content: CONTINUE_PROMPT });
 					continue;
 				}
+				// No text AND no tool call is a lost turn, not a finished answer. Ending the
+				// run here is what made the chat go blank mid-task — the webview drops the
+				// empty bubble and `done` says nothing, so the user sees the work simply
+				// vanish. Ask again a few times, then stop with an explanation.
+				if (!result.content.trim()) {
+					if (emptyRounds >= MAX_EMPTY_ROUNDS) {
+						return {
+							reason: 'stalled',
+							detail: `The model returned ${emptyRounds + 1} empty replies in a row, so the run stopped with the task unfinished. This is usually a provider hiccup — send "continue" to resume, or switch models.`,
+						};
+					}
+					emptyRounds++;
+					callbacks.onNote('The model returned an empty reply — asking it to continue.');
+					messages.push({ role: 'user', content: EMPTY_REPLY_PROMPT });
+					continue;
+				}
 				// In write-capable Agent mode, prose with no tool call usually means the model
-				// described a next action instead of taking it — ask once before believing
-				// it's done. Read-only Ask/Plan and research sub-agents legitimately end with
-				// a prose answer, so they finish immediately (no wasted round).
-				if (!this.readOnly && !nudged) {
-					nudged = true;
+				// described a next action instead of taking it, abandoned its own checklist,
+				// or never verified what it wrote — push back before believing it's done.
+				// Read-only Ask/Plan and research sub-agents legitimately end with a prose
+				// answer, so they finish immediately (no wasted round).
+				const nudge = await this.completionNudge();
+				if (nudge) {
 					step++;
-					messages.push({ role: 'user', content: COMPLETION_CHECK_PROMPT });
+					messages.push({ role: 'user', content: nudge });
 					continue;
 				}
 				return { reason: 'done' };
 			}
 
 			truncationRounds = 0;
-			nudged = false;
+			// Real tool work means the model is engaged again: let every nudge reason arm
+			// itself afresh for the next quiet stretch.
+			this.nudgeCounts.clear();
 			step++;
 
 			const outcomes = await this.runTools(result.toolCalls, params, callbacks);
 			for (const { call, result: toolResult } of outcomes) {
-				messages.push({ role: 'tool', content: toolResult, toolCallId: call.id });
+				// A tool result must never be empty or whitespace-only: Anthropic rejects such
+				// a `tool_result` block outright (HTTP 400), which killed the whole run over a
+				// zero-byte file or an MCP tool that legitimately returned nothing. Reading the
+				// result as "the tool produced no output" is both true and safe everywhere.
+				messages.push({
+					role: 'tool',
+					content: toolResult.trim() ? toolResult : `(${call.name} returned no output)`,
+					toolCallId: call.id,
+				});
 			}
 		}
 
@@ -285,6 +404,123 @@ export class AgentRunner {
 			reason: 'limit',
 			detail: `Reached the ${this.maxSteps}-step limit. Send "continue" to keep going, or raise "openvsChat.agent.maxSteps".`,
 		};
+	}
+
+	/**
+	 * The message to push back at a model that produced prose and no tool call, or
+	 * undefined when the run should genuinely be allowed to finish.
+	 *
+	 * Checked in order of how badly the run would be misreported as complete: open
+	 * checklist items first (the model abandoned its own plan), then unverified writes
+	 * (it changed code and never checked it), then the generic "did you actually finish"
+	 * catch. Each reason is capped by {@link MAX_NUDGES_PER_REASON} per quiet stretch so
+	 * a model that will not comply still terminates.
+	 */
+	private async completionNudge(): Promise<string | undefined> {
+		if (this.readOnly) {
+			return undefined;
+		}
+		// A specific reason short-circuits: once it is spent the run is allowed to end,
+		// rather than falling through to the generic prompt for one more round. Having
+		// already been chased about a concrete obligation twice, "are you sure you're
+		// done?" adds nothing but another request.
+		if (this.todos.some(t => t.status !== 'completed')) {
+			return this.takeNudge('todos') ? unfinishedTodoPrompt(this.todos) : undefined;
+		}
+		if (this.unverifiedWrites) {
+			// No verification command in this workspace means there is nothing to demand.
+			// Nudging anyway would be nagging the model about an impossibility, and it
+			// would learn to answer with a plausible-sounding excuse — so fall through to
+			// the ordinary "are you actually finished?" instead of inventing a chore.
+			const commands = await this.verificationCommands();
+			if (commands.length) {
+				return this.takeNudge('verify') ? verifyPrompt(commands) : undefined;
+			}
+		}
+		return this.takeNudge('generic') ? COMPLETION_CHECK_PROMPT : undefined;
+	}
+
+	/** The workspace's verification commands, probed at most once per run. */
+	private async verificationCommands(): Promise<string[]> {
+		if (!this.verifyCommands) {
+			this.verifyCommands = detectVerificationCommands().catch(() => []);
+		}
+		return this.verifyCommands;
+	}
+
+	/** Consumes one nudge allowance for `reason`, or returns false when it is spent. */
+	private takeNudge(reason: keyof typeof NUDGE_LIMITS): boolean {
+		const used = this.nudgeCounts.get(reason) ?? 0;
+		if (used >= NUDGE_LIMITS[reason]) {
+			return false;
+		}
+		this.nudgeCounts.set(reason, used + 1);
+		return true;
+	}
+
+	/**
+	 * Tracks whether the workspace has been changed without a subsequent successful
+	 * command run. Writes set the flag; a command that exits cleanly clears it. A failed
+	 * command deliberately leaves it set — a red build is exactly the state the model
+	 * must not walk away from.
+	 */
+	private recordVerificationState(call: ToolCall, isError: boolean): void {
+		if (isError) {
+			return;
+		}
+		if (call.name === 'write_file' || call.name === 'edit_file') {
+			this.unverifiedWrites = true;
+		} else if (call.name === 'run_command') {
+			this.unverifiedWrites = false;
+			// `isReadOnly` is optional at runtime on purpose: a toolset that predates it
+			// should make the run cautious, not crash it mid-step.
+		} else if (call.name.startsWith(MCP_PREFIX) && this.mcp?.isReadOnly?.(call.name) !== true) {
+			// An MCP server can edit files too. Only a tool the server itself declared
+			// read-only is exempt; anything unannotated has to count as a change, or a
+			// run that did all its work through an MCP filesystem server would sail past
+			// the verification gate untouched.
+			this.unverifiedWrites = true;
+		}
+	}
+
+	/**
+	 * Puts one {@link ASK_USER_TOOL} call to the user and returns their answer as the
+	 * tool result. Bad arguments come back as an error result rather than throwing, so a
+	 * malformed call costs one step instead of the whole run.
+	 */
+	private async askUser(call: ToolCall): Promise<{ result: string; isError: boolean }> {
+		const question = String(call.args.question ?? '').trim();
+		if (!question) {
+			return { result: 'ask_user requires a non-empty "question".', isError: true };
+		}
+		// Every entry is parsed before trimming, so the surplus shown to the user is the
+		// real remainder rather than whatever happened to follow the cut.
+		const parsed = parseAskOptions(call.args.options);
+		const options = parsed.slice(0, MAX_ASK_OPTIONS);
+		if (options.length < 2) {
+			return {
+				result: `ask_user needs at least 2 distinct "options" (each with a "label"), at most ${MAX_ASK_OPTIONS}. `
+					+ 'If there is no real choice to offer, do the work instead of asking.',
+				isError: true,
+			};
+		}
+		// Extra options are trimmed rather than rejected — re-asking would cost a step for
+		// a question the user can already answer — but nothing is hidden from either side.
+		// The user sees the surplus as text they can type; the model is told its choice
+		// was trimmed, so it doesn't assume the answer came from the full set.
+		const surplus = parsed.slice(options.length).map(o => o.label);
+		const dropped = surplus.length
+			? ` (note: you offered ${parsed.length} options; only the first ${options.length} were shown as buttons, so keep to ${MAX_ASK_OPTIONS})`
+			: '';
+		const answer = (await this.approver.ask({
+			question,
+			options,
+			multiSelect: call.args.multiSelect === true,
+			detail: surplus.length ? `Also offered, type to choose: ${surplus.join(' · ')}` : undefined,
+		})).trim();
+		return answer
+			? { result: `The user answered: ${answer}${dropped}`, isError: false }
+			: { result: `The user dismissed the question without answering. Proceed with the most reasonable option and say which you chose.${dropped}`, isError: false };
 	}
 
 	/**
@@ -361,23 +597,64 @@ export class AgentRunner {
 			if (call.name === UPDATE_TODOS_TOOL.name) {
 				callbacks.onToolStart(call);
 				const parsed = parseTodoUpdate(call.args);
-				const outcome = 'error' in parsed
-					? { result: parsed.error, isError: true }
-					: (callbacks.onTodos?.(parsed.items),
-						{ result: `Checklist updated (${parsed.items.length} item(s)).`, isError: false });
+				let outcome: { result: string; isError: boolean };
+				if (parsed.error !== undefined) {
+					outcome = { result: parsed.error, isError: true };
+				} else {
+					this.todos = parsed.items;
+					callbacks.onTodos?.(parsed.items);
+					// Echo the list back rather than just a count: the tool result is the
+					// model's only durable record of its own plan once compaction has
+					// summarized the turn that produced it.
+					outcome = { result: renderChecklist(parsed.items), isError: false };
+				}
 				callbacks.onToolEnd(call, outcome.result, outcome.isError);
 				outcomes.push({ call, ...outcome });
 				continue;
+			}
+			if (call.name === ASK_USER_TOOL.name) {
+				callbacks.onToolStart(call);
+				const outcome = await this.askUser(call);
+				callbacks.onToolEnd(call, outcome.result, outcome.isError);
+				outcomes.push({ call, ...outcome });
+				continue;
+			}
+			// Re-reading a file the model already read this run — the single most common way
+			// an agent run stalls — is answered from the transcript instead of the disk. The
+			// result it wants is still above it in the conversation, so re-fetching it buys
+			// nothing and costs a step; models that do it once tend to do it forever.
+			if (READ_ONLY_TOOL_NAMES.includes(call.name)) {
+				const key = repeatKey(call);
+				if (this.answeredReads.has(key)) {
+					callbacks.onToolStart(call);
+					const outcome = {
+						result: `You already ran ${key} earlier in this run and nothing has changed since, so its result is still above in this conversation — read it there instead of repeating the call. `
+							+ 'If you need something you have not seen, change the arguments (a different path, a different offset/limit, a different query) or move on to the next step of the task.',
+						isError: true,
+					};
+					callbacks.onToolEnd(call, outcome.result, outcome.isError);
+					outcomes.push({ call, ...outcome });
+					continue;
+				}
+				this.answeredReads.add(key);
 			}
 			callbacks.onToolStart(call);
 			const { result, isError } = call.name.startsWith(MCP_PREFIX)
 				? await this.callMcp(call)
 				: await executeTool(call, this.approver, this.guardrails);
+			// A write, a command or an MCP call can change anything a read reported, so
+			// every cached read expires here rather than being trusted across the change.
+			if (!READ_ONLY_TOOL_NAMES.includes(call.name)) {
+				this.answeredReads.clear();
+			}
+			this.recordVerificationState(call, isError);
 			callbacks.onToolEnd(call, result, isError);
 			outcomes.push({ call, result, isError });
 		}
 
 		if (spawnCalls.length) {
+			// A delegate reads and writes on its own; nothing the parent cached still holds.
+			this.answeredReads.clear();
 			const runOne = async (call: ToolCall) => {
 				callbacks.onToolStart(call);
 				const { result, isError } = await this.runSubagent(call, params, callbacks);
@@ -386,6 +663,11 @@ export class AgentRunner {
 			};
 			const readOnly = spawnCalls.filter(c => c.args.readOnly === true);
 			const writal = spawnCalls.filter(c => c.args.readOnly !== true);
+			if (writal.length) {
+				// A write-capable delegate may have changed anything; the parent must not
+				// then declare the task verified on the strength of an earlier build.
+				this.unverifiedWrites = true;
+			}
 			if (this.guardrails.parallelResearch && readOnly.length > 1) {
 				outcomes.push(...await Promise.all(readOnly.map(runOne)));
 			} else {
@@ -403,12 +685,22 @@ export class AgentRunner {
 			return { result: `MCP is not available for "${call.name}".`, isError: true };
 		}
 		if (!autoApproves(this.guardrails)) {
-			const approved = await this.approver.confirm(
-				`Allow the MCP tool "${call.name}"?`,
-				JSON.stringify(call.args).slice(0, 500),
-			);
+			const { approved, feedback } = await this.approver.confirm({
+				kind: 'mcp',
+				signature: call.name,
+				title: `Run the MCP tool "${call.name}"?`,
+				detail: 'Provided by a connected MCP server.',
+				preview: shortArgs(call.args, 800),
+				previewLanguage: 'json',
+			});
 			if (!approved) {
-				return { result: 'User denied the MCP tool call.', isError: true };
+				const reason = feedback?.trim();
+				return {
+					result: reason
+						? `The user denied the MCP tool call and said: "${reason}".`
+						: 'The user denied the MCP tool call. Try a different approach rather than repeating it.',
+					isError: true,
+				};
 			}
 		}
 		return this.mcp.call(call.name, call.args);
@@ -435,6 +727,12 @@ export class AgentRunner {
 			depth: this.depth + 1,
 			budget: this.budget,
 			readOnly,
+			// Inherited, or a sub-agent that reads a dozen files runs with no compaction and
+			// the default budget until the provider rejects the request outright. Its seed is
+			// [system, goal] — both must survive compaction, hence keepHead 2.
+			maxContextTokens: this.contextBudget,
+			contextWindow: this.contextWindow,
+			keepHead: 2,
 		});
 
 		const log: string[] = [];
@@ -486,13 +784,58 @@ function subagentSystem(readOnly: boolean): string {
 		`Accomplish exactly that goal using your tools, then end with a concise summary of what you found or changed. Do not ask follow-up questions.`;
 }
 
-function shortArgs(args: Record<string, unknown>): string {
+/**
+ * Identity of a read-only call for repeat detection: the tool name plus its arguments
+ * with the keys sorted, so `{path, limit}` and `{limit, path}` are recognized as the same
+ * call. Also readable enough to quote straight back to the model.
+ */
+function repeatKey(call: ToolCall): string {
+	const args = Object.keys(call.args).sort()
+		.map(key => `${key}=${JSON.stringify(call.args[key])}`)
+		.join(', ');
+	return `${call.name}(${args})`;
+}
+
+function shortArgs(args: Record<string, unknown>, max = 60): string {
 	try {
-		const s = JSON.stringify(args);
-		return s.length > 60 ? s.slice(0, 57) + '…' : s;
+		const s = JSON.stringify(args) ?? '';
+		return s.length > max ? s.slice(0, max - 3) + '…' : s;
 	} catch {
 		return '';
 	}
+}
+
+/**
+ * Normalizes the `options` argument of an `ask_user` call. Accepts both the documented
+ * `{label, description}` objects and the bare strings models sometimes send instead;
+ * entries with no usable label are dropped rather than rendered as empty buttons.
+ */
+function parseAskOptions(raw: unknown): AskOption[] {
+	if (!Array.isArray(raw)) {
+		return [];
+	}
+	const options: AskOption[] = [];
+	for (const entry of raw) {
+		const isObject = typeof entry === 'object' && entry !== null;
+		const label = (isObject ? String((entry as Record<string, unknown>).label ?? '') : String(entry ?? '')).trim();
+		if (!label) {
+			continue;
+		}
+		const description = isObject ? String((entry as Record<string, unknown>).description ?? '').trim() : '';
+		options.push(description ? { label, description } : { label });
+	}
+	return options;
+}
+
+/** The checklist as the model should see it echoed back from `update_todos`. */
+function renderChecklist(items: TodoItem[]): string {
+	if (!items.length) {
+		return 'Checklist cleared.';
+	}
+	const done = items.filter(t => t.status === 'completed').length;
+	const mark = (t: TodoItem) => t.status === 'completed' ? 'x' : t.status === 'in_progress' ? '~' : ' ';
+	return `Checklist updated (${done}/${items.length} complete):\n`
+		+ items.map(t => `- [${mark(t)}] ${t.content}`).join('\n');
 }
 
 function truncate(text: string, max: number): string {

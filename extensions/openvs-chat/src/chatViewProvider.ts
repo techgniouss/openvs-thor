@@ -8,7 +8,8 @@ import { AgentRunner, RunResult } from './agent/agentRunner';
 import { COMPACT_MARKER, compactMessages, shouldCompact } from './agent/compaction';
 import { trimMessages } from './agent/context';
 import { contextBudgetFor, contextWindowFor } from './agent/contextWindow';
-import { ToolApprover } from './agent/tools';
+import { APPROVAL_POLICIES, parseApprovalPolicy } from './agent/guardrails';
+import { ApprovalRequest, ApprovalResult, ToolApprover, UserQuestion } from './agent/tools';
 import { AutoOrchestrator } from './auto/orchestrator';
 import { AUTO_ROLES, AutoRole, RoleRouter } from './auto/router';
 import { WebAuthManager } from './auth';
@@ -16,11 +17,12 @@ import { McpManager } from './mcp/manager';
 import { supportsNativeSignIn } from './oauth';
 import { buildEnvContext } from './persona/envContext';
 import { modeDoctrine, personaBase } from './persona/prompts';
-import { ThinkingStreamParser, formatThinking, stripThinking } from './persona/thinking';
+import { ThinkingStreamParser, formatThinking, stripHistoryThinking, stripThinking } from './persona/thinking';
 import { ProviderRegistry } from './providers/registry';
 import { ChatMessage, ChatProvider, ModelEntry, entrySupportsTools, modelSupportsVision, streamChatWithContinuation } from './providers/types';
 import { RulesProvider } from './rules';
 import { SkillRegistry } from './skills';
+import { CHAT_APP_HTML } from './webviewHtml';
 
 /**
  * The chat modes. 'ask' (read-only Q&A over the open editors), 'plan' (plan the requirement,
@@ -33,10 +35,18 @@ export type InlineKind = 'explain' | 'fix' | 'doc' | 'optimize' | 'tests' | 'edi
 /** Sentinel provider id selecting the role-routed "Auto" pipeline instead of one provider. */
 const AUTO_PROVIDER = '__auto__';
 /**
- * Default agent step budget. Sized for real work — reading a handful of files, editing
- * several, running a build and fixing the fallout — rather than a quick Q&A.
+ * Default agent step budget. Sized for real work — "find the bugs in this extension and
+ * fix them" is dozens of reads, edits, builds and re-checks — rather than a quick Q&A.
+ * The budget exists only as a runaway backstop; stopping a task that is still making
+ * progress is the failure mode users actually hit, so it is set well above real tasks.
  */
-const DEFAULT_MAX_STEPS = 25;
+const DEFAULT_MAX_STEPS = 100;
+
+/**
+ * Step budget for the Ask/Plan read-only tool loop. Lower than Agent mode (it only reads),
+ * but high enough to survey a codebase — the old cap of 8 ended investigations mid-search.
+ */
+const MAX_READ_ONLY_STEPS = 30;
 
 /** A unique id for one send, used to fence out messages from a superseded run. */
 function newRunId(): string {
@@ -77,6 +87,10 @@ interface WebviewToHost {
 	runId?: string;
 	/** Archived conversations mirrored from the webview for cross-restart persistence. */
 	history?: HistoryEntry[];
+	/** Correlates a `promptResponse` with the approval/question the host is waiting on. */
+	promptId?: string;
+	/** The user's reply to that prompt (shape depends on the prompt type). */
+	response?: Record<string, unknown>;
 }
 
 /** An archived conversation shown in the History panel; persisted in workspace state. */
@@ -91,16 +105,19 @@ interface HistoryEntry {
 type SessionPost = (message: Record<string, unknown> & { type: string }) => void;
 
 /** The valid values of `openvsChat.guardrails.approval`, mirrored in the webview picker. */
-const APPROVAL_LEVELS = ['always', 'auto-readonly', 'auto-edits', 'yolo'];
+const APPROVAL_LEVELS: readonly string[] = APPROVAL_POLICIES;
 
 /**
  * Backs the AI Chat webview view. Renders the UI and drives the three modes
  * (Ask / Plan / Agent), provider configuration, model listing, and context.
  */
-export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprover {
+export class ChatViewProvider implements vscode.WebviewViewProvider {
 	public static readonly viewType = 'openvsChat.view';
 
 	private view?: vscode.WebviewView;
+	/** Approval/question round-trips currently awaiting a reply from the webview. */
+	private readonly pendingPrompts = new Map<string, (reply: Record<string, unknown>) => void>();
+	private promptSeq = 0;
 	/** The detached Settings editor tab, when open (see {@link openSettingsWindow}). */
 	private settingsPanel?: vscode.WebviewPanel;
 	/** One in-flight request per chat tab, so parallel conversations don't cancel each other. */
@@ -236,7 +253,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 				void this.postConfig();
 			}
 		});
-		webviewView.onDidDispose(() => sub.dispose());
+		webviewView.onDidDispose(() => {
+			sub.dispose();
+			// Forgetting the handle matters: `post` to a disposed webview is a silent
+			// no-op, so a run parked on an approval would wait on a card that can never
+			// be drawn, let alone answered. Dropping it makes promptUser fall back to a
+			// native dialog, and settles whatever was already in flight.
+			if (this.view === webviewView) {
+				this.view = undefined;
+			}
+			this.flushPrompts();
+		});
 	}
 
 	newChat(): void {
@@ -306,12 +333,82 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		await this.postConfig();
 	}
 
-	// --- ToolApprover -----------------------------------------------------------
+	// --- User prompts (approvals & questions) ------------------------------------
 
-	async confirm(title: string, detail: string): Promise<boolean> {
-		const choice = await vscode.window.showWarningMessage(
-			title, { modal: true, detail }, 'Allow', 'Deny');
-		return choice === 'Allow';
+	/**
+	 * Posts a prompt into the chat tab that raised it and waits for the user's reply.
+	 *
+	 * Resolves `undefined` when there is no webview to render into, so the caller can
+	 * fall back to a native dialog. Rejects with an AbortError when the run is stopped,
+	 * so pressing Stop tears down a run that is parked on a question instead of leaving
+	 * it waiting forever.
+	 */
+	async promptUser(
+		message: Record<string, unknown> & { type: string },
+		sessionId: string,
+		runId: string,
+		signal: AbortSignal,
+	): Promise<Record<string, unknown> | undefined> {
+		if (!this.view) {
+			return undefined;
+		}
+		if (signal.aborted) {
+			throw new DOMException('Aborted', 'AbortError');
+		}
+		// The run is now blocked on this card, so the panel holding it has to be on
+		// screen. A hidden view keeps its DOM (retainContextWhenHidden), which means the
+		// question would sit there unseen while the task silently stalled.
+		if (!this.view.visible) {
+			void vscode.commands.executeCommand('openvsChat.view.focus');
+		}
+		const id = `p${++this.promptSeq}`;
+		return new Promise<Record<string, unknown> | undefined>((resolve, reject) => {
+			const onAbort = () => {
+				if (!this.pendingPrompts.delete(id)) {
+					return;
+				}
+				this.post({ type: 'promptCancel', id, sessionId, runId });
+				reject(new DOMException('Aborted', 'AbortError'));
+			};
+			this.pendingPrompts.set(id, reply => {
+				signal.removeEventListener('abort', onAbort);
+				resolve(reply);
+			});
+			signal.addEventListener('abort', onAbort);
+			this.post({ ...message, id, sessionId, runId });
+		});
+	}
+
+	/** Delivers a webview reply to whichever prompt is waiting on it. */
+	private resolvePrompt(message: WebviewToHost): void {
+		const id = message.promptId;
+		if (!id) {
+			return;
+		}
+		const settle = this.pendingPrompts.get(id);
+		if (!settle) {
+			return; // already aborted or answered twice
+		}
+		this.pendingPrompts.delete(id);
+		settle(message.response ?? {});
+	}
+
+	/**
+	 * Settles every waiting prompt as unanswered. An empty reply reads as "denied" to an
+	 * approval and as "dismissed" to a question — both of which the agent loop handles —
+	 * whereas leaving the promise pending strands the run forever.
+	 */
+	private flushPrompts(): void {
+		const waiting = [...this.pendingPrompts.values()];
+		this.pendingPrompts.clear();
+		for (const settle of waiting) {
+			settle({});
+		}
+	}
+
+	/** Builds the per-run channel the agent uses to reach the user. */
+	private approverFor(sessionId: string, runId: string, signal: AbortSignal): ToolApprover {
+		return new SessionApprover(this, sessionId, runId, signal);
 	}
 
 	// --- Message handling -------------------------------------------------------
@@ -334,6 +431,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 	private async handleMessage(message: WebviewToHost): Promise<void> {
 		switch (message.type) {
 			case 'ready':
+				// The webview was (re)created, so every card it was showing is gone. Settle
+				// the waiting prompts as unanswered instead of leaving those runs parked on
+				// a question no one can ever see, let alone answer.
+				this.flushPrompts();
 				await this.postConfig();
 				this.postHistory();
 				break;
@@ -344,6 +445,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 				break;
 			case 'send':
 				await this.handleSend(message);
+				break;
+			case 'promptResponse':
+				this.resolvePrompt(message);
 				break;
 			case 'requestOpenSettings':
 				this.openSettingsWindow();
@@ -786,12 +890,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 			);
 
 			if (mode === 'agent') {
-				this.reportStop(post, await this.runAgent(provider, messages, { ...params, signal: controller.signal }, post, sessionId, keepHead));
+				this.reportStop(post, await this.runAgent(provider, messages, { ...params, signal: controller.signal }, post, sessionId, runId, keepHead));
 			} else if (readTools) {
 				// Ask/Plan get the read-only tool loop when the model can call tools: the
 				// model reads/lists/searches whatever files it needs to answer or plan,
 				// but has no write or command tools, so it cannot change anything.
-				this.reportStop(post, await this.runReadOnlyAgent(provider, messages, { ...params, signal: controller.signal }, post, keepHead));
+				this.reportStop(post, await this.runReadOnlyAgent(provider, messages, { ...params, signal: controller.signal }, post, sessionId, runId, keepHead));
 			} else {
 				await this.runStreaming(provider, messages, { ...params, signal: controller.signal }, mode, post);
 			}
@@ -802,10 +906,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 				post({ type: 'error', message: err instanceof Error ? err.message : String(err) });
 			}
 		} finally {
+			// Both cleanups are gated on still owning the session: a superseded run's
+			// `finally` fires *after* its replacement has started, and an ungated delete
+			// would throw away the new run's steering queue.
 			if (this.activeRequests.get(sessionId) === controller) {
 				this.activeRequests.delete(sessionId);
+				this.steerQueues.delete(sessionId);
 			}
-			this.steerQueues.delete(sessionId);
 			post({ type: 'done' });
 		}
 	}
@@ -819,7 +926,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		if (result.reason === 'done' || !result.detail) {
 			return;
 		}
-		if (result.reason === 'filtered' || result.reason === 'refused') {
+		if (result.reason === 'filtered' || result.reason === 'refused' || result.reason === 'stalled') {
 			post({ type: 'error', message: result.detail });
 			return;
 		}
@@ -847,11 +954,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 			if (mode === 'agent') {
 				const maxSteps = this.configuredMaxSteps();
 				await this.mcp.ensureStarted();
-				const orchestrator = new AutoOrchestrator(this.registry, this.router, this, maxSteps, this.mcp);
+				const approver = this.approverFor(sessionId, runId, controller.signal);
+				const orchestrator = new AutoOrchestrator(this.registry, this.router, approver, maxSteps, this.mcp);
 				let stepThinking: ThinkingStreamParser | undefined;
 				post({ type: 'todos', items: [] });
+				// An Auto run is still an agent run to the user, and the webview offers the
+				// same mid-run steering box. Without draining the queue here those messages
+				// were rendered as delivered and then silently discarded.
+				this.steerQueues.delete(sessionId);
 				await orchestrator.run(
-					{ history, contextText, baseSystemPrompt: await this.baseSystem(), signal: controller.signal },
+					{
+						history, contextText, baseSystemPrompt: await this.baseSystem(), signal: controller.signal,
+						steering: () => {
+							const queued = this.steerQueues.get(sessionId) ?? [];
+							this.steerQueues.delete(sessionId);
+							return queued;
+						},
+					},
 					{
 						phase: (role, a, streaming) => {
 							stepThinking?.flush();
@@ -916,6 +1035,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		} finally {
 			if (this.activeRequests.get(sessionId) === controller) {
 				this.activeRequests.delete(sessionId);
+				this.steerQueues.delete(sessionId);
 			}
 			post({ type: 'done' });
 		}
@@ -936,7 +1056,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		try {
 			({ text: full, truncated } = await streamChatWithContinuation(provider, {
 				// A long chat would otherwise grow until the provider rejects it outright.
-				messages: trimMessages(messages, this.configuredContextTokens(params.model, params.maxTokens)),
+				messages: trimMessages(messages, this.configuredContextTokens(params.model, params.maxTokens, provider.info.id)),
 				...params,
 				onToken: delta => thinking.push(delta),
 				onNotice: text => post({ type: 'info', message: text }),
@@ -950,6 +1070,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 			post({
 				type: 'info',
 				message: 'The reply is still incomplete after several automatic continuations — raise "openvsChat.maxTokens" or ask for a smaller piece at a time.',
+			});
+		}
+		// A reply with no text at all leaves nothing on screen: the webview drops the empty
+		// bubble, so without this the tab just goes quiet and re-enables Send, which reads
+		// as the chat having died. Same failure the agent loop guards against.
+		if (!full.trim()) {
+			post({
+				type: 'error',
+				message: `${provider.info.label} returned an empty response. This is usually a transient provider error — send the message again, or switch models.`,
 			});
 		}
 		if (mode === 'edit') {
@@ -998,13 +1127,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		messages: ChatMessage[],
 		params: { model: string; apiKey: string; baseUrl: string; maxTokens: number; signal: AbortSignal },
 		post: SessionPost,
+		sessionId: string,
+		runId: string,
 		keepHead?: number,
 	): Promise<RunResult> {
 		const configured = this.configuredMaxSteps();
-		const runner = new AgentRunner(provider, this, Math.min(configured, 8), {
+		const approver = this.approverFor(sessionId, runId, params.signal);
+		const runner = new AgentRunner(provider, approver, Math.min(configured, MAX_READ_ONLY_STEPS), {
 			readOnly: true,
-			maxContextTokens: this.configuredContextTokens(params.model, params.maxTokens),
-			contextWindow: contextWindowFor(params.model),
+			maxContextTokens: this.configuredContextTokens(params.model, params.maxTokens, provider.info.id),
+			contextWindow: this.windowFor(provider.info.id, params.model),
 			keepHead,
 		});
 		let stepThinking: ThinkingStreamParser | undefined;
@@ -1025,6 +1157,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		params: { model: string; apiKey: string; baseUrl: string; maxTokens: number; signal: AbortSignal },
 		post: SessionPost,
 		sessionId: string,
+		runId: string,
 		keepHead?: number,
 	): Promise<RunResult> {
 		const maxSteps = this.configuredMaxSteps();
@@ -1042,10 +1175,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 			];
 		}
 		this.steerQueues.delete(sessionId);
-		const runner = new AgentRunner(provider, this, maxSteps, {
+		const runner = new AgentRunner(provider, this.approverFor(sessionId, runId, params.signal), maxSteps, {
 			mcp: this.mcp,
-			maxContextTokens: this.configuredContextTokens(params.model, params.maxTokens),
-			contextWindow: contextWindowFor(params.model),
+			maxContextTokens: this.configuredContextTokens(params.model, params.maxTokens, provider.info.id),
+			contextWindow: this.windowFor(provider.info.id, params.model),
 			keepHead,
 			steering: () => {
 				const queued = this.steerQueues.get(sessionId) ?? [];
@@ -1082,14 +1215,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 	 * tool output is trimmed. Derived from the model's context window unless the user
 	 * pinned an explicit openvsChat.agent.maxContextTokens.
 	 */
-	private configuredContextTokens(model: string, maxOutputTokens: number): number {
+	private configuredContextTokens(model: string, maxOutputTokens: number, providerId?: string): number {
 		const configured = vscode.workspace.getConfiguration('openvsChat').get<number>('agent.maxContextTokens');
-		return contextBudgetFor(model, maxOutputTokens, typeof configured === 'number' ? configured : 0);
+		return contextBudgetFor(model, maxOutputTokens, typeof configured === 'number' ? configured : 0,
+			providerId ? this.modelCache.get(providerId) : undefined);
+	}
+
+	/**
+	 * The model's context window, preferring the fetched catalog's own figure (OpenRouter
+	 * and other gateways report it) over the name-pattern guess.
+	 */
+	private windowFor(providerId: string, model: string): number {
+		return contextWindowFor(model, this.modelCache.get(providerId));
 	}
 
 	/** History arrives from the webview with rendered thinking blocks still in past assistant turns; never re-send those. */
 	private sanitizeHistory(history: ChatMessage[]): ChatMessage[] {
-		return history.map(m => m.role === 'assistant' ? { ...m, content: stripThinking(m.content) } : m);
+		return stripHistoryThinking(history);
 	}
 
 	/**
@@ -1114,8 +1256,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 		post: SessionPost,
 	): Promise<ChatMessage[]> {
 		// The trim budget is passed too, so compaction always precedes the lossy trim.
-		const trimBudget = this.configuredContextTokens(params.model, params.maxTokens);
-		if (!shouldCompact(messages, contextWindowFor(params.model), trimBudget)) {
+		const trimBudget = this.configuredContextTokens(params.model, params.maxTokens, provider.info.id);
+		if (!shouldCompact(messages, this.windowFor(provider.info.id, params.model), trimBudget)) {
 			return messages;
 		}
 		const res = await compactMessages(messages, async (toSummarize, maxTokens) => {
@@ -1274,7 +1416,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 			providers,
 			selectedProvider: this.registry.getDefaultProviderId(),
 			auto: { roles, reviewEnabled: this.router.isReviewEnabled() },
-			approval: vscode.workspace.getConfiguration('openvsChat').get<string>('guardrails.approval') || 'auto-edits',
+			approval: parseApprovalPolicy(vscode.workspace.getConfiguration('openvsChat').get<string>('guardrails.approval')),
 		});
 		await this.postSkills();
 		this.pushAvailableModels(providers);
@@ -1373,107 +1515,91 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, ToolApprove
 </head>
 <body class="${settingsOnly ? 'settings-window' : ''}">
 	<script nonce="${nonce}">window.__OPENVS_SETTINGS_ONLY__ = ${settingsOnly ? 'true' : 'false'};</script>
-	<div id="app">
-		<div id="tabs"></div>
-		<section id="settingsPanel" class="hidden">
-			<div class="settings-header panel-header">
-				<h2>Settings</h2>
-				<button id="closeSettings" class="panel-close" title="Close settings (Esc)">✕ Close</button>
-			</div>
-			<div class="settings-header"><h2>Providers</h2></div>
-			<div id="providerList"></div>
-			<p class="hint">Keys are stored in the OS secret store. Anthropic and OpenAI support signing in with your <strong>Claude</strong> or <strong>ChatGPT</strong> subscription account, and <strong>OpenRouter</strong> offers a one-click browser sign-in that creates a key for you — no pasting needed. You can also set <code>OPENAI_API_KEY</code>, <code>ANTHROPIC_API_KEY</code>, <code>NVIDIA_API_KEY</code>, <code>OPENROUTER_API_KEY</code>, <code>MOONSHOT_API_KEY</code> or <code>DASHSCOPE_API_KEY</code>, or configure a web sign-in URL via <code>openvsChat.&lt;provider&gt;.authUrl</code>.</p>
-
-			<div class="settings-header"><h2>Agent permissions</h2></div>
-			<p class="hint">Controls when Agent mode pauses for your approval. <strong>Full Auto</strong> never asks (guardrails like protected paths and denied commands still apply); <strong>Default</strong> auto-approves file edits but asks before running commands.</p>
-			<div id="approvalList"></div>
-
-			<div class="settings-header"><h2>Skills</h2>
-				<button id="newSkill" class="mini-button" title="Create a new skill file in this workspace (.openvs/skills)">＋ New Skill</button>
-			</div>
-			<p class="hint">Skills are named instruction packs that steer every message while active. Activate as many as you like — they combine. Create your own — it opens as a Markdown file you can edit any time.</p>
-			<div id="skillList"></div>
-
-			<div class="settings-header"><h2>MCP servers</h2>
-				<span class="header-actions">
-					<button id="mcpAdd" class="mini-button" title="Register a new MCP server">＋ Add Server</button>
-					<button id="mcpReconnectBtn" class="mini-button" title="Restart all MCP connections">Reconnect</button>
-					<button id="mcpOpenConfig" class="mini-button" title="Open .openvs/mcp.json">Open Config</button>
-				</span>
-			</div>
-			<p class="hint">MCP (Model Context Protocol) servers add extra tools the agent can call (databases, browsers, APIs…). Tools appear to the agent as <code>mcp__&lt;server&gt;__&lt;tool&gt;</code>.</p>
-			<div id="mcpList" class="hint">Loading…</div>
-
-			<div class="settings-header"><h2>Auto routing</h2></div>
-			<p class="hint">When the provider is set to <strong>🤖 Auto</strong>, each phase runs on its own model: <strong>Ask</strong> and <strong>Plan</strong> use the planning model, inline edits use the implementation model, and <strong>Agent</strong> runs the full <em>plan → implement → review</em> pipeline. Leave a role on <em>Auto-select</em> to pick the best model from the keys you've configured.</p>
-			<div id="autoRoutingList"></div>
-			<label class="review-toggle"><input type="checkbox" id="enableReview" /> Run a review pass after Agent runs</label>
-		</section>
-
-		<section id="historyPanel" class="hidden">
-			<div class="settings-header panel-header">
-				<h2>Chat History</h2>
-				<button id="closeHistory" class="panel-close" title="Close history (Esc)">✕ Close</button>
-			</div>
-			<p class="hint">Closed chats are saved here automatically. Click one to reopen it in a tab.</p>
-			<div id="historyList"></div>
-		</section>
-
-		<main id="messages"></main>
-
-		<footer id="composer">
-			<div class="composer-box">
-				<div id="skillChip" class="context-chip hidden"></div>
-				<div id="contextChip" class="context-chip hidden"></div>
-				<div id="queueChips" class="queue-chips hidden"></div>
-				<div id="imageChips" class="image-chips hidden"></div>
-				<div class="composer-input-row">
-					<textarea id="input" rows="1" placeholder="Ask anything… (Enter to send, Shift+Enter for newline)"></textarea>
-					<button id="sendButton" class="send-button" title="Send">
-						<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M2 2l12 6-12 6 3-6-3-6z"/></svg>
-					</button>
-					<button id="stopButton" class="send-button hidden" title="Stop">
-						<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><rect x="4" y="4" width="8" height="8" rx="1"/></svg>
-					</button>
-				</div>
-				<div class="composer-bar">
-					<select id="modeSelect" class="mode-pill" title="Chat mode">
-						<option value="ask">Ask</option>
-						<option value="plan">Plan</option>
-						<option value="agent">Agent</option>
-					</select>
-					<select id="approvalSelect" class="approval-pill hidden" title="Agent permissions — when the agent must ask before acting">
-						<option value="always">🛡 Always Ask</option>
-						<option value="auto-readonly">🛡 Reads Free</option>
-						<option value="auto-edits">🛡 Default</option>
-						<option value="yolo">⚡ Full Auto</option>
-					</select>
-					<select id="providerSelect" title="Provider"></select>
-					<select id="modelSelect" title="Model"></select>
-					<span id="autoSummary" class="auto-summary hidden" title="Auto routing — configure in ⚙ Providers"></span>
-					<button id="refreshModels" class="icon-button" title="Refresh models from provider">
-						<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M13.5 2.5v4h-4l1.62-1.62A4.98 4.98 0 0 0 3 8a5 5 0 0 0 9.9 1h1.02A6 6 0 1 1 11.83 4.17L13.5 2.5z"/></svg>
-					</button>
-					<span class="spacer"></span>
-					<button id="attachButton" class="icon-button" title="Attach active file / selection">
-						<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M10.57 2.27a2.75 2.75 0 0 1 3.89 3.89l-6.72 6.72a4.25 4.25 0 0 1-6.01-6.01l6.01-6.01.71.71-6.01 6.01a3.25 3.25 0 1 0 4.6 4.6l6.72-6.72a1.75 1.75 0 1 0-2.48-2.48L4.92 9.34a.75.75 0 0 0 1.06 1.06l5.66-5.66.71.71-5.66 5.66a1.75 1.75 0 0 1-2.48-2.48l6.36-6.36z"/></svg>
-					</button>
-					<button id="enhanceButton" class="icon-button" title="Enhance prompt with AI">
-						<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1l1.5 4L14 6.5 9.5 8 8 12 6.5 8 2 6.5 6.5 5 8 1zm5 9l.75 2 2 .75-2 .75L13 15.5l-.75-2-2-.75 2-.75L13 10z"/></svg>
-					</button>
-					<button id="historyButton" class="icon-button" title="Chat history">
-						<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1.5a6.5 6.5 0 1 1 0 13 6.5 6.5 0 0 1 0-13zm0 1.3a5.2 5.2 0 1 0 0 10.4A5.2 5.2 0 0 0 8 2.8zm.65 1.7v3.23l2.55 1.53-.67 1.11L7.35 8.6V4.5h1.3z"/></svg>
-					</button>
-					<button id="settingsButton" class="icon-button" title="Providers & settings">
-						<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M9.1 1l.35 1.79c.47.16.91.4 1.31.69l1.72-.6 1.1 1.9-1.37 1.19a5.6 5.6 0 0 1 0 1.56l1.37 1.19-1.1 1.9-1.72-.6c-.4.29-.84.53-1.31.69L9.1 15H6.9l-.35-1.79a5.5 5.5 0 0 1-1.31-.69l-1.72.6-1.1-1.9 1.37-1.19a5.6 5.6 0 0 1 0-1.56L2.42 7.28l1.1-1.9 1.72.6c.4-.29.84-.53 1.31-.69L6.9 1h2.2zM8 5.5A2.5 2.5 0 1 0 8 10.5 2.5 2.5 0 0 0 8 5.5z"/></svg>
-					</button>
-				</div>
-			</div>
-		</footer>
-	</div>
+${CHAT_APP_HTML}
+	<script nonce="${nonce}" src="${mediaUri('prompts.js')}"></script>
 	<script nonce="${nonce}" src="${mediaUri('main.js')}"></script>
 </body>
 </html>`;
+	}
+}
+
+/**
+ * One run's channel to the user: renders approvals and questions as cards inside the
+ * chat tab that raised them, and remembers "always allow" decisions for that run.
+ *
+ * Scoped per run rather than shared across the extension for two reasons. A single
+ * global approver could not say which tab was asking — two parallel agent runs produced
+ * two identical, unattributable modal dialogs — and an "always allow" granted in one
+ * conversation must not silently carry into another.
+ */
+class SessionApprover implements ToolApprover {
+	/** Action signatures the user chose not to be asked about again this run. */
+	private readonly alwaysAllowed = new Set<string>();
+
+	constructor(
+		private readonly view: ChatViewProvider,
+		private readonly sessionId: string,
+		private readonly runId: string,
+		private readonly signal: AbortSignal,
+	) { }
+
+	async confirm(request: ApprovalRequest): Promise<ApprovalResult> {
+		if (this.alwaysAllowed.has(request.signature)) {
+			return { approved: true };
+		}
+		const reply = await this.view.promptUser({
+			type: 'approvalRequest',
+			kind: request.kind,
+			title: request.title,
+			detail: request.detail,
+			preview: request.preview ?? '',
+			previewLanguage: request.previewLanguage ?? '',
+		}, this.sessionId, this.runId, this.signal);
+		if (!reply) {
+			return this.nativeConfirm(request);
+		}
+		const approved = reply.approved === true;
+		if (approved && reply.always === true) {
+			this.alwaysAllowed.add(request.signature);
+		}
+		const feedback = typeof reply.feedback === 'string' ? reply.feedback : undefined;
+		return { approved, feedback };
+	}
+
+	async ask(question: UserQuestion): Promise<string> {
+		const reply = await this.view.promptUser({
+			type: 'askRequest',
+			question: question.question,
+			options: question.options,
+			multiSelect: !!question.multiSelect,
+			detail: question.detail ?? '',
+		}, this.sessionId, this.runId, this.signal);
+		if (!reply) {
+			return this.nativeAsk(question);
+		}
+		return typeof reply.answer === 'string' ? reply.answer : '';
+	}
+
+	/** Fallback for when the chat view isn't open: a native modal. */
+	private async nativeConfirm(request: ApprovalRequest): Promise<ApprovalResult> {
+		const detail = request.preview
+			? `${request.detail}\n\n${request.preview.slice(0, 1_000)}`
+			: request.detail;
+		const choice = await vscode.window.showWarningMessage(
+			request.title, { modal: true, detail }, 'Allow', 'Deny');
+		return { approved: choice === 'Allow' };
+	}
+
+	/** Fallback for when the chat view isn't open: a native quick pick. */
+	private async nativeAsk(question: UserQuestion): Promise<string> {
+		const picked = await vscode.window.showQuickPick(
+			question.options.map(o => ({ label: o.label, detail: o.description })),
+			{ title: question.question, canPickMany: !!question.multiSelect, ignoreFocusOut: true },
+		);
+		if (!picked) {
+			return '';
+		}
+		return Array.isArray(picked) ? picked.map(p => p.label).join(', ') : picked.label;
 	}
 }
 

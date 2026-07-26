@@ -8,6 +8,7 @@ import {
 	ModelEntry, ProviderInfo, RetryInfo, STREAM_FETCH_OPTS, StreamChatResult, ToolCall, apiFetch,
 	describeHttpError, normalizeFinishReason, readSSE, retryNotice,
 } from './types';
+import { CLOSE_MARK, OPEN_MARK } from '../persona/thinking';
 
 /**
  * Base implementation for any backend that speaks the OpenAI Chat Completions API
@@ -107,7 +108,7 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 				const reasoning: string | undefined = delta?.reasoning_content;
 				if (typeof reasoning === 'string' && reasoning) {
 					if (phase === 'idle') {
-						request.onToken('🤔 *Thinking…*\n\n');
+						request.onToken(OPEN_MARK);
 						phase = 'reasoning';
 					}
 					request.onToken(reasoning);
@@ -115,7 +116,7 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 				const content: string | undefined = delta?.content;
 				if (typeof content === 'string' && content) {
 					if (phase === 'reasoning') {
-						request.onToken('\n\n---\n\n');
+						request.onToken(CLOSE_MARK);
 					}
 					phase = 'answer';
 					request.onToken(content);
@@ -190,14 +191,14 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 			// Stream reasoning for visibility, but keep it out of the recorded turn.
 			if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
 				if (!reasoning) {
-					request.onToken?.('🤔 *Thinking…*\n\n');
+					request.onToken?.(OPEN_MARK);
 				}
 				reasoning += delta.reasoning_content;
 				request.onToken?.(delta.reasoning_content);
 			}
 			if (typeof delta.content === 'string' && delta.content) {
 				if (reasoning && !content) {
-					request.onToken?.('\n\n---\n\n');
+					request.onToken?.(CLOSE_MARK);
 				}
 				content += delta.content;
 				request.onToken?.(delta.content);

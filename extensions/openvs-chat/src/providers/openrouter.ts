@@ -11,6 +11,7 @@ interface OpenRouterCatalogModel {
 	readonly id?: string;
 	readonly pricing?: { readonly prompt?: string | number; readonly completion?: string | number };
 	readonly supported_parameters?: readonly string[];
+	readonly context_length?: number;
 }
 
 /**
@@ -74,9 +75,12 @@ export class OpenRouterProvider extends OpenAICompatibleProvider {
 				const prompt = Number(m.pricing?.prompt ?? NaN);
 				const completion = Number(m.pricing?.completion ?? NaN);
 				const free = m.id.endsWith(':free') || (prompt === 0 && completion === 0);
+				const contextLength = typeof m.context_length === 'number' && m.context_length > 0
+					? m.context_length
+					: undefined;
 				const entry: ModelEntry = Array.isArray(m.supported_parameters)
-					? { id: m.id, free, toolCapable: m.supported_parameters.includes('tools') }
-					: { id: m.id, free };
+					? { id: m.id, free, contextLength, toolCapable: m.supported_parameters.includes('tools') }
+					: { id: m.id, free, contextLength };
 				return entry;
 			})
 			.sort((a, b) => a.id.localeCompare(b.id));

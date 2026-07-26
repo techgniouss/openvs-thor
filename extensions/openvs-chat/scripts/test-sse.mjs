@@ -1,3 +1,7 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) OpenVS. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
 // Standalone unit test for readSSE in src/providers/types.ts. Run:
 //   npx tsc -p extensions/openvs-chat/tsconfig.json
 //   node extensions/openvs-chat/scripts/test-sse.mjs
@@ -123,5 +127,51 @@ assert.strictEqual(m.normalizeFinishReason('content_filter'), 'filtered');
 assert.strictEqual(m.normalizeFinishReason('refusal'), 'refused');
 assert.strictEqual(m.normalizeFinishReason('end_turn'), 'stop');
 assert.strictEqual(m.normalizeFinishReason(undefined), undefined);
+
+// --- streamChatWithContinuation -------------------------------------------------
+// A truncated response whose text is only whitespace must not be continued: the prefill
+// turn it would build is empty after the trailing-whitespace strip, which Anthropic
+// rejects with HTTP 400 — turning a blank reply into a hard failure.
+{
+	let calls = 0;
+	const prefillProvider = {
+		info: { id: 'p', label: 'P', supportsAssistantPrefill: true },
+		async streamChat(request) {
+			calls++;
+			request.onToken('   \n  ');
+			return { truncated: true };
+		},
+		async listModels() { return []; },
+	};
+	const out = await m.streamChatWithContinuation(prefillProvider, {
+		messages: [{ role: 'user', content: 'hi' }],
+		model: 'm', apiKey: 'k', baseUrl: 'u', maxTokens: 10, signal: never,
+		onToken: () => { },
+	});
+	assert.strictEqual(calls, 1, 'a whitespace-only truncated reply is not continued');
+	assert.strictEqual(out.truncated, true, 'the caller still learns it was cut off');
+	assert.strictEqual(out.text.trim(), '', 'the empty text is reported as-is, not hidden');
+}
+
+// Real text is still continued, and the accumulated result is returned in order.
+{
+	const chunksOut = ['part one', ' part two'];
+	let calls = 0;
+	const provider = {
+		info: { id: 'p', label: 'P', supportsAssistantPrefill: true },
+		async streamChat(request) {
+			request.onToken(chunksOut[calls]);
+			calls++;
+			return { truncated: calls < 2 };
+		},
+		async listModels() { return []; },
+	};
+	const out = await m.streamChatWithContinuation(provider, {
+		messages: [{ role: 'user', content: 'hi' }],
+		model: 'm', apiKey: 'k', baseUrl: 'u', maxTokens: 10, signal: never,
+		onToken: () => { },
+	});
+	assert.deepStrictEqual(out, { text: 'part one part two', truncated: false });
+}
 
 console.log('test-sse: all assertions passed');

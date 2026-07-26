@@ -35,6 +35,11 @@ export interface AutoRunParams {
 	readonly contextText?: string;
 	readonly baseSystemPrompt: string;
 	readonly signal: AbortSignal;
+	/**
+	 * Drains course corrections the user typed while the run was in flight, so the
+	 * implementer picks them up between steps exactly as a plain Agent run does.
+	 */
+	readonly steering?: () => string[];
 }
 
 /** Collects what the implementer did, so the reviewer can critique the real changes. */
@@ -108,7 +113,7 @@ export class AutoOrchestrator {
 				...params.history,
 				{ role: 'assistant', content: `Here is the plan to follow:\n\n${planText}` },
 				{ role: 'user', content: 'Implement this plan now using the tools.' },
-			], maxTokens, params.signal, cb, sink);
+			], maxTokens, params.signal, cb, sink, params.steering);
 		}
 
 		if (!reviewCandidates.length || params.signal.aborted) {
@@ -203,6 +208,7 @@ export class AutoOrchestrator {
 		signal: AbortSignal,
 		cb: AutoCallbacks,
 		sink: ChangeSink,
+		steering?: () => string[],
 	): Promise<void> {
 		let lastError: unknown;
 		for (let i = 0; i < candidates.length; i++) {
@@ -223,6 +229,7 @@ export class AutoOrchestrator {
 				mcp: this.mcp,
 				contextWindow: contextWindowFor(a.model),
 				keepHead: seed.length,
+				steering,
 			});
 			try {
 				const outcome = await runner.run(
@@ -304,6 +311,7 @@ export class AutoOrchestrator {
 				mcp: this.mcp,
 				contextWindow: contextWindowFor(a.model),
 				keepHead: stepSeed.length,
+				steering: params.steering,
 			});
 			const outcome = await runner.run(stepSeed, runParams, agentCallbacks(cb, sink));
 			if (outcome.reason !== 'done' && outcome.detail) {

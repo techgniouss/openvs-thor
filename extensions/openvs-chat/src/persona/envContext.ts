@@ -27,6 +27,17 @@ function sanitize(text: string): string {
 	return text.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
 }
 
+/** Describes the shell `run_command` will use, so the model writes compatible syntax. */
+function agentShell(): string {
+	const configured = vscode.workspace.getConfiguration('openvsChat').get<string>('agent.shell')?.trim();
+	if (configured) {
+		return configured;
+	}
+	return process.platform === 'win32'
+		? 'cmd.exe (Windows) — use Windows command syntax, not POSIX'
+		: '/bin/sh (POSIX)';
+}
+
 /** Filenames of open editor tabs, active-first, capped. */
 function openTabs(): string[] {
 	const names: string[] = [];
@@ -69,6 +80,9 @@ export async function buildEnvContext(): Promise<string> {
 		lines.push(`Workspace root: ${sanitize(root.toString())} (virtual)`);
 	}
 	lines.push(`Platform: ${process.platform}`);
+	// run_command executes through a real shell, so the model has to emit syntax that
+	// shell accepts. Left unsaid it defaults to POSIX and every command fails on Windows.
+	lines.push(`Shell for run_command: ${sanitize(agentShell())}`);
 	lines.push(`Date: ${new Date().toISOString().slice(0, 10)}`);
 
 	// Never run git in an untrusted workspace: a malicious repo's .git/config

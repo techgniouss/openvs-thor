@@ -198,6 +198,9 @@ registerSingleton(IAllowedMcpServersService, AllowedMcpServersService, Instantia
 
 //#region --- workbench contributions
 
+// OpenVS default configuration overrides (lean workbench)
+import './browser/openvsDefaults.contribution.js';
+
 // Default Account
 import './services/accounts/browser/defaultAccount.js';
 
