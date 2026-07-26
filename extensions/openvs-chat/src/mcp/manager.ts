@@ -12,6 +12,15 @@ export interface McpToolset {
 	tools(): ToolSpec[];
 	/** Calls a namespaced MCP tool (`mcp__<server>__<tool>`). */
 	call(name: string, args: Record<string, unknown>): Promise<{ result: string; isError: boolean }>;
+	/**
+	 * Whether the server declared this tool as read-only (`annotations.readOnlyHint`).
+	 * False when it declared otherwise *or said nothing* — an unannotated tool has to be
+	 * assumed capable of changing the workspace.
+	 *
+	 * Optional so a toolset written against the older interface still loads; callers must
+	 * treat its absence as "not known to be read-only".
+	 */
+	isReadOnly?(name: string): boolean;
 }
 
 /** Per-server configuration (stdio). `url` is reserved for a future HTTP transport. */
@@ -35,11 +44,17 @@ const PROJECT_FILES = ['.openvs/mcp.json', '.vscode/mcp.json'];
 export class McpManager implements McpToolset, vscode.Disposable {
 	private readonly clients = new Map<string, McpStdioClient>();
 	private readonly toolSpecs: ToolSpec[] = [];
-	/** namespaced tool name -> { server, tool } */
-	private readonly routes = new Map<string, { server: string; tool: string }>();
+	/** namespaced tool name -> { server, tool, readOnly } */
+	private readonly routes = new Map<string, { server: string; tool: string; readOnly: boolean }>();
 	private readonly status: string[] = [];
 	private started = false;
 	private starting?: Promise<void>;
+	/**
+	 * Bumped by every {@link reconnect}. A start that was already in flight compares it
+	 * before publishing anything, so a torn-down generation can't repopulate the tool
+	 * table it was just cleared from (and leave `started` true over a dead connection).
+	 */
+	private generation = 0;
 
 	/** Connects to all configured servers once (idempotent). Per-server failures are recorded, not thrown. */
 	async ensureStarted(): Promise<void> {
@@ -58,8 +73,12 @@ export class McpManager implements McpToolset, vscode.Disposable {
 	}
 
 	private async startAll(): Promise<void> {
+		const generation = this.generation;
 		const servers = await this.loadConfig();
 		for (const [id, cfg] of Object.entries(servers)) {
+			if (this.generation !== generation) {
+				return; // superseded by a reconnect
+			}
 			if (cfg.disabled) {
 				continue;
 			}
@@ -71,12 +90,14 @@ export class McpManager implements McpToolset, vscode.Disposable {
 				this.status.push(`${id}: skipped (workspace not trusted).`);
 				continue;
 			}
-			await this.startServer(id, cfg as McpStdioConfig);
+			await this.startServer(id, cfg as McpStdioConfig, generation);
 		}
-		this.started = true;
+		if (this.generation === generation) {
+			this.started = true;
+		}
 	}
 
-	private async startServer(id: string, cfg: McpStdioConfig): Promise<void> {
+	private async startServer(id: string, cfg: McpStdioConfig, generation: number): Promise<void> {
 		const client = new McpStdioClient({
 			command: cfg.command,
 			args: cfg.args,
@@ -86,10 +107,14 @@ export class McpManager implements McpToolset, vscode.Disposable {
 		try {
 			await client.start();
 			const tools = await client.listTools();
+			if (this.generation !== generation) {
+				client.dispose();
+				return; // a reconnect happened while this server was handshaking
+			}
 			this.clients.set(id, client);
 			for (const tool of tools) {
 				const namespaced = `${NAMESPACE}${id}__${tool.name}`;
-				this.routes.set(namespaced, { server: id, tool: tool.name });
+				this.routes.set(namespaced, { server: id, tool: tool.name, readOnly: tool.annotations?.readOnlyHint === true });
 				this.toolSpecs.push({
 					name: namespaced,
 					description: `[MCP:${id}] ${tool.description ?? tool.name}`,
@@ -105,6 +130,10 @@ export class McpManager implements McpToolset, vscode.Disposable {
 
 	tools(): ToolSpec[] {
 		return this.toolSpecs;
+	}
+
+	isReadOnly(name: string): boolean {
+		return this.routes.get(name)?.readOnly === true;
 	}
 
 	async call(name: string, args: Record<string, unknown>): Promise<{ result: string; isError: boolean }> {
@@ -130,6 +159,7 @@ export class McpManager implements McpToolset, vscode.Disposable {
 
 	/** Tears down and forgets all connections so the next ensureStarted reconnects. */
 	reconnect(): void {
+		this.generation++;
 		this.dispose();
 		this.started = false;
 	}

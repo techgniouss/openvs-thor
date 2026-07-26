@@ -1,3 +1,7 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) OpenVS. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
 // Standalone unit test for src/agent/contextWindow.ts. Run:
 //   npx tsc -p extensions/openvs-chat/tsconfig.json
 //   node extensions/openvs-chat/scripts/test-context-window.mjs
@@ -26,5 +30,33 @@ assert.strictEqual(m.contextBudgetFor('totally-unknown-model', 8_192), Math.floo
 assert.strictEqual(m.contextBudgetFor('claude-fable-5', 8_192, 50_000), 50_000);
 // Headroom can never push the budget below the floor.
 assert.strictEqual(m.contextBudgetFor('totally-unknown-model', 30_000), 8_000);
+
+// A window reported by the provider's catalog is authoritative and beats the name
+// patterns — including for models the table has never heard of, which otherwise get the
+// 32k default and compact themselves to death a few file reads into a run.
+{
+	const catalog = [
+		{ id: 'vendor/brand-new-model', contextLength: 262_144 },
+		{ id: 'anthropic/claude-sonnet-5', contextLength: 1_000_000 },
+		{ id: 'vendor/no-window-reported' },
+	];
+	assert.strictEqual(m.contextWindowFor('vendor/brand-new-model', catalog), 262_144,
+		'the catalog wins over the 32k default');
+	assert.strictEqual(m.contextWindowFor('anthropic/claude-sonnet-5', catalog), 1_000_000,
+		'the catalog wins over a name-pattern match too');
+	assert.strictEqual(m.contextWindowFor('vendor/no-window-reported', catalog), 32_000,
+		'a catalog entry without a window falls back to the patterns');
+	assert.strictEqual(m.contextWindowFor('not-in-catalog', catalog), 32_000,
+		'a model missing from the catalog falls back to the patterns');
+	assert.strictEqual(m.contextBudgetFor('vendor/brand-new-model', 8_192, 0, catalog),
+		Math.floor(262_144 * 0.8) - 8_192, 'the budget follows the catalog window');
+}
+
+// Models added to the pattern table so they stop landing on the 32k default.
+assert.strictEqual(m.contextWindowFor('x-ai/grok-4'), 128_000);
+assert.strictEqual(m.contextWindowFor('z-ai/glm-4.6'), 128_000);
+assert.strictEqual(m.contextWindowFor('minimax/minimax-m2'), 192_000);
+assert.strictEqual(m.contextWindowFor('openai/gpt-oss-120b'), 128_000);
+assert.strictEqual(m.contextWindowFor('mistralai/devstral-medium'), 128_000);
 
 console.log('test-context-window: all assertions passed');

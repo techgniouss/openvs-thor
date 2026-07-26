@@ -35,9 +35,29 @@ active development unless told otherwise; everything else is upstream VS Code.
 - `scripts/test.bat` (Windows) — general unit test entry point; accepts `--grep <pattern>`.
 - `scripts/test-integration.bat` — integration tests (`*.integrationTest.ts` and tests under
   `extensions/`).
-- There is no dedicated test suite in `extensions/openvs-chat` today — verify changes there
-  by running the extension in the Extension Development Host (`F5` from this repo, or launch
-  VS Code with `--extensionDevelopmentPath=extensions/openvs-chat`) and exercising the chat UI.
+- `npm test --prefix extensions/openvs-chat` — the extension's own suite (`pretest`
+  compiles first, since the tests import from `out/`). Run one file directly while
+  iterating: `node extensions/openvs-chat/scripts/test-tools.mjs`.
+  `npm run typecheck --prefix extensions/openvs-chat` is the fast no-emit check, and it
+  covers `media/main.js` too — that file runs under `// @ts-check` with
+  `media/webview.d.ts` supplying the host globals, which is the only type safety the
+  webview has. Keep it at zero errors; the moment it drifts, the pragma stops being read
+  as a signal.
+- Anything reaching the `vscode` API is tested by stubbing that module through
+  `Module._load` — see `test-tools.mjs`, which drives the real tool layer against an
+  in-memory workspace. Prefer that over asserting on mocks.
+- `test-webview.mjs` guards the host↔webview contract statically (element ids, message
+  types in both directions, prompt field names, script load order). `media/main.js` is one
+  large IIFE that can't be imported, so this is what stands in for it — if you add a
+  message type or an element id, that test catches the half you forgot.
+- `test-prompt-cards.mjs` runs the real approval/question cards (`media/prompts.js`)
+  against a small DOM stand-in. That module is deliberately written with
+  createElement/textContent and direct child references — **no `innerHTML`, no
+  `querySelector`** — which is what lets the stand-in stay faithful without an HTML parser
+  or a selector engine. Keep it that way when editing it.
+- Rendering *appearance* still has to be checked by hand in the Extension Development Host
+  (`F5` from this repo, or launch VS Code with
+  `--extensionDevelopmentPath=extensions/openvs-chat`).
 
 **MANDATORY:** always check for compilation errors before running tests or declaring work
 done, and fix them first. Do not run tests while there are compile errors. Do not use
@@ -97,9 +117,24 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   shared `OAuthTokenStore` used by all web sign-in flows (Claude, ChatGPT, and OpenRouter's
   one-click PKCE sign-in via `signInOpenRouter`), refreshing tokens transparently near
   expiry.
-- `src/agent/` — the Agent-mode tool loop: `tools.ts` (read/list/write files, run commands),
-  `guardrails.ts` (protected paths, denied/allowed command regexes, approval policy),
-  `agentRunner.ts` (the loop itself, including `spawn_subagent` delegation).
+- `src/agent/` — the Agent-mode tool loop: `tools.ts` (read/list/write files, run commands,
+  plus `ask_user`, which blocks the loop on a multiple-choice question),
+  `guardrails.ts` (protected paths, denied/allowed command regexes, approval policy, and
+  `normalizeWorkspacePath` — the *single* place a model-supplied path is cleaned; both the
+  guardrail check and the filesystem resolution must go through it or they validate one
+  path and touch another), `agentRunner.ts` (the loop itself, including `spawn_subagent`
+  delegation and the completion gate that refuses to call a run "done" while the model's
+  own `update_todos` checklist has open items or it wrote files without verifying them).
+  Approvals and questions reach the user as inline cards in the chat tab that raised them,
+  via the per-run `SessionApprover` in `chatViewProvider.ts` (host side) and
+  `media/prompts.js` (rendering) — never as a global modal, so the card can carry a diff,
+  say which tab is asking, offer "allow for this run", and take a written reason on denial
+  (which is fed back to the model as the tool result).
+  `search_files` prefers the editor's own ripgrep via `workspace.findTextInFiles`, which
+  is why `enabledApiProposals: ["findTextInFiles"]` is in the extension's package.json —
+  that keeps this extension **built-in only** (a packaged VSIX would be refused). The
+  manual file sweep remains as a feature-detected fallback, so removing the proposal
+  degrades performance rather than breaking search.
 - `src/auto/` — **Auto** role-routing mode: `router.ts` picks/validates per-role models
   (planning / implementation / review) from `openvsChat.auto.*` settings, honoring pinned
   models exactly and only falling back for auto-selected ones; `orchestrator.ts` runs the
@@ -175,3 +210,13 @@ when changing either.
 2. Grep for exact error strings or function names.
 3. Follow imports to find callers of a changed module.
 4. Check `*/test/` folders — they reveal real usage and expected behavior.
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+Rules:
+- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).

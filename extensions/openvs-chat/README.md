@@ -10,7 +10,8 @@ chat panel that lets **you** choose the model provider.
   - **Edit** — sends the active file, asks the model for the full updated file, and
     offers an **Apply** button that writes the change back into the editor.
   - **Agent** — an autonomous loop with tools to **read / list / write files** and
-    **run commands** in your workspace (every write and command asks for approval).
+    **run commands** in your workspace. How often it stops to ask is one pill next to the
+    mode picker — see [Agent permissions](#agent-permissions).
 - **🤖 Auto (role routing)** — a special provider choice that runs each phase of a task
   on a different model. In **Agent** mode it runs a full **plan → implement → review**
   pipeline (e.g. plan with Claude Opus, implement with Sonnet, review with GPT-4o); in
@@ -27,6 +28,10 @@ chat panel that lets **you** choose the model provider.
   check that confirms a key works before you rely on it.
 - **Streaming everywhere**, including the Agent's tool-planning steps, with **Copy** and
   **Insert at cursor** actions on every code block.
+- **Reasoning stays out of the way** — a model's chain of thought collapses to a single
+  line (`✻ Thought for 12s`) that expands when you want to see it, so the answer isn't
+  buried under the thinking that produced it. Works for both native reasoning models and
+  models that think in `<thinking>` tags.
 - **Inline editor actions** (right-click a selection: Explain / Fix / Document / Optimize /
   Generate tests / Edit) and **slash commands** (`/fix`, `/explain`, `/auto`, …) in the chat box.
 - **Prompt enhancement** (✨ / `/enhance`) rewrites your draft into a sharper prompt.
@@ -77,10 +82,16 @@ chat panel that lets **you** choose the model provider.
 | --- | --- | --- |
 | **Ask** | Read-only Q&A grounded in the files open in your editor tabs. | No |
 | **Plan** | Produces an implementation plan for your requirement — no code, no changes. | No |
-| **Agent** | Plans and executes the whole task: reads, creates, edits files and runs commands. | Writes/edits/commands require per-action approval |
+| **Agent** | Plans and executes the whole task: reads, creates, edits files and runs commands. | Yes — how often it asks first is set by [Agent permissions](#agent-permissions) |
 
 Inline **Fix / Doc / Optimize / Edit** code actions on a selection still propose a
 rewrite that is applied to the editor.
+
+The loop is also protected against the two ways an agent run wastes your tokens going
+nowhere: a tool name handed to `run_command` (`list_dir .`) is rejected with a note that it
+is a tool, not a shell command, and an identical read repeated before anything changed is
+answered from the transcript instead of the disk. A write, a command, a sub-agent or a
+context compaction expires that, so a genuine re-read after a change still runs.
 
 > Agent mode uses function/tool calling, which works best with tool-capable models
 > (e.g. GPT-4o, Claude, Llama-3.3-70B). A model without tool support will report an
@@ -245,12 +256,27 @@ Use them for conventions and constraints ("use tabs", "never edit `generated/`",
 | Blocked commands (regex) | `openvsChat.guardrails.deniedCommands` | `rm -rf`, fork bombs, `sudo`, `git push --force`, `curl … \| sh`, … |
 | Command allow-list (regex) | `openvsChat.guardrails.allowedCommands` | empty (off) |
 | Protected paths (no writes) | `openvsChat.guardrails.protectedPaths` | `.git`, `.env*`, `*.pem`, `*.key`, … |
-| Approval policy | `openvsChat.guardrails.approval` | `always` |
+| Approval policy | `openvsChat.guardrails.approval` | `auto-edits` |
 | Command timeout | `openvsChat.agent.commandTimeoutMs` | `60000` |
 
 The agent also can't read or write **outside the workspace root** (path-escape attempts are
-blocked), and can't write at all in an **untrusted workspace**. Approval policy `yolo`
-auto-approves writes/commands — use it knowingly.
+blocked), and can't write at all in an **untrusted workspace**.
+
+### Agent permissions
+
+The approval policy is the pill next to the mode picker in Agent mode (also
+`openvsChat.guardrails.approval`, and the **Agent permissions** section of ⚙):
+
+| Pill | Value | Behaviour |
+| --- | --- | --- |
+| 🛡 **Always Ask** | `always` | Confirms every file write and every command. |
+| 🛡 **Default** | `auto-edits` | File edits inside the workspace go through; commands still ask. |
+| ⚡ **Full Auto** | `yolo` | Nothing is confirmed — writes, commands and MCP calls all run. |
+
+Reading, listing and searching never ask, at any level. The hard guardrails above apply at
+every level too, **including Full Auto**: a denied command stays denied, a protected path
+stays unwritable, and an overwrite that shrinks a file to a fraction of its size is still
+confirmed by hand, because that is what a truncated model response looks like.
 
 ## Web sign-in (login instead of a key)
 

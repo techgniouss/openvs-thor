@@ -98,3 +98,8 @@ lerna-debug.log*
 # misc build/test extras
 *.orig
 .stylelintcache
+
+# graphify
+graphify-out/
+.graphify/
+

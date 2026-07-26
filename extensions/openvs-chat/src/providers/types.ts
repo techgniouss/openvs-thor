@@ -43,6 +43,12 @@ export interface ModelEntry {
 	 * patterns decide.
 	 */
 	readonly toolCapable?: boolean;
+	/**
+	 * Total context window in tokens as reported by the provider's catalog. Authoritative
+	 * when present: guessing it from the model name underestimates every model the name
+	 * table doesn't know, which makes compaction fire constantly and degrade long runs.
+	 */
+	readonly contextLength?: number;
 }
 
 /** JSON-schema description of a tool the model may call (Agent mode). */
@@ -260,8 +266,10 @@ export async function streamChatWithContinuation(
 		});
 		full += chunk;
 		const truncated = !!result?.truncated;
-		// An empty chunk means the model made no progress; bail rather than loop.
-		if (!truncated || !chunk || round >= MAX_CONTINUATION_ROUNDS) {
+		// A chunk with no real text means the model made no progress; bail rather than loop.
+		// Whitespace counts as no progress: continuing on it would also build a prefill turn
+		// that is empty after the trailing-whitespace strip below, which Anthropic rejects.
+		if (!truncated || !chunk.trim() || !full.trim() || round >= MAX_CONTINUATION_ROUNDS) {
 			return { text: full, truncated };
 		}
 		if (provider.info.supportsAssistantPrefill) {

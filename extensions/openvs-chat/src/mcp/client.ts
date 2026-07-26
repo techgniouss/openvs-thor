@@ -13,6 +13,13 @@ export interface McpToolDef {
 	readonly name: string;
 	readonly description?: string;
 	readonly inputSchema?: Record<string, unknown>;
+	/**
+	 * The server's own behavioral hints. Only `readOnlyHint` is read: it is what lets the
+	 * agent loop tell an MCP tool that inspects something from one that changes the
+	 * workspace, and therefore whether a run still owes the user a verification step.
+	 * Advisory by spec, so absence means "assume it can write".
+	 */
+	readonly annotations?: { readonly readOnlyHint?: boolean };
 }
 
 export interface McpStdioConfig {

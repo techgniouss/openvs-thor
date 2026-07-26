@@ -46,10 +46,19 @@ export const UPDATE_TODOS_TOOL: ToolSpec = {
 };
 
 /**
+ * The outcome of {@link parseTodoUpdate}: either a clean list or the message to hand
+ * back to the model. Discriminated on `error` rather than by key presence so callers can
+ * narrow with a plain comparison.
+ */
+export type TodoUpdate =
+	| { readonly items: TodoItem[]; readonly error?: undefined }
+	| { readonly items?: undefined; readonly error: string };
+
+/**
  * Validates an update_todos call's arguments into a clean item list. Returns an
  * error string (for the tool result) instead of throwing on bad model output.
  */
-export function parseTodoUpdate(args: Record<string, unknown>): { items: TodoItem[] } | { error: string } {
+export function parseTodoUpdate(args: Record<string, unknown>): TodoUpdate {
 	const raw = args.items;
 	if (!Array.isArray(raw)) {
 		return { error: 'update_todos requires an "items" array (send the complete checklist).' };

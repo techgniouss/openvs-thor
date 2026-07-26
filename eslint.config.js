@@ -143,6 +143,26 @@ export default defineConfig(
 			]
 		},
 	},
+	// OpenVS first-party extension: same MIT terms, its own copyright holder. Declared
+	// here so the header rule stays enforced for it rather than failing on every file,
+	// which is indistinguishable from the rule being off.
+	{
+		files: [
+			'extensions/openvs-chat/**/*.{js,cjs,mjs,ts,tsx,mts,cts}',
+		],
+		rules: {
+			'header/header': [
+				2,
+				'block',
+				[
+					'---------------------------------------------------------------------------------------------',
+					' *  Copyright (c) OpenVS. All rights reserved.',
+					' *  Licensed under the MIT License. See License.txt in the project root for license information.',
+					' *--------------------------------------------------------------------------------------------'
+				]
+			]
+		},
+	},
 	// TS
 	{
 		files: [

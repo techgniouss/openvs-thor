@@ -729,6 +729,77 @@ body.settings-window #settingsPanel {
 .tool-summary:hover { opacity: 1; }
 details[open] > .tool-summary { margin-bottom: 4px; }
 
+/* ---- Reasoning ----
+   Collapsed by default: a run's thinking dwarfs its answer, so it shows as a single
+   muted line ("✻ Thought for 12s") until the user opens it. */
+details.thinking { margin: 4px 0; }
+details.thinking > summary {
+	font-size: 0.85em; cursor: pointer; user-select: none; list-style: none;
+	color: var(--vscode-descriptionForeground);
+	display: inline-flex; align-items: center; gap: 4px;
+	padding: 1px 6px; border-radius: 10px;
+	background: var(--vscode-editor-inactiveSelectionBackground, rgba(127,127,127,0.08));
+}
+details.thinking > summary::-webkit-details-marker { display: none; }
+details.thinking > summary:hover { color: var(--vscode-foreground); }
+.thinking-body {
+	margin-top: 4px; padding-left: 8px; font-size: 0.9em;
+	border-left: 2px solid var(--vscode-panel-border, rgba(127,127,127,0.3));
+	color: var(--vscode-descriptionForeground);
+}
+
+/* ---- Approval & question cards ---- */
+.prompt-card {
+	margin: 8px 0; padding: 10px 12px; border-radius: 8px;
+	border: 1px solid var(--vscode-focusBorder, #4ea1ff);
+	background: var(--vscode-editorWidget-background, rgba(127,127,127,0.1));
+}
+.prompt-card.prompt-answered { border-color: var(--vscode-panel-border, transparent); opacity: 0.7; }
+.prompt-title { font-weight: 600; margin-bottom: 2px; }
+.prompt-detail { font-size: 0.88em; opacity: 0.85; margin-bottom: 6px; }
+.prompt-preview {
+	margin: 0 0 8px; padding: 6px 8px; max-height: 240px; overflow: auto;
+	font-family: var(--vscode-editor-font-family, monospace); font-size: 0.85em;
+	white-space: pre; border-radius: 4px;
+	background: var(--vscode-textCodeBlock-background, rgba(0,0,0,0.2));
+}
+.prompt-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.prompt-btn {
+	padding: 4px 12px; border-radius: 4px; cursor: pointer;
+	border: 1px solid var(--vscode-button-border, transparent);
+	background: var(--vscode-button-secondaryBackground, rgba(127,127,127,0.25));
+	color: var(--vscode-button-secondaryForeground, inherit);
+}
+.prompt-btn:hover { background: var(--vscode-button-secondaryHoverBackground, rgba(127,127,127,0.4)); }
+.prompt-btn.prompt-primary {
+	background: var(--vscode-button-background); color: var(--vscode-button-foreground);
+}
+.prompt-btn.prompt-primary:hover { background: var(--vscode-button-hoverBackground); }
+.prompt-btn.prompt-deny { color: var(--vscode-errorForeground, #f14c4c); }
+.prompt-feedback, .prompt-answer {
+	flex: 1 1 180px; min-width: 0; margin-top: 6px; padding: 4px 8px; border-radius: 4px;
+	border: 1px solid var(--vscode-input-border, transparent);
+	background: var(--vscode-input-background); color: var(--vscode-input-foreground);
+	font-family: inherit; font-size: 0.9em;
+}
+.prompt-answer { margin-top: 0; }
+.prompt-options { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+.prompt-option {
+	display: flex; flex-direction: column; gap: 2px; text-align: left;
+	padding: 6px 10px; border-radius: 6px; cursor: pointer;
+	border: 1px solid var(--vscode-panel-border, rgba(127,127,127,0.35));
+	background: var(--vscode-list-hoverBackground, rgba(127,127,127,0.12));
+	color: inherit; font-family: inherit;
+}
+.prompt-option:hover { border-color: var(--vscode-focusBorder, #4ea1ff); }
+.prompt-option.prompt-option-on {
+	border-color: var(--vscode-focusBorder, #4ea1ff);
+	background: var(--vscode-list-activeSelectionBackground, rgba(78,161,255,0.25));
+}
+.prompt-option-label { font-weight: 600; }
+.prompt-option-desc { font-size: 0.85em; opacity: 0.8; }
+.prompt-resolved { font-size: 0.9em; opacity: 0.85; }
+
 /* ---- Edit apply bar ---- */
 .edit-apply {
 	display: flex; align-items: center; justify-content: space-between; gap: 8px;
