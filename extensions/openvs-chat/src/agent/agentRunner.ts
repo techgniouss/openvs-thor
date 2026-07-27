@@ -10,8 +10,8 @@ import { TodoItem, UPDATE_TODOS_TOOL, parseTodoUpdate } from '../persona/todos';
 import { AgentStep, CONTINUE_PROMPT, ChatProvider, ChatMessage, ToolCall, ToolSpec } from '../providers/types';
 import { canCompact, compactMessages, compactionThreshold, shouldCompact } from './compaction';
 import { estimateMessagesTokens, isContextLengthError, trimMessages } from './context';
-import { Guardrails, autoApproves, loadGuardrails } from './guardrails';
-import { AGENT_TOOLS, ASK_USER_TOOL, AskOption, MAX_ASK_OPTIONS, READ_ONLY_TOOL_NAMES, SPAWN_SUBAGENT_TOOL, ToolApprover, detectVerificationCommands, executeTool } from './tools';
+import { Guardrails, autoApproves, loadGuardrails, resolveWorkspacePath } from './guardrails';
+import { AGENT_TOOLS, ASK_USER_TOOL, AskOption, MAX_ASK_OPTIONS, READ_ONLY_TOOL_NAMES, SPAWN_SUBAGENT_TOOL, ToolApprover, VerifyCommand, detectVerificationCommands, executeTool } from './tools';
 
 const MCP_PREFIX = 'mcp__';
 
@@ -110,9 +110,14 @@ function unfinishedTodoPrompt(items: TodoItem[]): string {
  * real instead of gesturing at "the tests". The gate does not fire at all when the list
  * is empty — see {@link AgentRunner.completionNudge}.
  */
-function verifyPrompt(commands: string[]): string {
+function verifyPrompt(commands: VerifyCommand[]): string {
+	// A command belonging to another workspace folder carries the cwd the model has to pass;
+	// without it the model would run the first folder's build and report the change verified.
+	const rendered = commands
+		.map(c => c.cwd ? `\`${c.command}\` (with cwd: "${c.cwd}")` : `\`${c.command}\``)
+		.join(' or ');
 	return 'You changed files in this run but never ran a command to check them. Run '
-		+ `${commands.map(c => `\`${c}\``).join(' or ')} with run_command now and fix anything it reports. `
+		+ `${rendered} with run_command now and fix anything it reports. `
 		+ 'Do not summarize the work as finished until it passes.';
 }
 
@@ -216,7 +221,7 @@ export class AgentRunner {
 	 */
 	private readonly answeredReads = new Set<string>();
 	/** Memoized workspace probe for verification commands; undefined until first needed. */
-	private verifyCommands?: Promise<string[]>;
+	private verifyCommands?: Promise<VerifyCommand[]>;
 
 	constructor(
 		private readonly provider: ChatProvider,
@@ -233,6 +238,18 @@ export class AgentRunner {
 		this.contextBudget = opts?.maxContextTokens ?? DEFAULT_CONTEXT_TOKENS;
 		this.contextWindow = opts?.contextWindow ?? 0;
 		this.keepHead = opts?.keepHead;
+	}
+
+	/**
+	 * Forgets every cached read, so the next one goes back to disk.
+	 *
+	 * Called when the workspace changed from outside the run — the user saving a file the
+	 * agent had already read. Without it the repeat-read guard answers a legitimate re-read
+	 * with "nothing has changed since", which is then simply false: the model is refused the
+	 * one call that would have shown it the edit it is being asked to work with.
+	 */
+	invalidateReads(): void {
+		this.answeredReads.clear();
 	}
 
 	/** The tools offered this run: read-only set for research sub-agents; otherwise the full set, plus delegation and any MCP tools. */
@@ -441,7 +458,7 @@ export class AgentRunner {
 	}
 
 	/** The workspace's verification commands, probed at most once per run. */
-	private async verificationCommands(): Promise<string[]> {
+	private async verificationCommands(): Promise<VerifyCommand[]> {
 		if (!this.verifyCommands) {
 			this.verifyCommands = detectVerificationCommands().catch(() => []);
 		}
@@ -788,12 +805,21 @@ function subagentSystem(readOnly: boolean): string {
  * Identity of a read-only call for repeat detection: the tool name plus its arguments
  * with the keys sorted, so `{path, limit}` and `{limit, path}` are recognized as the same
  * call. Also readable enough to quote straight back to the model.
+ *
+ * A `path` argument is reduced to the file it actually resolves to first. `a.ts`, `./a.ts`
+ * and `/repo/a.ts` are one file but three different strings, so keying on the raw argument
+ * let a model re-read the same file indefinitely just by spelling it differently — the exact
+ * loop this guard exists to stop, walked straight around.
  */
 function repeatKey(call: ToolCall): string {
-	const args = Object.keys(call.args).sort()
-		.map(key => `${key}=${JSON.stringify(call.args[key])}`)
+	const args: Record<string, unknown> = { ...call.args };
+	if (typeof args.path === 'string') {
+		args.path = resolveWorkspacePath(args.path)?.display ?? args.path;
+	}
+	const rendered = Object.keys(args).sort()
+		.map(key => `${key}=${JSON.stringify(args[key])}`)
 		.join(', ');
-	return `${call.name}(${args})`;
+	return `${call.name}(${rendered})`;
 }
 
 function shortArgs(args: Record<string, unknown>, max = 60): string {

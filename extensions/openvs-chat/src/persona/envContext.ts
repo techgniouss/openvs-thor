@@ -73,11 +73,21 @@ export async function buildEnvContext(): Promise<string> {
 		return cached.text;
 	}
 	const lines: string[] = [];
-	const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+	const folders = vscode.workspace.workspaceFolders ?? [];
+	const root = folders[0]?.uri;
 	if (root?.scheme === 'file') {
 		lines.push(`Workspace root: ${sanitize(root.fsPath)}`);
 	} else if (root) {
 		lines.push(`Workspace root: ${sanitize(root.toString())} (virtual)`);
+	}
+	// Without this the model never learns the other folders exist, so it addresses every
+	// path to the first one — and the tools, which do resolve a folder-name prefix, are
+	// left with no way to be told which folder was meant.
+	if (folders.length > 1) {
+		lines.push(
+			`Workspace folders: ${folders.map(f => sanitize(f.name)).join(', ')}. `
+			+ `Prefix a path with the folder name to reach one (e.g. "${sanitize(folders[1].name)}/src/index.ts"); `
+			+ `an unprefixed path means "${sanitize(folders[0].name)}", and run_command runs there unless you pass its "cwd".`);
 	}
 	lines.push(`Platform: ${process.platform}`);
 	// run_command executes through a real shell, so the model has to emit syntax that
