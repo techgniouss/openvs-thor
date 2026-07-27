@@ -1188,16 +1188,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		});
 		let stepThinking: ThinkingStreamParser | undefined;
 		post({ type: 'todos', items: [] });
-		return runner.run(messages, params, {
-			onStepStart: () => { stepThinking = new ThinkingStreamParser(text => post({ type: 'token', delta: text })); post({ type: 'agentStepStart' }); },
-			onToken: delta => stepThinking?.push(delta),
-			onStepEnd: content => { stepThinking?.flush(); stepThinking = undefined; post({ type: 'agentStepEnd', content: formatThinking(content) }); },
-			onToolStart: call => post({ type: 'toolStart', id: call.id, name: call.name, args: call.args }),
-			onToolEnd: (call, result, isError) =>
-				post({ type: 'toolEnd', id: call.id, name: call.name, result, isError }),
-			onNote: text => post({ type: 'info', message: text }),
-			onTodos: items => post({ type: 'todos', items }),
-		});
+		// The agent reads from disk, so a save by the user is a change it cannot otherwise
+		// see: its repeat-read guard would answer the re-read with "nothing has changed
+		// since". Deliberately only saves — a file watcher would also fire for every artifact
+		// a build writes, clearing the guard constantly and reopening the re-read loop.
+		const saves = vscode.workspace.onDidSaveTextDocument(() => runner.invalidateReads());
+		try {
+			return await runner.run(messages, params, {
+				onStepStart: () => { stepThinking = new ThinkingStreamParser(text => post({ type: 'token', delta: text })); post({ type: 'agentStepStart' }); },
+				onToken: delta => stepThinking?.push(delta),
+				onStepEnd: content => { stepThinking?.flush(); stepThinking = undefined; post({ type: 'agentStepEnd', content: formatThinking(content) }); },
+				onToolStart: call => post({ type: 'toolStart', id: call.id, name: call.name, args: call.args }),
+				onToolEnd: (call, result, isError) =>
+					post({ type: 'toolEnd', id: call.id, name: call.name, result, isError }),
+				onNote: text => post({ type: 'info', message: text }),
+				onTodos: items => post({ type: 'todos', items }),
+			});
+		} finally {
+			saves.dispose();
+		}
 	}
 
 	/**

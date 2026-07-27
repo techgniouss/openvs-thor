@@ -672,4 +672,47 @@ const noopCallbacks = () => {
 		'only the immediate repeat is short-circuited; the read after the write runs again');
 }
 
+// 20b. …but a change from outside the run expires it too. The agent reads from disk, so a
+// file the user saves mid-run really has changed; answering the re-read with "nothing has
+// changed since" refuses the model the one call that would show it the edit.
+{
+	const script = [
+		{ content: '', toolCalls: [{ id: 't1', name: 'read_file', args: { path: 'a.ts' } }] },
+		{ content: '', toolCalls: [{ id: 't2', name: 'read_file', args: { path: 'a.ts' } }] },
+		{ content: 'done', toolCalls: [] },
+	];
+	const results = [];
+	const runner = new AgentRunner(fakeProvider(script), approver, 20);
+	const cb = {
+		...noopCallbacks(),
+		onToolEnd: (call, result) => {
+			results.push(result);
+			// Stands in for the user saving the file between the two reads.
+			runner.invalidateReads();
+		},
+	};
+	await runner.run([{ role: 'user', content: 'go' }], params, cb);
+	assert.deepStrictEqual(results.map(r => /already ran read_file/.test(r)), [false, false],
+		'the second read runs against disk rather than being refused');
+}
+
+// 20c. The guard keys on the file, not on how the model spelled it. `a.ts`, `./a.ts` and
+// `/repo/a.ts` are one file but three different strings, so keying on the raw argument let a
+// model re-read the same file forever just by varying the spelling — walking straight around
+// the one guard that exists to stop it.
+{
+	const script = [
+		{ content: '', toolCalls: [{ id: 't1', name: 'read_file', args: { path: 'a.ts' } }] },
+		{ content: '', toolCalls: [{ id: 't2', name: 'read_file', args: { path: './a.ts' } }] },
+		{ content: '', toolCalls: [{ id: 't3', name: 'read_file', args: { path: '/repo/a.ts' } }] },
+		{ content: 'done', toolCalls: [] },
+	];
+	const results = [];
+	const cb = { ...noopCallbacks(), onToolEnd: (_call, result) => results.push(result) };
+	await new AgentRunner(fakeProvider(script), approver, 20)
+		.run([{ role: 'user', content: 'go' }], params, cb);
+	assert.deepStrictEqual(results.map(r => /already ran read_file/.test(r)), [false, true, true],
+		'every respelling of the same file is recognized as the repeat it is');
+}
+
 console.log('test-agent-loop: all assertions passed');

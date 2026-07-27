@@ -23,6 +23,10 @@ let nextApproval = { approved: true };
 let settings = {};
 /** Workspace-relative paths the stubbed `findFiles` reports, in order. */
 let globMatches = [];
+/** The include pattern the last `findFiles` call was given. */
+let lastGlob;
+/** Absolute paths the fake fs treats as directories. */
+let dirs = new Set();
 
 function uri(fsPath) {
 	return { fsPath, path: fsPath, scheme: 'file', toString: () => `file://${fsPath}` };
@@ -41,13 +45,24 @@ function joinPath(base, ...parts) {
 
 const vscodeStub = {
 	workspace: {
-		workspaceFolders: [{ uri: uri(ROOT) }],
+		workspaceFolders: [{ uri: uri(ROOT), name: 'repo', index: 0 }],
 		isTrusted: true,
 		getConfiguration: () => ({ get: key => settings[key] }),
 		asRelativePath: u => u.fsPath.replace(`${ROOT}/`, ''),
-		findFiles: async (_include, _exclude, max) => globMatches.slice(0, max).map(rel => uri(`${ROOT}/${rel}`)),
+		// Entries starting with `/` are absolute (used by the multi-root tests); anything
+		// else is relative to the primary folder. The include pattern is recorded rather
+		// than applied — the tests assert on what the editor was asked to match.
+		findFiles: async (include, _exclude, max) => {
+			lastGlob = include;
+			return globMatches.slice(0, max).map(p => uri(p.startsWith('/') ? p : `${ROOT}/${p}`));
+		},
 		fs: {
 			async readFile(u) {
+				if (dirs.has(u.fsPath)) {
+					const err = new Error(`EISDIR: illegal operation on a directory, read ${u.fsPath}`);
+					err.code = 'FileIsADirectory';
+					throw err;
+				}
 				const text = files.get(u.fsPath);
 				if (text === undefined) {
 					const err = new Error(`ENOENT: ${u.fsPath}`);
@@ -58,10 +73,16 @@ const vscodeStub = {
 			},
 			async writeFile(u, bytes) { files.set(u.fsPath, new TextDecoder().decode(bytes)); },
 			async readDirectory() { return []; },
+			async stat(u) {
+				if (!files.has(u.fsPath) && !dirs.has(u.fsPath)) { throw new Error(`ENOENT: ${u.fsPath}`); }
+				return { type: dirs.has(u.fsPath) ? 2 : 1 };
+			},
 		},
 	},
 	window: { showWarningMessage: async () => undefined, showQuickPick: async () => undefined },
 	Uri: { file: uri, joinPath },
+	// Mirrors vscode.RelativePattern: a glob anchored to one workspace folder.
+	RelativePattern: class { constructor(base, pattern) { this.baseUri = base.uri ?? base; this.pattern = pattern; } },
 	FileType: { Directory: 2, File: 1 },
 };
 const load = Module._load;
@@ -69,7 +90,7 @@ Module._load = function (request, ...rest) {
 	return request === 'vscode' ? vscodeStub : load.call(this, request, ...rest);
 };
 
-const { executeTool, renderDiff } = await import(new URL('../out/agent/tools.js', import.meta.url));
+const { executeTool, renderDiff, detectVerificationCommands } = await import(new URL('../out/agent/tools.js', import.meta.url));
 const { normalizeWorkspacePath, loadGuardrails } = await import(new URL('../out/agent/guardrails.js', import.meta.url));
 
 const approver = {
@@ -82,10 +103,18 @@ function run(name, args) {
 	return executeTool({ id: 'c1', name, args }, approver, loadGuardrails());
 }
 
+/** Opens `roots` as the workspace folders, e.g. [['/repo','repo'], ['/api','api']]. */
+function setFolders(roots) {
+	vscodeStub.workspace.workspaceFolders = roots.map(([path, name], index) => ({ uri: uri(path), name, index }));
+}
+
 function reset(initial = {}, options = {}) {
 	files = new Map(Object.entries(initial));
 	approvals = [];
 	globMatches = [];
+	lastGlob = undefined;
+	dirs = new Set();
+	setFolders([[ROOT, 'repo']]);
 	nextApproval = { approved: true };
 	// 'yolo' keeps approvals out of the way unless a test is specifically about them.
 	settings = { 'guardrails.approval': 'yolo', 'guardrails.protectedPaths': [], ...options };
@@ -354,6 +383,214 @@ function reset(initial = {}, options = {}) {
 	const res = await run('glob_files', { pattern: '**/*' });
 	assert.deepStrictEqual(res.result.split('\n'), ['.env', 'src/a.ts']);
 	assert.strictEqual((await run('write_file', { path: '.env', content: 'x' })).isError, true, 'but writing it is still blocked');
+}
+
+// 22. `$` in newText is literal. String.replace treats `$&`, `$'` and `$1` in the
+// replacement as substitution patterns, so routing an edit through it silently corrupted
+// any snippet containing a dollar sign — shell scripts, template literals, jQuery, regex
+// replacements. Covered on the exact, replaceAll and loose paths.
+{
+	const dollars = 'const s = `${a}$& and $\' and $1`;';
+	reset({ '/repo/a.ts': 'const s = 1;\n' });
+	await run('edit_file', { path: 'a.ts', oldText: 'const s = 1;', newText: dollars });
+	assert.strictEqual(files.get('/repo/a.ts'), `${dollars}\n`, 'exact path keeps $ literal');
+
+	reset({ '/repo/b.ts': 'x\nx\n' });
+	await run('edit_file', { path: 'b.ts', oldText: 'x', newText: '$&y', replaceAll: true });
+	assert.strictEqual(files.get('/repo/b.ts'), '$&y\n$&y\n', 'replaceAll keeps $ literal');
+
+	// Loose path: the file is CRLF so the exact match fails first.
+	reset({ '/repo/c.ts': 'keep\r\n\tanchor\r\n' });
+	await run('edit_file', { path: 'c.ts', oldText: 'anchor', newText: '$& $1' });
+	assert.strictEqual(files.get('/repo/c.ts'), 'keep\r\n\t$& $1\r\n', 'loose path keeps $ literal');
+}
+
+// 23. Two identical loose matches are both replaced, in the right places. Replacing by
+// String.replace re-found the first match on the second pass — which by then was the text
+// just written — so the second site was left untouched and the first was mangled.
+// The file is CRLF and oldText is multi-line, so the exact match cannot fire and both
+// sites go through the loose path.
+{
+	const before = 'if (a) {\r\n\t\tgo();\r\n\t\tdone();\r\n}\r\nif (b) {\r\n\t\tgo();\r\n\t\tdone();\r\n}\r\n';
+	reset({ '/repo/a.ts': before });
+	const res = await run('edit_file', {
+		path: 'a.ts',
+		oldText: 'go();\ndone();',
+		newText: 'go();\nlog();\ndone();',
+		replaceAll: true,
+	});
+	assert.strictEqual(res.isError, false, res.result);
+	assert.strictEqual(
+		files.get('/repo/a.ts'),
+		'if (a) {\r\n\t\tgo();\r\n\t\tlog();\r\n\t\tdone();\r\n}\r\nif (b) {\r\n\t\tgo();\r\n\t\tlog();\r\n\t\tdone();\r\n}\r\n',
+		'both sites replaced, indentation and CRLF preserved at each');
+}
+
+// 24. A multi-line replacement matched against a SINGLE-line anchor still gets the file's
+// line endings. The span of a one-line match contains no newline at all, so judging the
+// file's convention by the span stripped CRLF out of every such replacement.
+{
+	reset({ '/repo/a.ts': 'first\r\n\tonly\r\nlast\r\n' });
+	// Trailing space, so the exact match misses and the loose path handles it.
+	await run('edit_file', { path: 'a.ts', oldText: 'only ', newText: 'one\ntwo' });
+	assert.strictEqual(files.get('/repo/a.ts'), 'first\r\n\tone\r\n\ttwo\r\nlast\r\n');
+}
+
+// 24b. When the model's own nesting disagrees with the file's, no indentation is guessed:
+// its text goes in as written. A guessed shift puts code at the wrong depth, which is both
+// worse and far harder to notice in a diff than untidy indentation.
+{
+	reset({ '/repo/a.ts': 'if (a) {\r\n\t\tgo();\r\n\t}\r\n' });
+	// The model has `}` deeper than `go();`; the file has it shallower — no uniform shift.
+	await run('edit_file', { path: 'a.ts', oldText: 'go();\n\t}', newText: 'stop();\n\t}' });
+	assert.strictEqual(files.get('/repo/a.ts'), 'if (a) {\r\nstop();\r\n\t}\r\n');
+}
+
+// 24c. Exact matches are not reindented — the model asked for that text byte for byte —
+// but LF newlines it wrote into a CRLF file are still corrected.
+{
+	reset({ '/repo/a.ts': 'first\r\nonly\r\n' });
+	await run('edit_file', { path: 'a.ts', oldText: 'only', newText: 'one\ntwo' });
+	assert.strictEqual(files.get('/repo/a.ts'), 'first\r\none\r\ntwo\r\n');
+}
+
+// 25. A block that repeats on consecutive lines matches without the two spans overlapping —
+// overlapping ranges would splice the second replacement inside the first.
+{
+	reset({ '/repo/a.ts': 'x\nx\nx\nx\n' });
+	const res = await run('edit_file', { path: 'a.ts', oldText: '   1→x\n   2→x', newText: 'y\ny', replaceAll: true });
+	assert.strictEqual(res.isError, false, res.result);
+	assert.strictEqual(files.get('/repo/a.ts'), 'y\ny\ny\ny\n');
+}
+
+// 26. Multi-root: a search or glob hit in the SECOND folder round-trips. This was the
+// whole bug — matches were reported folder-prefixed ("api/src/index.ts") but every path was
+// resolved against workspaceFolders[0], so the very next read_file looked for
+// /repo/api/src/index.ts and failed. Every search result in a multi-root workspace pointed
+// at a path the agent could not open.
+{
+	reset({ '/api/src/index.ts': 'export const x = 1;\n' });
+	setFolders([[ROOT, 'repo'], ['/api', 'api']]);
+	globMatches = ['/api/src/index.ts', '/elsewhere/stray.ts'];
+
+	const found = await run('glob_files', { pattern: '**/*.ts' });
+	assert.strictEqual(found.result, 'api/src/index.ts',
+		'prefixed with the folder name, and a hit outside every folder is dropped');
+
+	const read = await run('read_file', { path: found.result });
+	assert.strictEqual(read.isError, false, read.result);
+	assert.match(read.result, /export const x = 1;/);
+
+	// …and writes land in the right folder too.
+	const edit = await run('edit_file', { path: 'api/src/index.ts', oldText: '1', newText: '2' });
+	assert.strictEqual(edit.isError, false, edit.result);
+	assert.strictEqual(files.get('/api/src/index.ts'), 'export const x = 2;\n');
+	assert.strictEqual(files.has('/repo/api/src/index.ts'), false, 'nothing was created under the first folder');
+}
+
+// 27. A plain relative path still means the first folder, exactly as in a single-root
+// workspace — the folder-name branch must not capture ordinary paths.
+{
+	reset({ '/repo/a.ts': 'one\n' });
+	setFolders([[ROOT, 'repo'], ['/api', 'api']]);
+	const res = await run('read_file', { path: 'a.ts' });
+	assert.strictEqual(res.isError, false, res.result);
+	assert.match(res.result, /one/);
+}
+
+// 28. An absolute path inside a folder is honoured rather than rebased onto the root, where
+// it became /repo/api/src/index.ts and simply failed to open. One that matches no folder is
+// still treated as relative and reported missing — never read from outside the workspace.
+{
+	reset({ '/api/src/index.ts': 'ok\n', '/outside/secret.ts': 'nope\n' });
+	setFolders([[ROOT, 'repo'], ['/api', 'api']]);
+	const inside = await run('read_file', { path: '/api/src/index.ts' });
+	assert.strictEqual(inside.isError, false, inside.result);
+	assert.match(inside.result, /ok/);
+
+	const outside = await run('read_file', { path: '/outside/secret.ts' });
+	assert.strictEqual(outside.isError, true, 'a path outside every folder is not read');
+	assert.ok(!/nope/.test(outside.result), 'and its contents never appear');
+}
+
+// 29. Confinement is enforced per folder, not just against the first one: `..` out of the
+// second folder is blocked the same way it always was out of the first.
+{
+	reset({ '/etc/passwd': 'secret' });
+	setFolders([[ROOT, 'repo'], ['/api', 'api']]);
+	const res = await run('read_file', { path: 'api/../../etc/passwd' });
+	assert.strictEqual(res.isError, true);
+	assert.match(res.result, /escapes the workspace root/);
+}
+
+// 30. Multi-root: a folder-name prefix works in a GLOB too, not just in a path. A plain
+// string pattern is matched against every folder's own relative paths, so "api/**" looked
+// for an `api` directory inside each folder and matched the folder called `api` never —
+// while read_file accepted that exact prefix and the environment snapshot tells the model
+// to use it. An empty result is precisely what sends a model round the same search again.
+{
+	reset({ '/api/src/index.ts': 'x\n' });
+	setFolders([[ROOT, 'repo'], ['/api', 'api']]);
+	globMatches = ['/api/src/index.ts'];
+	await run('glob_files', { pattern: 'api/**/*.ts' });
+	assert.strictEqual(lastGlob.baseUri.fsPath, '/api', 'scoped to the named folder');
+	assert.strictEqual(lastGlob.pattern, '**/*.ts', 'with the folder name stripped off');
+
+	// A pattern naming no folder is passed straight through, as in a single-root workspace.
+	await run('glob_files', { pattern: '**/*.ts' });
+	assert.strictEqual(lastGlob, '**/*.ts');
+}
+
+// 31. Reading a directory names the tool that would have worked. The raw
+// EISDIR/FileIsADirectory error mentions no tool the model has, so it retried the same call.
+{
+	reset();
+	dirs.add('/repo/src');
+	const res = await run('read_file', { path: 'src' });
+	assert.strictEqual(res.isError, true);
+	assert.match(res.result, /is a directory, not a file\. Use list_dir/);
+}
+
+// 32. run_command's cwd goes through the same guarded resolution as any other path, so a
+// command cannot be aimed outside the workspace. (Checked on the rejection path — the
+// success path would reach the real `exec`.)
+{
+	reset();
+	const res = await run('run_command', { command: 'echo hi', cwd: '../outside' });
+	assert.strictEqual(res.isError, true);
+	assert.match(res.result, /escapes the workspace root/);
+	assert.strictEqual(approvals.length, 0, 'the user is never asked to approve a blocked command');
+}
+
+// 33. The verification probe covers every folder, and a command belonging to a non-primary
+// one carries the cwd the model has to pass. Without that the completion gate would demand
+// "npm run build" for a change in the second folder, the model would run the FIRST folder's
+// build, and the run would be reported verified on the strength of an unrelated green build.
+{
+	reset({
+		'/repo/package.json': JSON.stringify({ scripts: { build: 'x' } }),
+		'/api/package.json': JSON.stringify({ scripts: { test: 'y' } }),
+	});
+	setFolders([[ROOT, 'repo'], ['/api', 'api']]);
+	assert.deepStrictEqual(await detectVerificationCommands(), [
+		{ command: 'npm run build', cwd: undefined },
+		{ command: 'npm run test', cwd: 'api' },
+	]);
+}
+
+// 34. Nested workspace folders resolve to the innermost one, whatever order they were
+// added in. Taking the first prefix match made a file's reported path depend on that order.
+{
+	reset({ '/repo/packages/api/src/a.ts': 'x\n' });
+	for (const order of [[[ROOT, 'repo'], ['/repo/packages/api', 'api']], [['/repo/packages/api', 'api'], [ROOT, 'repo']]]) {
+		setFolders(order);
+		globMatches = ['/repo/packages/api/src/a.ts'];
+		const found = await run('glob_files', { pattern: '**/*.ts' });
+		assert.strictEqual(found.result, 'api/src/a.ts', `innermost folder wins (order: ${order.map(o => o[1])})`);
+		// …and the path it reported opens the file it came from.
+		const read = await run('read_file', { path: found.result });
+		assert.strictEqual(read.isError, false, read.result);
+	}
 }
 
 console.log('test-tools: all assertions passed');

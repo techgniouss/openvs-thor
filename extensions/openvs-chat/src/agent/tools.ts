@@ -6,7 +6,7 @@
 import { exec } from 'child_process';
 import * as vscode from 'vscode';
 import { ToolCall, ToolSpec } from '../providers/types';
-import { Guardrails, autoApproves, autoApprovesWrites, checkCommand, checkPath, loadGuardrails, normalizeWorkspacePath } from './guardrails';
+import { Guardrails, WorkspacePath, autoApproves, autoApprovesWrites, checkCommand, checkPath, describeWorkspaceUri, loadGuardrails, normalizeWorkspacePath, resolveWorkspacePath } from './guardrails';
 
 /**
  * Most bytes of a file that are decoded for one read_file call. Well above the page cap
@@ -86,7 +86,7 @@ export const AGENT_TOOLS: ToolSpec[] = [
 	},
 	{
 		name: 'glob_files',
-		description: 'Find files by PATH pattern (not by content) and get back matching workspace-relative paths, most recently modified first. Use this to locate a file whose name you know — "**/chatViewProvider.ts", "src/**/*.test.ts" — instead of walking directories with list_dir.',
+		description: 'Find files by PATH pattern (not by content) and get back matching workspace-relative paths. Use this to locate a file whose name you know — "**/chatViewProvider.ts", "src/**/*.test.ts" — instead of walking directories with list_dir. Build output and dependency folders (node_modules, out, dist, .git, target, vendor, …) are never searched.',
 		parameters: {
 			type: 'object',
 			properties: {
@@ -150,10 +150,13 @@ export const AGENT_TOOLS: ToolSpec[] = [
 	},
 	{
 		name: 'run_command',
-		description: 'Run a shell command in the workspace root and return its output. Requires user approval. Use for builds, tests, git, etc.',
+		description: 'Run a shell command and return its output. Requires user approval. Use for builds, tests, git, etc. Runs in the workspace root unless you pass "cwd".',
 		parameters: {
 			type: 'object',
-			properties: { command: { type: 'string', description: 'The shell command to run.' } },
+			properties: {
+				command: { type: 'string', description: 'The shell command to run.' },
+				cwd: { type: 'string', description: 'Workspace-relative directory to run in, e.g. "packages/api". Defaults to the workspace root. In a multi-root workspace, name the folder here to run inside it.' },
+			},
 			required: ['command'],
 		},
 	},
@@ -301,17 +304,43 @@ export interface ToolResult {
 	readonly isError: boolean;
 }
 
+/**
+ * The folder commands run in and non-path probes look at. Commands are workspace-wide and
+ * have a single working directory, so in a multi-root workspace they use the first folder —
+ * the same one a plain relative path resolves against.
+ */
 function workspaceRoot(): vscode.Uri | undefined {
 	return vscode.workspace.workspaceFolders?.[0]?.uri;
 }
 
+/** A path resolved and cleared by the guardrails, or the reason it was refused. */
+type Located =
+	| { readonly ok: true; readonly target: WorkspacePath }
+	| { readonly ok: false; readonly error: string };
+
 /**
- * Maps a model-supplied workspace path onto a URI. Shares
- * {@link normalizeWorkspacePath} with the guardrail check so the path that is validated
- * is exactly the path that gets touched.
+ * Resolves a model-supplied path onto its workspace folder and runs the guardrail check
+ * against that same folder.
+ *
+ * The single place a path is turned into something the filesystem can touch: resolution and
+ * validation happen here together, so there is no way to validate one path and then open
+ * another. Callers get a {@link WorkspacePath} and never construct a URI themselves.
  */
-function resolve(root: vscode.Uri, relativePath: string): vscode.Uri {
-	return vscode.Uri.joinPath(root, normalizeWorkspacePath(relativePath));
+function locate(rawPath: string, forWrite: boolean, g: Guardrails): Located {
+	const target = resolveWorkspacePath(rawPath);
+	if (!target) {
+		return {
+			ok: false,
+			error: rawPath.trim()
+				? `Path "${rawPath}" could not be resolved to a workspace folder.`
+				: 'An empty path was supplied.',
+		};
+	}
+	const guard = checkPath(target.root, target.relative, forWrite, g);
+	if (!guard.ok) {
+		return { ok: false, error: guard.reason ?? 'Path blocked.' };
+	}
+	return { ok: true, target };
 }
 
 /** Executes a single tool call, applying guardrails and prompting for approval on side effects. */
@@ -329,25 +358,49 @@ export async function executeTool(call: ToolCall, approver: ToolApprover, guardr
 			isError: true,
 		};
 	}
+	// Every path-taking tool resolves through the same guarded step, so none of them can
+	// reach the filesystem with a path the guardrails did not clear.
+	const pathArg = (forWrite: boolean): Located => locate(String(call.args.path ?? (call.name === 'list_dir' ? '.' : '')), forWrite, g);
 	try {
 		switch (call.name) {
-			case 'read_file':
-				return await readFile(root, String(call.args.path ?? ''), g,
+			case 'read_file': {
+				const found = pathArg(false);
+				return found.ok ? await readFile(found.target,
 					typeof call.args.offset === 'number' ? call.args.offset : undefined,
-					typeof call.args.limit === 'number' ? call.args.limit : undefined);
-			case 'list_dir':
-				return await listDir(root, String(call.args.path ?? '.'), g);
+					typeof call.args.limit === 'number' ? call.args.limit : undefined)
+					: { result: found.error, isError: true };
+			}
+			case 'list_dir': {
+				const found = pathArg(false);
+				return found.ok ? await listDir(found.target) : { result: found.error, isError: true };
+			}
 			case 'search_files':
-				return await searchFiles(root, String(call.args.query ?? ''), !!call.args.isRegex, String(call.args.glob ?? ''), g);
+				return await searchFiles(String(call.args.query ?? ''), !!call.args.isRegex, String(call.args.glob ?? ''));
 			case 'glob_files':
-				return await globFiles(root, String(call.args.pattern ?? ''), g,
+				return await globFiles(String(call.args.pattern ?? ''),
 					typeof call.args.limit === 'number' ? call.args.limit : undefined);
-			case 'write_file':
-				return await writeFile(root, String(call.args.path ?? ''), String(call.args.content ?? ''), approver, g);
-			case 'edit_file':
-				return await editFile(root, String(call.args.path ?? ''), parseEdits(call.args), approver, g);
-			case 'run_command':
-				return await runCommand(root, String(call.args.command ?? ''), approver, g);
+			case 'write_file': {
+				const found = pathArg(true);
+				return found.ok ? await writeFile(found.target, String(call.args.content ?? ''), approver, g)
+					: { result: found.error, isError: true };
+			}
+			case 'edit_file': {
+				const found = pathArg(true);
+				return found.ok ? await editFile(found.target, parseEdits(call.args), approver, g)
+					: { result: found.error, isError: true };
+			}
+			case 'run_command': {
+				// An explicit cwd goes through the same guarded resolution as any other path,
+				// so a command cannot be aimed outside the workspace.
+				const raw = String(call.args.cwd ?? '').trim();
+				if (!raw) {
+					return await runCommand(root, '', String(call.args.command ?? ''), approver, g);
+				}
+				const found = locate(raw, false, g);
+				return found.ok
+					? await runCommand(found.target.uri, found.target.display, String(call.args.command ?? ''), approver, g)
+					: { result: found.error, isError: true };
+			}
 			default:
 				return { result: `Unknown tool: ${call.name}`, isError: true };
 		}
@@ -356,13 +409,22 @@ export async function executeTool(call: ToolCall, approver: ToolApprover, guardr
 	}
 }
 
-async function readFile(root: vscode.Uri, path: string, g: Guardrails, offset?: number, limit?: number): Promise<ToolResult> {
-	const guard = checkPath(root, path, false, g);
-	if (!guard.ok) {
-		return { result: guard.reason ?? 'Path blocked.', isError: true };
+async function readFile(target: WorkspacePath, offset?: number, limit?: number): Promise<ToolResult> {
+	const path = target.display;
+	let bytes: Uint8Array;
+	try {
+		bytes = await vscode.workspace.fs.readFile(target.uri);
+	} catch (err) {
+		// Reading a directory otherwise surfaces as a raw `EISDIR`/`FileIsADirectory`, which
+		// names no tool the model could use instead — so it retries the same call. Naming
+		// list_dir turns a dead end into the next step.
+		const code = (err as { code?: string } | undefined)?.code ?? '';
+		const message = err instanceof Error ? err.message : String(err);
+		if (code === 'FileIsADirectory' || /EISDIR|is a directory/i.test(`${code} ${message}`)) {
+			return { result: `${path} is a directory, not a file. Use list_dir to see what is in it.`, isError: true };
+		}
+		throw err;
 	}
-	const uri = resolve(root, path);
-	const bytes = await vscode.workspace.fs.readFile(uri);
 	// `stream: true` keeps a multi-byte sequence straddling the cut from decoding as U+FFFD.
 	const decodeLimit = Math.max(MAX_DECODE_BYTES, MAX_READ_CHARS);
 	const partial = bytes.byteLength > decodeLimit;
@@ -423,19 +485,19 @@ const GLOB_MAX_LIMIT = 1_000;
  * time — several steps, and a frequent way for a run to stall before it has even located
  * the code it was asked to change.
  */
-async function globFiles(root: vscode.Uri, pattern: string, g: Guardrails, limit?: number): Promise<ToolResult> {
+async function globFiles(pattern: string, limit?: number): Promise<ToolResult> {
 	if (!pattern.trim()) {
 		return { result: 'glob_files requires a non-empty "pattern".', isError: true };
 	}
 	const cap = Math.min(limit && limit > 0 ? limit : GLOB_DEFAULT_LIMIT, GLOB_MAX_LIMIT);
 	// One over the cap, so a truncated listing can be reported as truncated.
-	const uris = await vscode.workspace.findFiles(pattern, SEARCH_EXCLUDE, cap + 1);
+	const uris = await vscode.workspace.findFiles(toGlobPattern(pattern), SEARCH_EXCLUDE, cap + 1);
+	// Rendered in the form read_file accepts — folder-prefixed when several folders are
+	// open. Anything outside every folder is dropped; the model could not open it anyway.
+	// Protected paths are deliberately not filtered — they are a write blocklist.
 	const paths = uris
-		.map(u => vscode.workspace.asRelativePath(u))
-		// The same confinement search applies: a match outside the workspace root (reachable
-		// through a symlinked or multi-root folder) is not this workspace's file to offer.
-		// Protected paths are deliberately not filtered — they are a write blocklist.
-		.filter(rel => checkPath(root, rel, false, g).ok);
+		.map(u => describeWorkspaceUri(u)?.display)
+		.filter((rel): rel is string => rel !== undefined);
 	if (!paths.length) {
 		return {
 			result: `No files match "${pattern}". Patterns are matched against workspace-relative paths — "**/" is needed to match at any depth (e.g. "**/${pattern.replace(/^\*\*\//, '')}").`,
@@ -447,16 +509,16 @@ async function globFiles(root: vscode.Uri, pattern: string, g: Guardrails, limit
 	return { result: shown.join('\n') + more, isError: false };
 }
 
-async function listDir(root: vscode.Uri, path: string, g: Guardrails): Promise<ToolResult> {
-	const guard = checkPath(root, path, false, g);
-	if (!guard.ok) {
-		return { result: guard.reason ?? 'Path blocked.', isError: true };
-	}
-	const uri = resolve(root, path);
-	const entries = await vscode.workspace.fs.readDirectory(uri);
+async function listDir(target: WorkspacePath): Promise<ToolResult> {
+	const entries = await vscode.workspace.fs.readDirectory(target.uri);
 	const lines = entries.map(([name, type]) =>
 		`${type === vscode.FileType.Directory ? 'dir ' : 'file'}  ${name}`);
-	return { result: lines.length ? lines.join('\n') : '(empty directory)', isError: false };
+	// Headed with the directory in the form the other tools accept. The entries are bare
+	// names, so without this the model has nothing to join them onto — and in a multi-root
+	// workspace it would compose them against the wrong folder, which is exactly the
+	// mismatch that made every search result unopenable before.
+	const header = `Contents of ${target.display}/ (paths below are relative to it):\n`;
+	return { result: entries.length ? header + lines.join('\n') : `${target.display}/ is an empty directory.`, isError: false };
 }
 
 const SEARCH_MAX_FILES = 2_000;
@@ -478,6 +540,32 @@ function escapeRegExp(text: string): string {
 }
 
 /**
+ * Turns a model-supplied glob into one the editor can match, honouring a `folderName/…`
+ * prefix the way every other path argument does.
+ *
+ * A plain string pattern is matched against *each* workspace folder's own relative paths,
+ * so with folders `repo` and `api` open, `api/**` looks for an `api` directory inside both
+ * of them and matches the folder called `api` never. Every other tool accepts that prefix —
+ * the environment snapshot tells the model to use it — so a glob that silently returned
+ * nothing was the one place the convention broke, and an empty result is exactly what sends
+ * a model round the same search again.
+ */
+function toGlobPattern(pattern: string): vscode.GlobPattern {
+	const folders = vscode.workspace.workspaceFolders ?? [];
+	if (folders.length > 1) {
+		const clean = normalizeWorkspacePath(pattern);
+		const slash = clean.indexOf('/');
+		if (slash > 0) {
+			const folder = folders.find(f => f.name === clean.slice(0, slash));
+			if (folder) {
+				return new vscode.RelativePattern(folder, clean.slice(slash + 1));
+			}
+		}
+	}
+	return pattern;
+}
+
+/**
  * Searches workspace files for a pattern, returning `path:line: text` matches.
  *
  * Prefers `findTextInFiles`, which runs the editor's own ripgrep: it honours
@@ -485,7 +573,7 @@ function escapeRegExp(text: string): string {
  * and returns in a fraction of the time. Falls back to {@link searchFilesByScan} when
  * the proposed API isn't enabled for this build.
  */
-async function searchFiles(root: vscode.Uri, query: string, isRegex: boolean, glob: string, g: Guardrails): Promise<ToolResult> {
+async function searchFiles(query: string, isRegex: boolean, glob: string): Promise<ToolResult> {
 	if (!query) {
 		return { result: 'search_files requires a non-empty "query".', isError: true };
 	}
@@ -498,17 +586,15 @@ async function searchFiles(root: vscode.Uri, query: string, isRegex: boolean, gl
 			return { result: `Invalid regular expression: ${err instanceof Error ? err.message : String(err)}`, isError: true };
 		}
 	}
-	const viaRipgrep = await searchFilesByRipgrep(root, query, isRegex, glob, g);
-	return viaRipgrep ?? searchFilesByScan(root, query, isRegex, glob, g);
+	const viaRipgrep = await searchFilesByRipgrep(query, isRegex, glob);
+	return viaRipgrep ?? searchFilesByScan(query, isRegex, glob);
 }
 
 /**
  * ripgrep-backed search. Returns undefined when `findTextInFiles` is unavailable (the
  * API proposal is not enabled), so the caller can fall back rather than fail.
  */
-async function searchFilesByRipgrep(
-	root: vscode.Uri, query: string, isRegex: boolean, glob: string, g: Guardrails,
-): Promise<ToolResult | undefined> {
+async function searchFilesByRipgrep(query: string, isRegex: boolean, glob: string): Promise<ToolResult | undefined> {
 	// Feature-detected rather than assumed: the proposal is declared in package.json, but
 	// a build that strips proposed APIs must degrade to the scan instead of throwing.
 	if (typeof vscode.workspace.findTextInFiles !== 'function') {
@@ -518,7 +604,7 @@ async function searchFilesByRipgrep(
 	try {
 		await vscode.workspace.findTextInFiles(
 			{ pattern: query, isRegExp: isRegex, isCaseSensitive: false },
-			{ include: glob || undefined, exclude: SEARCH_EXCLUDE, maxResults: SEARCH_MAX_MATCHES },
+			{ include: glob ? toGlobPattern(glob) : undefined, exclude: SEARCH_EXCLUDE, maxResults: SEARCH_MAX_MATCHES },
 			result => {
 				// A TextSearchResult is either a match or a surrounding context line, and
 				// only a match carries `preview`. Context lines are not results and must
@@ -527,14 +613,16 @@ async function searchFilesByRipgrep(
 				if (matches.length >= SEARCH_MAX_MATCHES || match.preview === undefined) {
 					return;
 				}
-				const rel = vscode.workspace.asRelativePath(match.uri);
-				// A protected path must not leak its contents through search either.
-				if (!checkPath(root, rel, false, g).ok) {
+				// Reported in the form read_file accepts, folder-prefixed when several are
+				// open. A hit outside every workspace folder is dropped rather than offered:
+				// the model could not open it, so naming it only costs a wasted step.
+				const found = describeWorkspaceUri(match.uri);
+				if (!found) {
 					return;
 				}
 				const first = Array.isArray(match.ranges) ? match.ranges[0] : match.ranges;
 				const line = (first?.start.line ?? 0) + 1;
-				matches.push(`${rel}:${line}: ${match.preview.text.trim().slice(0, 200)}`);
+				matches.push(`${found.display}:${line}: ${match.preview.text.trim().slice(0, 200)}`);
 			},
 		);
 	} catch {
@@ -553,14 +641,14 @@ async function searchFilesByRipgrep(
  * {@link SEARCH_MAX_FILES}, so it says when the sweep was incomplete rather than letting
  * a partial result read as "not used anywhere".
  */
-async function searchFilesByScan(root: vscode.Uri, query: string, isRegex: boolean, glob: string, g: Guardrails): Promise<ToolResult> {
+async function searchFilesByScan(query: string, isRegex: boolean, glob: string): Promise<ToolResult> {
 	let re: RegExp;
 	try {
 		re = new RegExp(isRegex ? query : escapeRegExp(query), 'i');
 	} catch (err) {
 		return { result: `Invalid regular expression: ${err instanceof Error ? err.message : String(err)}`, isError: true };
 	}
-	const uris = await vscode.workspace.findFiles(glob || '**/*', SEARCH_EXCLUDE, SEARCH_MAX_FILES);
+	const uris = await vscode.workspace.findFiles(glob ? toGlobPattern(glob) : '**/*', SEARCH_EXCLUDE, SEARCH_MAX_FILES);
 	const matches: string[] = [];
 	const decoder = new TextDecoder();
 	// Read in parallel batches — thousands of sequential fs round-trips are painfully
@@ -568,12 +656,12 @@ async function searchFilesByScan(root: vscode.Uri, query: string, isRegex: boole
 	const BATCH = 64;
 	for (let start = 0; start < uris.length && matches.length < SEARCH_MAX_MATCHES; start += BATCH) {
 		const batch = uris.slice(start, start + BATCH).map(async uri => {
-			const rel = vscode.workspace.asRelativePath(uri);
-			if (!checkPath(root, rel, false, g).ok) {
+			const found = describeWorkspaceUri(uri);
+			if (!found) {
 				return undefined;
 			}
 			try {
-				return { rel, bytes: await vscode.workspace.fs.readFile(uri) };
+				return { rel: found.display, bytes: await vscode.workspace.fs.readFile(uri) };
 			} catch {
 				return undefined;
 			}
@@ -664,13 +752,9 @@ const CLOBBER_RATIO = 0.4;
 /** Files smaller than this are too short for the ratio test to mean anything. */
 const CLOBBER_MIN_CHARS = 200;
 
-async function writeFile(root: vscode.Uri, path: string, content: string, approver: ToolApprover, g: Guardrails): Promise<ToolResult> {
-	const guard = checkPath(root, path, true, g);
-	if (!guard.ok) {
-		return { result: guard.reason ?? 'Path blocked.', isError: true };
-	}
-	const uri = resolve(root, path);
-	const existing = await readIfExists(uri);
+async function writeFile(target: WorkspacePath, content: string, approver: ToolApprover, g: Guardrails): Promise<ToolResult> {
+	const path = target.display;
+	const existing = await readIfExists(target.uri);
 	// A drastic shrink is never auto-approved, whatever the policy says: it is the
 	// signature of a truncated model response, and the write is not reversible.
 	const suspicious = existing !== undefined
@@ -684,7 +768,9 @@ async function writeFile(root: vscode.Uri, path: string, content: string, approv
 			: '';
 		const { approved, feedback } = await approver.confirm({
 			kind: 'write',
-			signature: `write_file:${normalizeWorkspacePath(path)}`,
+			// Keyed by the resolved path, so "always allow" cannot be widened by spelling the
+			// same file differently on the next call.
+			signature: `write_file:${path}`,
 			title: existing === undefined ? `Create ${path}?` : `Overwrite ${path}?`,
 			detail: existing === undefined
 				? `New file, ${content.split('\n').length} line(s).${shrink}`
@@ -696,7 +782,7 @@ async function writeFile(root: vscode.Uri, path: string, content: string, approv
 			return { result: denialMessage('write', feedback), isError: true };
 		}
 	}
-	await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(content));
+	await vscode.workspace.fs.writeFile(target.uri, new TextEncoder().encode(content));
 	return { result: `Wrote ${content.length} characters to ${path}.`, isError: false };
 }
 
@@ -736,6 +822,22 @@ function normalizeLine(line: string): string {
 }
 
 /**
+ * One loose match, as a half-open character range into the file plus the exact text found
+ * there.
+ *
+ * Offsets rather than just the text because the replacement has to be spliced by index.
+ * `String.prototype.replace` with a string pattern is wrong twice over here: it treats `$&`,
+ * `$'` and `$1` in the *replacement* as substitution patterns (so any snippet containing a
+ * `$` is silently corrupted), and with two identical matches the second call re-finds the
+ * first — which by then is the text just written.
+ */
+interface LooseMatch {
+	readonly start: number;
+	readonly end: number;
+	readonly text: string;
+}
+
+/**
  * Finds `oldText` in `current` comparing line by line with indentation, trailing
  * whitespace and line endings ignored, and returns the exact text present in the file for
  * each match.
@@ -750,7 +852,7 @@ function normalizeLine(line: string): string {
  * Returns an empty list when `oldText` is not whole lines — a fragment inside a line either
  * matched exactly or is genuinely absent, and guessing there would be dangerous.
  */
-function findLooseMatches(current: string, oldText: string): string[] {
+function findLooseMatches(current: string, oldText: string): LooseMatch[] {
 	const fileLines = current.split('\n');
 	const oldLines = oldText.split('\n');
 	// A trailing newline leaves an empty final element that must not be matched against a
@@ -763,55 +865,112 @@ function findLooseMatches(current: string, oldText: string): string[] {
 		return [];
 	}
 	const wanted = oldLines.map(normalizeLine);
-	const matches: string[] = [];
+	// Offset of each line within `current`, so a match can be spliced by index rather than
+	// by String.replace — see {@link LooseMatch}.
+	const lineStarts: number[] = [];
+	for (let i = 0, at = 0; i < fileLines.length; i++) {
+		lineStarts.push(at);
+		at += fileLines[i].length + 1;
+	}
+	const matches: LooseMatch[] = [];
 	const last = fileLines.length - wanted.length - (trailingNewline ? 1 : 0);
 	for (let i = 0; i <= last; i++) {
 		let hit = true;
 		for (let k = 0; k < wanted.length && hit; k++) {
 			hit = normalizeLine(fileLines[i + k]) === wanted[k];
 		}
-		if (hit) {
-			const span = fileLines.slice(i, i + wanted.length).join('\n');
-			// Splitting on '\n' leaves each CRLF line's '\r' on the line itself, so a span
-			// that stops short of a newline still ends with the first half of one. Keeping it
-			// would have the replacement swallow the '\r' and leave a lone '\n' behind — one
-			// mixed line ending in the middle of an otherwise CRLF file.
-			matches.push(trailingNewline ? `${span}\n` : span.replace(/\r$/, ''));
+		if (!hit) {
+			continue;
 		}
+		const span = fileLines.slice(i, i + wanted.length).join('\n');
+		// Splitting on '\n' leaves each CRLF line's '\r' on the line itself, so a span
+		// that stops short of a newline still ends with the first half of one. Keeping it
+		// would have the replacement swallow the '\r' and leave a lone '\n' behind — one
+		// mixed line ending in the middle of an otherwise CRLF file.
+		const text = trailingNewline ? `${span}\n` : span.replace(/\r$/, '');
+		const start = lineStarts[i];
+		matches.push({ start, end: start + text.length, text });
+		// Matches must not overlap, or splicing the second would land inside the first.
+		// A repeating block ("})\n})") genuinely can match at consecutive offsets, so the
+		// scan resumes after the match rather than one line into it.
+		i += wanted.length - 1;
 	}
 	return matches;
 }
 
+/** A uniform indentation adjustment: strip `remove` from the front of each line, then prepend `add`. */
+interface IndentShift {
+	readonly add: string;
+	readonly remove: string;
+}
+
 /**
- * Re-indents `text` when a loose match was found at a different indentation than the model
- * supplied, so replacement lines land at the depth the file actually uses. Lines that don't
- * start with the expected indentation are left untouched rather than mangled.
+ * The single indentation shift that maps every line of `oldText` onto the corresponding
+ * line of the matched `span`, or undefined when no single shift does.
+ *
+ * The shift has to be uniform across the whole snippet — the whole block moved in or out by
+ * the same amount — because that is the only case where the model's *relative* indentation
+ * agrees with the file's and the replacement can be placed with confidence. When the deltas
+ * disagree (the model nested its lines differently from the file, or indents with spaces
+ * where the file uses tabs), returning undefined means the replacement goes in exactly as
+ * the model wrote it. That can look untidy; guessing a shift produces code at the wrong
+ * nesting depth, which is worse and much harder to spot in a diff.
  */
-function reindent(text: string, from: string, to: string): string {
-	if (from === to) {
+function indentShift(span: string, oldText: string): IndentShift | undefined {
+	const spanLines = span.split('\n');
+	const oldLines = oldText.split('\n');
+	let shift: IndentShift | undefined;
+	for (let i = 0; i < oldLines.length && i < spanLines.length; i++) {
+		if (!oldLines[i].trim()) {
+			continue;
+		}
+		const from = indentOf(oldLines[i]);
+		const to = indentOf(spanLines[i].replace(/\r$/, ''));
+		let here: IndentShift;
+		if (to.endsWith(from)) {
+			here = { add: to.slice(0, to.length - from.length), remove: '' };
+		} else if (from.endsWith(to)) {
+			here = { add: '', remove: from.slice(0, from.length - to.length) };
+		} else {
+			return undefined;
+		}
+		if (!shift) {
+			shift = here;
+		} else if (shift.add !== here.add || shift.remove !== here.remove) {
+			return undefined;
+		}
+	}
+	return shift;
+}
+
+/** Applies an {@link IndentShift} to every non-blank line of `text`. */
+function reindent(text: string, shift: IndentShift | undefined): string {
+	if (!shift || (!shift.add && !shift.remove)) {
 		return text;
 	}
 	return text.split('\n').map(line => {
 		if (!line.trim()) {
 			return line;
 		}
-		if (!from) {
-			return to + line;
-		}
-		return line.startsWith(from) ? to + line.slice(from.length) : line;
+		const body = shift.remove && line.startsWith(shift.remove) ? line.slice(shift.remove.length) : line;
+		return shift.add + body;
 	}).join('\n');
 }
 
 /**
- * Rewrites `text`'s line endings to match `sample`.
+ * Rewrites `text`'s line endings to match those of `file`.
  *
  * Only used on the loose-match path, where the model's copy of the snippet differed from
  * the file. Splicing its LF replacement into a CRLF file would leave mixed endings through
  * the middle of the edited region — a diff nobody asked for, and on some toolchains a
  * broken file.
+ *
+ * The sample is the whole file, not the matched span: a span that is a single line carries
+ * no line ending at all, so judging by it would strip CRLF out of every multi-line
+ * replacement made against a one-line anchor.
  */
-function matchLineEndings(text: string, sample: string): string {
-	return sample.includes('\r\n') ? text.replace(/\r?\n/g, '\r\n') : text.replace(/\r\n/g, '\n');
+function matchLineEndings(text: string, file: string): string {
+	return file.includes('\r\n') ? text.replace(/\r?\n/g, '\r\n') : text.replace(/\r\n/g, '\n');
 }
 
 /** How many candidate anchor lines are offered when an edit finds nothing. */
@@ -853,10 +1012,15 @@ function editHints(current: string, oldText: string, path: string): string {
 	return `\nNothing in ${path} resembles "${anchor.slice(0, 40)}" either, so this text may be in a different file — find it with search_files rather than reading this one again.`;
 }
 
+/** The result of applying one replacement: the new text, or why it could not be applied. */
+type EditOutcome =
+	| { readonly ok: true; readonly updated: string; readonly occurrences: number }
+	| { readonly ok: false; readonly error: string };
+
 /** Applies one replacement to `current`, or explains why it could not be applied. */
-function applyEdit(current: string, edit: FileEdit, path: string, label: string): { updated: string; occurrences: number } | { error: string } {
+function applyEdit(current: string, edit: FileEdit, path: string, label: string): EditOutcome {
 	if (!edit.oldText) {
-		return { error: `${label}oldText must not be empty. To create a new file or replace one entirely, use write_file.` };
+		return { ok: false, error: `${label}oldText must not be empty. To create a new file or replace one entirely, use write_file.` };
 	}
 	// The model copied its anchor straight out of a numbered read result. Strip the gutter
 	// and carry on rather than making it read the file again to learn that.
@@ -870,46 +1034,51 @@ function applyEdit(current: string, edit: FileEdit, path: string, label: string)
 		}
 	}
 	if (oldText === newText) {
-		return { error: `${label}oldText and newText are identical, so this edit would change nothing.` };
+		return { ok: false, error: `${label}oldText and newText are identical, so this edit would change nothing.` };
 	}
 
 	const occurrences = current.split(oldText).length - 1;
 	if (occurrences === 0) {
 		const loose = findLooseMatches(current, oldText);
 		if (!loose.length) {
-			return { error: `${label}oldText was not found in ${path}.${editHints(current, oldText, path)}` };
+			return { ok: false, error: `${label}oldText was not found in ${path}.${editHints(current, oldText, path)}` };
 		}
 		if (loose.length > 1 && !edit.replaceAll) {
-			return { error: `${label}oldText matches ${loose.length} places in ${path} once indentation is ignored. Include more surrounding context to make it unique, or set replaceAll:true.` };
+			return { ok: false, error: `${label}oldText matches ${loose.length} places in ${path} once indentation is ignored. Include more surrounding context to make it unique, or set replaceAll:true.` };
 		}
 		// Matched loosely: replace the text the FILE has, and shift the replacement to the
-		// indentation the file actually uses.
-		const anchorIndex = oldText.split('\n').findIndex(l => l.trim());
-		const from = indentOf(oldText.split('\n')[anchorIndex]);
+		// indentation the file actually uses. Spliced back to front so each match's offsets
+		// are still valid when its turn comes.
 		let updated = current;
-		for (const needle of loose) {
-			const to = indentOf(needle.split('\n')[anchorIndex] ?? '');
-			updated = updated.replace(needle, matchLineEndings(reindent(newText, from, to), needle));
+		for (let i = loose.length - 1; i >= 0; i--) {
+			const match = loose[i];
+			const replacement = matchLineEndings(reindent(newText, indentShift(match.text, oldText)), current);
+			updated = updated.slice(0, match.start) + replacement + updated.slice(match.end);
 		}
-		return { updated, occurrences: loose.length };
+		return { ok: true, updated, occurrences: loose.length };
 	}
 	if (occurrences > 1 && !edit.replaceAll) {
-		return { error: `${label}oldText appears ${occurrences} times in ${path}. Include more surrounding context to make it unique, or set replaceAll:true.` };
+		return { ok: false, error: `${label}oldText appears ${occurrences} times in ${path}. Include more surrounding context to make it unique, or set replaceAll:true.` };
 	}
-	const updated = edit.replaceAll ? current.split(oldText).join(newText) : current.replace(oldText, newText);
-	return { updated, occurrences };
+	// The snippet matched byte for byte, so it goes in as written — with one correction: a
+	// model that writes LF newlines into a CRLF file is making a mistake, not a request, and
+	// splicing them in unchanged leaves one stray line ending mid-file.
+	const replacement = matchLineEndings(newText, current);
+	// Spliced by index rather than via String.replace, which would read `$&`/`$1` in
+	// newText as substitution patterns and quietly corrupt any snippet containing a `$`.
+	const at = current.indexOf(oldText);
+	const updated = edit.replaceAll
+		? current.split(oldText).join(replacement)
+		: current.slice(0, at) + replacement + current.slice(at + oldText.length);
+	return { ok: true, updated, occurrences };
 }
 
-async function editFile(root: vscode.Uri, path: string, edits: FileEdit[], approver: ToolApprover, g: Guardrails): Promise<ToolResult> {
-	const guard = checkPath(root, path, true, g);
-	if (!guard.ok) {
-		return { result: guard.reason ?? 'Path blocked.', isError: true };
-	}
+async function editFile(target: WorkspacePath, edits: FileEdit[], approver: ToolApprover, g: Guardrails): Promise<ToolResult> {
+	const path = target.display;
 	if (!edits.length) {
 		return { result: 'edit_file requires either oldText/newText or a non-empty "edits" array.', isError: true };
 	}
-	const uri = resolve(root, path);
-	const current = await readIfExists(uri);
+	const current = await readIfExists(target.uri);
 	if (current === undefined) {
 		return { result: `${path} does not exist, so there is nothing to edit. Use write_file to create it.`, isError: true };
 	}
@@ -921,7 +1090,7 @@ async function editFile(root: vscode.Uri, path: string, edits: FileEdit[], appro
 	for (let i = 0; i < edits.length; i++) {
 		const label = edits.length > 1 ? `edits[${i}]: ` : '';
 		const outcome = applyEdit(updated, edits[i], path, label);
-		if ('error' in outcome) {
+		if (!outcome.ok) {
 			const applied = i > 0 ? ` No edits were applied — the ${i} earlier one(s) in this call were discarded too, so the file is unchanged.` : '';
 			return { result: outcome.error + applied, isError: true };
 		}
@@ -932,7 +1101,7 @@ async function editFile(root: vscode.Uri, path: string, edits: FileEdit[], appro
 	if (!autoApprovesWrites(g)) {
 		const { approved, feedback } = await approver.confirm({
 			kind: 'write',
-			signature: `edit_file:${normalizeWorkspacePath(path)}`,
+			signature: `edit_file:${path}`,
 			title: `Edit ${path}?`,
 			detail: `Replaces ${replacements} occurrence(s)${edits.length > 1 ? ` across ${edits.length} edits` : ''}; ${current.split('\n').length} line(s) → ${updated.split('\n').length} line(s).`,
 			preview: renderDiff(current, updated),
@@ -942,7 +1111,7 @@ async function editFile(root: vscode.Uri, path: string, edits: FileEdit[], appro
 			return { result: denialMessage('edit', feedback), isError: true };
 		}
 	}
-	await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(updated));
+	await vscode.workspace.fs.writeFile(target.uri, new TextEncoder().encode(updated));
 	return { result: `Replaced ${replacements} occurrence(s) in ${path}.`, isError: false };
 }
 
@@ -972,6 +1141,13 @@ const VERIFY_MARKERS: Array<[string, string]> = [
 	['build.gradle.kts', 'gradle build'],
 ];
 
+/** A command the workspace offers for checking a change, and where it has to run. */
+export interface VerifyCommand {
+	readonly command: string;
+	/** `run_command`'s `cwd` argument; absent means the workspace root. */
+	readonly cwd?: string;
+}
+
 /**
  * Commands this workspace actually offers for checking a change, best first.
  *
@@ -979,32 +1155,39 @@ const VERIFY_MARKERS: Array<[string, string]> = [
  * there is nothing to run, so pressing the model to "verify" would be nagging it about
  * an impossibility. Every probe fails soft — an unreadable or malformed manifest just
  * contributes nothing.
+ *
+ * Every workspace folder is probed, not just the first. Commands run in the first folder by
+ * default, so a build belonging to another one is returned with the `cwd` the model must
+ * pass — otherwise the gate would demand `npm run build` for a change in the second folder
+ * and the model would dutifully run the *first* folder's build and call it verified.
  */
-export async function detectVerificationCommands(): Promise<string[]> {
-	const root = workspaceRoot();
-	if (!root) {
-		return [];
-	}
-	const found: string[] = [];
-	try {
-		const raw = new TextDecoder().decode(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(root, 'package.json')));
-		const scripts = JSON.parse(raw)?.scripts;
-		if (scripts && typeof scripts === 'object') {
-			for (const name of VERIFY_SCRIPTS) {
-				if (typeof scripts[name] === 'string') {
-					found.push(`npm run ${name}`);
+export async function detectVerificationCommands(): Promise<VerifyCommand[]> {
+	const folders = vscode.workspace.workspaceFolders ?? [];
+	const found: VerifyCommand[] = [];
+	for (const folder of folders) {
+		// The first folder is `run_command`'s default, so it needs no cwd; the others are
+		// named the same way every other tool names them.
+		const cwd = folder === folders[0] ? undefined : folder.name;
+		try {
+			const raw = new TextDecoder().decode(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(folder.uri, 'package.json')));
+			const scripts = JSON.parse(raw)?.scripts;
+			if (scripts && typeof scripts === 'object') {
+				for (const name of VERIFY_SCRIPTS) {
+					if (typeof scripts[name] === 'string') {
+						found.push({ command: `npm run ${name}`, cwd });
+					}
 				}
 			}
-		}
-	} catch {
-		// No package.json, or it isn't valid JSON — neither is an error here.
-	}
-	for (const [marker, command] of VERIFY_MARKERS) {
-		try {
-			await vscode.workspace.fs.stat(vscode.Uri.joinPath(root, marker));
-			found.push(command);
 		} catch {
-			// Marker absent.
+			// No package.json, or it isn't valid JSON — neither is an error here.
+		}
+		for (const [marker, command] of VERIFY_MARKERS) {
+			try {
+				await vscode.workspace.fs.stat(vscode.Uri.joinPath(folder.uri, marker));
+				found.push({ command, cwd });
+			} catch {
+				// Marker absent.
+			}
 		}
 	}
 	return found;
@@ -1045,7 +1228,7 @@ export function commandSignature(command: string): string {
  */
 const CMD_MAX_BUFFER = 16 * 1024 * 1024;
 
-async function runCommand(root: vscode.Uri, command: string, approver: ToolApprover, g: Guardrails): Promise<ToolResult> {
+async function runCommand(dir: vscode.Uri, dirLabel: string, command: string, approver: ToolApprover, g: Guardrails): Promise<ToolResult> {
 	if (!command.trim()) {
 		return { result: 'Empty command.', isError: true };
 	}
@@ -1065,9 +1248,11 @@ async function runCommand(root: vscode.Uri, command: string, approver: ToolAppro
 	if (!autoApproves(g)) {
 		const { approved, feedback } = await approver.confirm({
 			kind: 'command',
-			signature: commandSignature(command),
+			// The directory is part of the identity: approving `npm run build` in one folder
+			// must not silently pre-approve it in another.
+			signature: `${commandSignature(command)}@${dirLabel}`,
 			title: 'Run a command?',
-			detail: `In ${root.fsPath} (timeout ${Math.round(g.commandTimeoutMs / 1000)}s).`,
+			detail: `In ${dir.fsPath} (timeout ${Math.round(g.commandTimeoutMs / 1000)}s).`,
 			preview: command,
 			previewLanguage: 'shell',
 		});
@@ -1076,7 +1261,7 @@ async function runCommand(root: vscode.Uri, command: string, approver: ToolAppro
 		}
 	}
 	return new Promise<ToolResult>(resolvePromise => {
-		exec(command, { cwd: root.fsPath, timeout: g.commandTimeoutMs, maxBuffer: CMD_MAX_BUFFER, shell: g.shell || undefined },
+		exec(command, { cwd: dir.fsPath, timeout: g.commandTimeoutMs, maxBuffer: CMD_MAX_BUFFER, shell: g.shell || undefined },
 			(error, stdout, stderr) => {
 				const out = capCommandOutput([stdout, stderr].filter(Boolean).join('\n'));
 				const fault = error as (Error & { killed?: boolean; code?: number | string; signal?: string }) | null;
