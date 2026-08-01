@@ -8,6 +8,7 @@ import {
 	AgentRequest, AgentStep, ChatMessage, ChatRequest, FinishReason, STREAM_FETCH_OPTS,
 	StreamChatResult, ToolCall, apiFetch, describeHttpError, readSSE, retryNotice,
 } from './types';
+import { parseToolArgs } from './toolCalls';
 
 /**
  * Transport for ChatGPT subscription sign-ins (no API key): talks to the ChatGPT
@@ -159,13 +160,7 @@ async function streamResponses(
 			case 'response.output_item.done': {
 				const item = event.item;
 				if (item?.type === 'function_call' && typeof item.name === 'string') {
-					let args: Record<string, unknown> = {};
-					try {
-						args = item.arguments ? JSON.parse(item.arguments) : {};
-					} catch {
-						args = { _raw: item.arguments };
-					}
-					toolCalls.push({ id: item.call_id ?? item.id ?? '', name: item.name, args });
+					toolCalls.push({ id: item.call_id ?? item.id ?? '', name: item.name, args: parseToolArgs(item.arguments) });
 				}
 				break;
 			}

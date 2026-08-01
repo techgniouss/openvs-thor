@@ -28,6 +28,12 @@ declare function acquireVsCodeApi(): {
 interface Window {
 	/** Set by the host: true when this webview is the detached Settings editor tab. */
 	__OPENVS_SETTINGS_ONLY__?: boolean;
+	/**
+	 * Set by the host: the `vscode-webview://` URI of `media/hero.png`, the brand mark
+	 * drawn on the empty chat. The webview cannot build this itself — relative paths
+	 * resolve against the document, not the extension's media folder.
+	 */
+	__OPENVS_HERO_URI__?: string;
 }
 
 /** One selectable answer offered by an `ask_user` question. */

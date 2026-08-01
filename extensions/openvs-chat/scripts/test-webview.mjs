@@ -48,6 +48,21 @@ function captures(text, re) {
 	assert.ok(CHAT_APP_HTML.includes('id="messages"'), 'the transcript container is served');
 }
 
+// 1c. Bootstrap globals are the other half of the host↔webview contract: the host writes
+// them into an inline script, the webview reads them at load. Neither side fails loudly
+// when the other drops out — a missing `__OPENVS_HERO_URI__` just silently returns the
+// empty chat to the drawn orb, and a missing media file is a broken image with no error.
+{
+	const globals = captures(main, /window\)?\.(__OPENVS_[A-Z_]+__)/g);
+	assert.ok(globals.length > 0, 'expected the webview to read at least one bootstrap global');
+	const unset = globals.filter(g => !host.includes(`window.${g} =`));
+	assert.deepStrictEqual(unset, [], 'the webview reads these globals but the host never sets them');
+
+	const assets = captures(host, /mediaUri\('([^']+)'\)/g);
+	const missing = assets.filter(f => !fs.existsSync(url(`../media/${f}`)));
+	assert.deepStrictEqual(missing, [], 'the host serves these media files but they do not exist');
+}
+
 /** Message `type` values the host sends to the webview, from its `post({ type: … })` calls. */
 const hostSends = new Set([
 	...captures(host, /post\(\{\s*type:\s*'([a-zA-Z]+)'/g),

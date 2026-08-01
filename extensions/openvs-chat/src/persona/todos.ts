@@ -54,34 +54,70 @@ export type TodoUpdate =
 	| { readonly items: TodoItem[]; readonly error?: undefined }
 	| { readonly items?: undefined; readonly error: string };
 
+/** Names models use for the list itself, and for an item's text. */
+const LIST_KEYS = ['items', 'todos', 'tasks', 'checklist', 'list', 'steps'];
+const CONTENT_KEYS = ['content', 'task', 'title', 'text', 'description', 'name', 'step', 'todo'];
+
+/**
+ * Status spellings mapped onto ours. A checklist rejected wholesale because one item said
+ * "done" instead of "completed" costs a step and teaches the model nothing about which item
+ * was wrong — and the checklist is what the completion gate reads, so losing it turns a
+ * tracked run into an untracked one.
+ */
+const STATUS_ALIASES: Record<string, TodoStatus> = {
+	pending: 'pending', todo: 'pending', 'to_do': 'pending', 'to-do': 'pending', open: 'pending',
+	not_started: 'pending', notstarted: 'pending', queued: 'pending', waiting: 'pending', new: 'pending',
+	in_progress: 'in_progress', 'in-progress': 'in_progress', inprogress: 'in_progress', active: 'in_progress',
+	doing: 'in_progress', started: 'in_progress', current: 'in_progress', running: 'in_progress', 'working': 'in_progress',
+	completed: 'completed', complete: 'completed', done: 'completed', finished: 'completed',
+	closed: 'completed', resolved: 'completed', success: 'completed', cancelled: 'completed', canceled: 'completed',
+	skipped: 'completed',
+};
+
 /**
  * Validates an update_todos call's arguments into a clean item list. Returns an
  * error string (for the tool result) instead of throwing on bad model output.
+ *
+ * Deliberately forgiving about shape, strict about substance. The list is the model's own
+ * plan and the thing the completion gate checks it against, so the cost of rejecting a
+ * usable-but-oddly-spelled call is much higher than the cost of accepting it: the run
+ * either loses its checklist or spends steps re-sending it. Only a call with no recoverable
+ * item text is refused.
  */
 export function parseTodoUpdate(args: Record<string, unknown>): TodoUpdate {
-	const raw = args.items;
-	if (!Array.isArray(raw)) {
-		return { error: 'update_todos requires an "items" array (send the complete checklist).' };
+	const key = LIST_KEYS.find(k => Array.isArray(args[k]));
+	const raw = key ? args[key] as unknown[] : undefined;
+	if (!raw) {
+		return { error: `update_todos requires an "items" array (send the complete checklist). Received: ${Object.keys(args).join(', ') || 'no arguments'}.` };
 	}
 	if (raw.length > MAX_ITEMS) {
 		return { error: `Too many todo items (${raw.length}); keep the checklist under ${MAX_ITEMS}.` };
 	}
 	const items: TodoItem[] = [];
 	for (const entry of raw) {
+		// A bare string is a complete, unambiguous item — models send them constantly, and
+		// the only thing missing is a status, which defaults to the sensible one.
+		if (typeof entry === 'string') {
+			const content = entry.trim().slice(0, MAX_CONTENT);
+			if (content) {
+				items.push({ content, status: 'pending' });
+			}
+			continue;
+		}
 		if (typeof entry !== 'object' || entry === null) {
-			return { error: 'Each todo item must be an object with "content" and "status".' };
+			return { error: 'Each todo item must be an object with "content" and "status", or a plain string.' };
 		}
-		const content = typeof (entry as Record<string, unknown>).content === 'string'
-			? ((entry as Record<string, unknown>).content as string).trim().slice(0, MAX_CONTENT)
-			: '';
-		const status = (entry as Record<string, unknown>).status;
+		const fields = entry as Record<string, unknown>;
+		const contentKey = CONTENT_KEYS.find(k => typeof fields[k] === 'string' && (fields[k] as string).trim());
+		const content = contentKey ? (fields[contentKey] as string).trim().slice(0, MAX_CONTENT) : '';
 		if (!content) {
-			return { error: 'Todo "content" must be a non-empty string.' };
+			return { error: `Todo "content" must be a non-empty string. One item had only: ${Object.keys(fields).join(', ') || 'no fields'}.` };
 		}
-		if (typeof status !== 'string' || !STATUSES.includes(status as TodoStatus)) {
-			return { error: `Todo "status" must be one of: ${STATUSES.join(', ')}.` };
-		}
-		items.push({ content, status: status as TodoStatus });
+		// An unrecognized or missing status defaults to pending rather than failing the call:
+		// "pending" is the safe reading, because the completion gate then keeps chasing the
+		// item instead of letting the run end with it silently marked done.
+		const rawStatus = typeof fields.status === 'string' ? fields.status.trim().toLowerCase() : '';
+		items.push({ content, status: STATUS_ALIASES[rawStatus] ?? 'pending' });
 	}
 	return { items };
 }

@@ -30,8 +30,18 @@ assert.deepEqual(parseTodoUpdate({ items: [] }), { items: [] });
 assert.ok('error' in parseTodoUpdate({}));
 assert.ok('error' in parseTodoUpdate({ items: 'nope' }));
 assert.ok('error' in parseTodoUpdate({ items: [{ content: '', status: 'pending' }] }));
-assert.ok('error' in parseTodoUpdate({ items: [{ content: 'x', status: 'doing' }] }));
 assert.ok('error' in parseTodoUpdate({ items: [{ status: 'pending' }] }));
+assert.ok('error' in parseTodoUpdate({ items: [42] }));
+
+// A recognizable status spelled another way is accepted rather than failing the call. The
+// checklist is what the completion gate reads, so rejecting the whole list over one word
+// would turn a tracked run into an untracked one — see test-tool-conformance.mjs.
+assert.deepEqual(
+	parseTodoUpdate({ items: [{ content: 'x', status: 'doing' }] }), { items: [{ content: 'x', status: 'in_progress' }] });
+// An unrecognized status falls back to pending, never to completed: the gate must keep
+// chasing the item rather than let the run end with it silently marked done.
+assert.deepEqual(
+	parseTodoUpdate({ items: [{ content: 'x', status: 'nonsense' }] }), { items: [{ content: 'x', status: 'pending' }] });
 
 // Content is trimmed and capped so the panel cannot be flooded.
 const long = parseTodoUpdate({ items: [{ content: '  ' + 'x'.repeat(500) + '  ', status: 'pending' }] });
