@@ -19,7 +19,7 @@ import { buildEnvContext } from './persona/envContext';
 import { modeDoctrine, personaBase } from './persona/prompts';
 import { ThinkingStreamParser, formatThinking, stripHistoryThinking, stripThinking } from './persona/thinking';
 import { ProviderRegistry } from './providers/registry';
-import { ChatMessage, ChatProvider, ModelEntry, entrySupportsTools, modelSupportsVision, streamChatWithContinuation } from './providers/types';
+import { ChatMessage, ChatProvider, ModelEntry, entrySupportsTools, isAbortError, modelSupportsVision, streamChatWithContinuation } from './providers/types';
 import { RulesProvider } from './rules';
 import { SkillRegistry } from './skills';
 import { CHAT_APP_HTML } from './webviewHtml';
@@ -54,9 +54,9 @@ function newRunId(): string {
 }
 
 /** True for an abort raised by {@link AbortController}, which is never an error to report. */
-function isAbortError(err: unknown): boolean {
-	return err instanceof DOMException && err.name === 'AbortError';
-}
+// Re-exported from the provider layer so the host and the agent loop agree on what a
+// cancellation looks like; a narrower local copy meant Stop could surface as an error.
+
 const INLINE_KINDS: InlineKind[] = ['explain', 'fix', 'doc', 'optimize', 'tests', 'edit'];
 const ENHANCE_SYSTEM = 'You are a prompt engineer. Rewrite the user\'s message into a clear, specific, self-contained prompt for an AI coding assistant. Preserve intent and concrete details; add structure and obvious missing specifics, but do not invent requirements. Return ONLY the improved prompt — no preamble, code fences, or commentary.';
 
@@ -122,8 +122,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	private settingsPanel?: vscode.WebviewPanel;
 	/** One in-flight request per chat tab, so parallel conversations don't cancel each other. */
 	private readonly activeRequests = new Map<string, AbortController>();
-	/** Steering messages typed while an agent run is in flight, per chat tab. */
-	private readonly steerQueues = new Map<string, string[]>();
+	/**
+	 * Steering messages typed while an agent run is in flight, per chat tab.
+	 *
+	 * Each carries the run it was typed into. A tab's queue outlives any single run — a
+	 * message posted as one run ends arrives after the next has started — so delivering
+	 * the whole queue to whoever drains it next handed the user's correction to the wrong
+	 * task. An empty `runId` comes from a webview that predates the stamp and is accepted
+	 * by whichever run drains it, which is the old behaviour.
+	 */
+	private readonly steerQueues = new Map<string, Array<{ runId: string; text: string }>>();
+
+	/**
+	 * Drains the steering messages belonging to `runId`, discarding any left behind by a
+	 * run that has already ended. Returned as plain text for the agent loop.
+	 */
+	private drainSteering(sessionId: string, runId: string): string[] {
+		const queued = this.steerQueues.get(sessionId);
+		if (!queued?.length) {
+			return [];
+		}
+		this.steerQueues.delete(sessionId);
+		return queued.filter(entry => !entry.runId || entry.runId === runId).map(entry => entry.text);
+	}
 	private editTarget?: vscode.Uri;
 	private editRange?: vscode.Range;
 	private inlineEditActive = false;
@@ -144,7 +165,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		private readonly auth: WebAuthManager,
 		private readonly mcp: McpManager,
 	) {
-		this.router = new RoleRouter(registry);
+		this.router = new RoleRouter(registry, id => this.modelCache.get(id));
 		this.skills = new SkillRegistry(context.extensionUri);
 	}
 
@@ -552,7 +573,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			case 'steer':
 				if (message.sessionId && message.text?.trim()) {
 					const queue = this.steerQueues.get(message.sessionId) ?? [];
-					queue.push(message.text.trim());
+					queue.push({ runId: message.runId ?? '', text: message.text.trim() });
 					this.steerQueues.set(message.sessionId, queue);
 				}
 				break;
@@ -926,7 +947,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		if (result.reason === 'done' || !result.detail) {
 			return;
 		}
-		if (result.reason === 'filtered' || result.reason === 'refused' || result.reason === 'stalled') {
+		if (result.reason === 'filtered' || result.reason === 'refused' || result.reason === 'stalled' || result.reason === 'error') {
 			post({ type: 'error', message: result.detail });
 			return;
 		}
@@ -955,7 +976,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				const maxSteps = this.configuredMaxSteps();
 				await this.mcp.ensureStarted();
 				const approver = this.approverFor(sessionId, runId, controller.signal);
-				const orchestrator = new AutoOrchestrator(this.registry, this.router, approver, maxSteps, this.mcp);
+				const orchestrator = new AutoOrchestrator(this.registry, this.router, approver, maxSteps, this.mcp,
+					id => this.modelCache.get(id));
 				let stepThinking: ThinkingStreamParser | undefined;
 				post({ type: 'todos', items: [] });
 				// An Auto run is still an agent run to the user, and the webview offers the
@@ -965,11 +987,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				await orchestrator.run(
 					{
 						history, contextText, baseSystemPrompt: await this.baseSystem(), signal: controller.signal,
-						steering: () => {
-							const queued = this.steerQueues.get(sessionId) ?? [];
-							this.steerQueues.delete(sessionId);
-							return queued;
-						},
+						steering: () => this.drainSteering(sessionId, runId),
 					},
 					{
 						phase: (role, a, streaming) => {
@@ -1180,11 +1198,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			maxContextTokens: this.configuredContextTokens(params.model, params.maxTokens, provider.info.id),
 			contextWindow: this.windowFor(provider.info.id, params.model),
 			keepHead,
-			steering: () => {
-				const queued = this.steerQueues.get(sessionId) ?? [];
-				this.steerQueues.delete(sessionId);
-				return queued;
-			},
+			steering: () => this.drainSteering(sessionId, runId),
 		});
 		let stepThinking: ThinkingStreamParser | undefined;
 		post({ type: 'todos', items: [] });

@@ -200,13 +200,74 @@
 		sessions = [s];
 		activeSessionId = s.id;
 	}
+	/**
+	 * Total base64 image data kept in persisted state, newest first.
+	 *
+	 * Attachments live in `messages` as base64, and `saveState` serializes every session on
+	 * every commit — so a few 5MB screenshots turned each save into a multi-megabyte
+	 * synchronous write, dozens of times a run. Recent images are the ones still worth
+	 * restoring; older ones are replaced by a marker so the transcript still shows that an
+	 * image was there. In-memory `messages` are untouched, so nothing changes for the
+	 * current session — only what survives a reload.
+	 */
+	const MAX_PERSISTED_IMAGE_BYTES = 2 * 1024 * 1024;
+
+	/**
+	 * Copies `messages` for persistence, keeping image data only while under the budget.
+	 * `budget` is threaded through the caller so the cap is global, not per session.
+	 * @param {Msg[]} messages
+	 * @param {{ left: number }} budget
+	 */
+	function messagesForState(messages, budget) {
+		const out = [];
+		// Newest first: the tail of the conversation is what a reload most needs intact.
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const m = messages[i];
+			if (!m.images?.length) {
+				out.push(m);
+				continue;
+			}
+			const bytes = m.images.reduce((sum, img) => sum + img.data.length, 0);
+			if (bytes <= budget.left) {
+				budget.left -= bytes;
+				out.push(m);
+			} else {
+				const count = m.images.length;
+				const note = `\n\n_[${count} image${count === 1 ? '' : 's'} not kept after reload]_`;
+				out.push({ role: m.role, content: (m.content || '') + note, kind: m.kind });
+			}
+		}
+		return out.reverse();
+	}
+
 	function saveState() {
+		const budget = { left: MAX_PERSISTED_IMAGE_BYTES };
+		// The budget is spent in order, so spend it on the tab the user is actually looking
+		// at before any background one — otherwise the visible conversation could lose its
+		// screenshot to a tab nobody has open. `sessions` order (and thus the tab strip) is
+		// untouched; only the order the budget is *allocated* in changes.
+		const byPriority = [...sessions].sort((a, b) =>
+			(a.id === activeSessionId ? 0 : 1) - (b.id === activeSessionId ? 0 : 1));
+		/** @type {Map<string, Msg[]>} */
+		const kept = new Map();
+		for (const s of byPriority) {
+			kept.set(s.id, messagesForState(s.messages, budget));
+		}
 		vscode.setState({
-			sessions: sessions.map(s => ({ id: s.id, title: s.title, messages: s.messages, queue: s.queue, compactSummary: s.compactSummary, compactedUpTo: s.compactedUpTo })),
+			sessions: sessions.map(s => ({
+				id: s.id,
+				title: s.title,
+				messages: kept.get(s.id) ?? s.messages,
+				queue: s.queue,
+				compactSummary: s.compactSummary,
+				compactedUpTo: s.compactedUpTo,
+			})),
 			activeSessionId,
 			mode,
 			selectedProvider,
-			history,
+			// Archived conversations are never re-sent to a model, so their image bytes buy
+			// nothing at all and are dropped outright.
+			history: history.map(h => ({ ...h, messages: messagesForState(h.messages, { left: 0 }) })),
 		});
 	}
 
@@ -378,6 +439,8 @@
 
 	function renderAll() {
 		const s = cur();
+		// The whole transcript is about to be rebuilt, `pending` included.
+		cancelStreamRender();
 		els.messages.innerHTML = '';
 		activeAssistantBody = null;
 		toolEls.clear();
@@ -1129,7 +1192,7 @@
 			row.className = 'role-row' + (r.ready ? '' : ' not-ready');
 			const provOpts = ['<option value="">Auto-select</option>']
 				.concat(providers.map(p =>
-					`<option value="${p.id}"${pinned && p.id === r.providerId ? ' selected' : ''}>${escapeHtml(p.label)}</option>`))
+					`<option value="${escapeHtml(p.id)}"${pinned && p.id === r.providerId ? ' selected' : ''}>${escapeHtml(p.label)}</option>`))
 				.join('');
 			const listId = `auto-models-${r.role}`;
 			const sourceText = pinned
@@ -1339,7 +1402,11 @@
 			scrollToBottom();
 		}
 		saveState();
-		vscode.postMessage({ type: 'steer', sessionId: s.id, text });
+		// Stamped with the run it was typed into, exactly like every other run-scoped
+		// message. Without it a correction typed as one run finished was delivered to
+		// whichever run started next in this tab — the user watched their instruction be
+		// applied to the wrong task.
+		vscode.postMessage({ type: 'steer', sessionId: s.id, runId: s.runId, text });
 	}
 
 	// ---- Working indicator ------------------------------------------------------
@@ -1557,6 +1624,9 @@
 
 	/** Starts an in-flight assistant turn on a session (DOM bubble only when visible). */
 	function openStream(s) {
+		// A frame queued against the bubble this replaces would otherwise paint the new
+		// session's text into the old element (or the old text into the new one).
+		flushStreamRender();
 		s.pending = '';
 		if (s.id === activeSessionId) {
 			activeAssistantBody = appendMessageEl('assistant', '');
@@ -1585,8 +1655,65 @@
 		return cleaned.trim();
 	}
 
+	/**
+	 * Coalesced repaint of the streaming bubble.
+	 *
+	 * A token used to repaint synchronously: re-render the WHOLE accumulated answer to
+	 * markdown, reparse it through innerHTML, walk it twice for open thinking blocks, and
+	 * scroll. That is O(n²) over a response — and reasoning models stream thousands of
+	 * tokens — so a long answer progressively froze the panel and starved the message pump
+	 * the same run was using to report its progress. `s.pending` is still updated on every
+	 * token, so the model of record is unchanged; only the painting is rate-limited to one
+	 * frame.
+	 * @type {number}
+	 */
+	let streamFrame = 0;
+	/** @type {Session | null} The session whose pending text the queued frame will paint. */
+	let streamTarget = null;
+
+	function paintStream() {
+		const s = streamTarget;
+		streamTarget = null;
+		if (!s || s.id !== activeSessionId || !activeAssistantBody) { return; }
+		activeAssistantBody.parentElement?.classList.remove('awaiting');
+		setBodyMarkdown(activeAssistantBody, s.pending || '');
+		scrollToBottom();
+	}
+
+	/** Requests a repaint of `s`'s streaming bubble on the next frame (at most one queued). */
+	function scheduleStreamRender(s) {
+		streamTarget = s;
+		if (streamFrame) { return; }
+		streamFrame = requestAnimationFrame(() => { streamFrame = 0; paintStream(); });
+	}
+
+	/**
+	 * Paints any queued frame immediately. Every path that reads the bubble's DOM or
+	 * replaces it has to call this first, or the last tokens before a step/tool boundary
+	 * would be dropped from the rendered turn while still present in `s.pending`.
+	 */
+	function flushStreamRender() {
+		if (!streamFrame) { return; }
+		cancelAnimationFrame(streamFrame);
+		streamFrame = 0;
+		paintStream();
+	}
+
+	/**
+	 * Drops a queued frame without painting it. For callers that are about to rebuild the
+	 * transcript wholesale — painting into DOM that is one statement away from being
+	 * discarded is pure waste, and the rebuild renders `pending` itself.
+	 */
+	function cancelStreamRender() {
+		if (streamFrame) { cancelAnimationFrame(streamFrame); streamFrame = 0; }
+		streamTarget = null;
+	}
+
 	/** Commits a session's in-flight assistant turn into its transcript. */
 	function commitPending(s) {
+		// The queued frame holds tokens that are in `s.pending` but not yet on screen;
+		// enhanceCodeBlocks below reads the rendered DOM, so it has to see them.
+		flushStreamRender();
 		// Only the visible tab owns the working indicator; a background tab finishing must
 		// not cancel the one running for the active tab. The `streaming` guard matters as
 		// much: this runs at every tool call and agent step too, and the strip has to
@@ -1634,8 +1761,10 @@
 		}
 		pendingImages = [];
 		renderImageChips();
-		// Remember how this run was started so mid-run input knows whether to steer or queue.
-		s.runMode = (sendMode === 'agent' && !isAuto()) ? 'agent' : sendMode;
+		// Remember how this run was started so mid-run input knows whether to steer or
+		// queue. Agent runs steer, everything else queues — Auto included, since its
+		// implementer phase is an agent loop and the orchestrator forwards steering to it.
+		s.runMode = sendMode;
 
 		// In Auto mode the per-phase header creates its own bubble; otherwise pre-create one
 		// for non-agent streaming. (openStream only touches the DOM for the visible tab.)
@@ -2065,9 +2194,7 @@
 				if (s.pending === null) { openStream(s); }
 				s.pending += msg.delta;
 				if (s.id === activeSessionId && activeAssistantBody) {
-					activeAssistantBody.parentElement?.classList.remove('awaiting');
-					setBodyMarkdown(activeAssistantBody, s.pending);
-					scrollToBottom();
+					scheduleStreamRender(s);
 				}
 				break;
 			}

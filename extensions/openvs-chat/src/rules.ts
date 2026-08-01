@@ -26,12 +26,19 @@ export class RulesProvider {
 		}
 
 		const fileNames = cfg.get<string[]>('ruleFiles') ?? [];
-		const root = vscode.workspace.workspaceFolders?.[0]?.uri;
-		if (root) {
+		// Every workspace folder is probed, not just the first. A multi-root workspace is
+		// several projects, and the rules of the second one are exactly as binding as the
+		// first's — reading only `workspaceFolders[0]` silently ignored them. The folder is
+		// named in the heading when there is more than one, so the model can tell whose
+		// rules it is reading. (`detectVerificationCommands` already probes all folders;
+		// this brings rule discovery in line with it.)
+		const folders = vscode.workspace.workspaceFolders ?? [];
+		for (const folder of folders) {
 			for (const name of fileNames) {
-				const text = await this.tryReadFile(root, name);
+				const text = await this.tryReadFile(folder.uri, name);
 				if (text) {
-					parts.push(`# Rules from ${name}\n${text}`);
+					const label = folders.length > 1 ? `${folder.name}/${name}` : name;
+					parts.push(`# Rules from ${label}\n${text}`);
 				}
 			}
 		}

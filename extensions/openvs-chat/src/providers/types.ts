@@ -583,6 +583,71 @@ export async function apiFetch(
 	}
 }
 
+/**
+ * Whether a rejection is a cancellation rather than a failure.
+ *
+ * Broader than `err instanceof DOMException`: an abort reaches us as a `DOMException`
+ * from `fetch`, as a plain `Error` named `AbortError` from some runtimes and polyfills,
+ * and as a Node system error carrying `ABORT_ERR`. Getting this wrong is user-visible in
+ * the worst way — the agent loop turns an unrecognized rejection into a reported failure,
+ * so pressing Stop would pop an error toast blaming the provider.
+ */
+export function isAbortError(err: unknown): boolean {
+	if (err instanceof DOMException && err.name === 'AbortError') {
+		return true;
+	}
+	const candidate = err as { name?: unknown; code?: unknown } | null | undefined;
+	return !!candidate && (candidate.name === 'AbortError' || candidate.code === 'ABORT_ERR');
+}
+
+/**
+ * Failures that are definitively the caller's fault and will fail identically forever:
+ * a bad key, a revoked token, a model the account can't reach. Checked first, because a
+ * 403 body routinely contains words ("try again", "temporarily") that the transient
+ * patterns below would otherwise match.
+ */
+const PERMANENT_PATTERNS: RegExp[] = [
+	/authentication failed/,
+	/\bhttp 40[13]\b/,
+	/invalid api key|incorrect api key|no api key|unauthorized|forbidden/,
+	/does not support/,
+];
+
+/**
+ * Failures that a later identical request has a real chance of surviving: the provider
+ * fell over, the gateway queue timed out, the socket dropped mid-stream. Matched against
+ * the messages this module produces ({@link describeHttpError}, {@link readSSE},
+ * {@link apiFetch}) plus the raw runtime network errors underneath them.
+ */
+const TRANSIENT_PATTERNS: RegExp[] = [
+	/\bhttp 5\d\d\b/,
+	/\bhttp (408|409|425|429)\b/,
+	/rate limited/,
+	/response stalled/,
+	/ended before it was complete/,
+	/did not start responding within/,
+	/fetch failed|network error|socket hang up|premature close|terminated/,
+	/econnreset|econnrefused|etimedout|enotfound|eai_again|epipe/,
+	/temporarily unavailable|service unavailable|overloaded|bad gateway|gateway timeout/,
+];
+
+/**
+ * Whether a failed provider request is worth retrying as-is.
+ *
+ * The agent loop uses this to decide between resuming a run and ending it: a dropped
+ * stream halfway through a twenty-step task used to destroy the whole run — every tool
+ * result it had gathered lives only in that run's message array — while a bad API key
+ * retried three times just wastes the user's time. Unrecognized failures are treated as
+ * permanent, so a genuinely broken request fails fast and loudly.
+ */
+export function isTransientProviderError(message: string): boolean {
+	const m = message.toLowerCase();
+	if (PERMANENT_PATTERNS.some(p => p.test(m))) {
+		return false;
+	}
+	return TRANSIENT_PATTERNS.some(p => p.test(m));
+}
+
 /** Builds a friendly error message from a failed (non-OK) HTTP response. */
 export async function describeHttpError(provider: string, response: Response): Promise<string> {
 	let detail = '';

@@ -6,7 +6,23 @@
 import { spawn } from 'child_process';
 
 const PROTOCOL_VERSION = '2024-11-05';
+
+/**
+ * Handshake and `tools/list` budget. Short on purpose: a server that cannot introduce
+ * itself in 20s is broken, and every one of these is paid during startup.
+ */
 const REQUEST_TIMEOUT_MS = 20_000;
+
+/**
+ * `tools/call` budget. Far longer than the handshake because a tool call is real work —
+ * a build, a browser navigation, a database query — and the handshake's 20s cut those off
+ * mid-flight, reported them to the model as a failure, and left the server still running
+ * the abandoned call.
+ */
+const CALL_TIMEOUT_MS = 120_000;
+
+/** How much of a server's stderr is retained to explain a failure. */
+const MAX_STDERR_CHARS = 4_000;
 
 /** A tool advertised by an MCP server (`tools/list`). */
 export interface McpToolDef {
@@ -40,6 +56,8 @@ export class McpStdioClient {
 	private readonly pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
 	private buffer = '';
 	private closed = false;
+	/** Rolling tail of the server's stderr, used to explain a failure. */
+	private stderr = '';
 
 	constructor(private readonly config: McpStdioConfig) { }
 
@@ -51,8 +69,27 @@ export class McpStdioClient {
 			stdio: ['pipe', 'pipe', 'pipe'],
 		});
 		this.proc.stdout?.on('data', (chunk: any) => this.onData(chunk));
-		this.proc.on('exit', () => this.failAll('MCP server process exited.'));
-		this.proc.on('error', (err: any) => this.failAll(`MCP server failed to start: ${err?.message ?? err}`));
+		// stderr MUST be drained. It is piped, and a pipe nobody reads fills its OS buffer
+		// (~64KB) and then blocks the child's next write forever — so a chatty server did
+		// not fail, it silently froze, and every later tool call sat until its timeout. The
+		// tail is kept because it is usually the only explanation of why a server died.
+		this.proc.stderr?.on('data', (chunk: any) => {
+			this.stderr = (this.stderr + String(chunk)).slice(-MAX_STDERR_CHARS);
+		});
+		// A dead process must be recognized as dead. Without this the client stayed "open"
+		// over a corpse: each call wrote to a closed pipe and then waited out the full
+		// timeout, turning one crash into minutes of stalled agent steps.
+		this.proc.on('exit', (code: number | null) => {
+			this.closed = true;
+			this.failAll(`MCP server process exited${code === null ? '' : ` (code ${code})`}.${this.stderrTail()}`);
+		});
+		this.proc.on('error', (err: any) => {
+			this.closed = true;
+			this.failAll(`MCP server failed to start: ${err?.message ?? err}${this.stderrTail()}`);
+		});
+		// Writing to a killed child emits 'error' on stdin; unhandled, that is a throw out of
+		// an I/O callback, which takes down the extension host rather than one MCP server.
+		this.proc.stdin?.on('error', () => { this.closed = true; });
 
 		await this.request('initialize', {
 			protocolVersion: PROTOCOL_VERSION,
@@ -69,7 +106,7 @@ export class McpStdioClient {
 
 	/** Calls a tool and returns its content flattened to text, with an error flag. */
 	async callTool(name: string, args: Record<string, unknown>): Promise<{ text: string; isError: boolean }> {
-		const result = await this.request('tools/call', { name, arguments: args });
+		const result = await this.request('tools/call', { name, arguments: args }, CALL_TIMEOUT_MS);
 		const blocks: Array<{ type?: string; text?: string }> = Array.isArray(result?.content) ? result.content : [];
 		const text = blocks
 			.map(b => (b.type === 'text' && typeof b.text === 'string' ? b.text : JSON.stringify(b)))
@@ -122,9 +159,9 @@ export class McpStdioClient {
 		}
 	}
 
-	private request(method: string, params: unknown): Promise<any> {
-		if (this.closed || !this.proc?.stdin) {
-			return Promise.reject(new Error('MCP client is not connected.'));
+	private request(method: string, params: unknown, timeoutMs = REQUEST_TIMEOUT_MS): Promise<any> {
+		if (this.closed || !this.proc?.stdin?.writable) {
+			return Promise.reject(new Error(`MCP client is not connected.${this.stderrTail()}`));
 		}
 		const id = this.nextId++;
 		const payload = JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n';
@@ -132,12 +169,26 @@ export class McpStdioClient {
 			const timer = setTimeout(() => {
 				if (this.pending.has(id)) {
 					this.pending.delete(id);
-					reject(new Error(`MCP request "${method}" timed out.`));
+					reject(new Error(`MCP request "${method}" timed out after ${Math.round(timeoutMs / 1000)}s.`));
 				}
-			}, REQUEST_TIMEOUT_MS);
+			}, timeoutMs);
 			this.pending.set(id, { resolve, reject, timer });
-			this.proc!.stdin!.write(payload);
+			// The write itself can throw synchronously on a destroyed stream; failing the one
+			// request is correct, crashing the host is not.
+			try {
+				this.proc!.stdin!.write(payload);
+			} catch (err) {
+				clearTimeout(timer);
+				this.pending.delete(id);
+				reject(new Error(`MCP request "${method}" could not be sent: ${err instanceof Error ? err.message : String(err)}`));
+			}
 		});
+	}
+
+	/** The server's recent stderr, formatted for appending to an error message. */
+	private stderrTail(): string {
+		const tail = this.stderr.trim();
+		return tail ? ` Server output:\n${tail}` : '';
 	}
 
 	private notify(method: string, params: unknown): void {

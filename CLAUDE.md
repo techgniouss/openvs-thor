@@ -156,9 +156,11 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   manager (`manager.ts`); merges global (`openvsChat.mcp.servers`) and per-project
   (`.openvs/mcp.json` / `.vscode/mcp.json`) server configs; project overrides global; stdio
   servers only start in a trusted workspace.
-- `src/rules.ts` — loads always-on "soft steering" instructions from `openvsChat.rules` or
-  the first present of `.openvs/rules.md`, `AGENTS.md`, `.github/copilot-instructions.md`,
-  `.cursorrules` (configurable via `openvsChat.ruleFiles`); prepended to every conversation.
+- `src/rules.ts` — loads always-on "soft steering" instructions from `openvsChat.rules` plus
+  **every** present file in `openvsChat.ruleFiles` (default `.openvs/rules.md`, `AGENTS.md`,
+  `.github/copilot-instructions.md`, `.cursorrules`), each labelled with its source and
+  probed across all workspace folders; prepended to every conversation. The combined block
+  is capped at 12k chars — earlier files win, so order the setting by priority.
 - `src/skills.ts` — activatable instruction packs; four ship bundled verbatim under
   `skills/*.md` (caveman, impeccable, uiux-pro-max, agent-browser), user skills can be added
   via settings or `.openvs/skills/*.md`. The `openvsChat.createSkill` command (also the

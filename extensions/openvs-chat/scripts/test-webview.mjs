@@ -182,4 +182,42 @@ const hostHandles = new Set(captures(host, /^\s*case '([a-zA-Z]+)':/gm));
 	assert.deepStrictEqual(unknown, [], 'the webview labels tools that no longer exist');
 }
 
+// 9. Every message that belongs to a specific RUN must carry `runId`, and the host must
+// fence on it. A chat tab outlives its runs: `send` supersedes the previous run in that
+// tab, and a message posted as one run ends arrives after the next has started. `steer`
+// was the one run-scoped message without the stamp, so a correction typed at the wrong
+// moment was delivered to whichever run happened to be live — the user watched their
+// instruction be applied to a different task.
+{
+	const runScoped = ['send', 'steer'];
+	for (const type of runScoped) {
+		const post = new RegExp(`vscode\\.postMessage\\(\\{[^}]*type: '${type}'[\\s\\S]{0,400}?\\}\\)`).exec(main);
+		assert.ok(post, `the webview still posts "${type}"`);
+		assert.match(post[0], /runId/, `"${type}" must carry the run it belongs to`);
+	}
+	// The host has to actually use it, not just accept it: steering is drained per run.
+	assert.match(host, /drainSteering\(sessionId, runId\)/, 'steering is drained for the current run only');
+	assert.match(host, /entry\.runId === runId/, 'a steer left behind by an ended run is discarded');
+}
+
+// 10. Streaming repaints must stay coalesced. Painting per token re-renders the whole
+// accumulated answer through markdown and innerHTML on every delta — O(n²) over a
+// response, which froze the panel on long answers and on reasoning models that stream
+// thousands of tokens. The accumulate/paint split is easy to undo by accident, so pin it.
+{
+	const tokenCase = /case 'token': \{[\s\S]{0,500}?\n\t\t\t\}/.exec(main);
+	assert.ok(tokenCase, 'the token handler is still there');
+	assert.match(tokenCase[0], /s\.pending \+= msg\.delta/, 'every token still accumulates');
+	assert.match(tokenCase[0], /scheduleStreamRender\(s\)/, 'painting is deferred to a frame');
+	assert.ok(!/setBodyMarkdown/.test(tokenCase[0]), 'a token must not repaint synchronously');
+	// …and every path that reads or replaces the bubble must settle the queued frame first,
+	// or the last tokens before a boundary are on `pending` but never on screen.
+	assert.match(main, /function commitPending\(s\) \{[\s\S]{0,400}?flushStreamRender\(\)/,
+		'committing a turn flushes the queued frame');
+	assert.match(main, /function openStream\(s\) \{[\s\S]{0,300}?flushStreamRender\(\)/,
+		'opening a new bubble flushes the queued frame');
+	assert.match(main, /function renderAll\(\) \{[\s\S]{0,300}?cancelStreamRender\(\)/,
+		'a full rebuild drops the queued frame instead of painting doomed DOM');
+}
+
 console.log('test-webview: all assertions passed');
