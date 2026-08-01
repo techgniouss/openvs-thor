@@ -200,36 +200,26 @@ html, body {
 	gap: 8px;
 	padding: 16px 8px;
 }
-.empty-orb {
-	width: 84px;
-	height: 84px;
-	display: flex;
-	align-items: center;
-	justify-content: center;
-	border-radius: 50%;
-	color: var(--vscode-charts-blue, #4ea1ff);
-	background:
-		radial-gradient(circle at 30% 25%, color-mix(in srgb, var(--vscode-charts-purple, #b180d7) 28%, transparent), transparent 62%),
-		radial-gradient(circle at 70% 75%, color-mix(in srgb, var(--vscode-charts-blue, #4ea1ff) 30%, transparent), transparent 62%),
-		var(--vscode-editor-inactiveSelectionBackground, rgba(127, 127, 127, 0.08));
-	box-shadow: 0 0 42px color-mix(in srgb, var(--vscode-charts-blue, #4ea1ff) 22%, transparent);
-	animation: orb-float 5s ease-in-out infinite;
+/* The brand mark on a fresh chat. `media/hero.png` carries its own dark backdrop, so it
+   is framed as a rounded card with a hairline border — that reads as deliberate on a
+   light theme, where an unframed dark square would look pasted on. The glow is tinted
+   from the theme rather than baked into the art, so it sits in any color scheme.
+   `--vscode-contrastBorder` is only defined by the high-contrast themes, so it wins
+   there and falls through to the tinted hairline everywhere else: HC asks for a solid
+   edge on anything that would otherwise be told apart by color alone, and a raster
+   mark cannot restate itself in the theme's palette the way a drawn glyph could. */
+.empty-hero {
+	width: 116px;
+	height: 116px;
+	border-radius: 26px;
+	border: 1px solid var(--vscode-contrastBorder, color-mix(in srgb, var(--vscode-charts-blue, #4ea1ff) 30%, transparent));
+	box-shadow: 0 0 46px color-mix(in srgb, var(--vscode-charts-blue, #4ea1ff) 26%, transparent);
+	user-select: none;
+	animation: hero-float 5s ease-in-out infinite;
 }
-/* The bolt is drawn at full 24px viewBox scale, so the idle pulse also does the
-   sizing — it must live in the keyframes, since a CSS transform animation would
-   override any `transform` presentation attribute on the path. */
-.empty-orb .spark {
-	color: var(--vscode-charts-yellow, #e2c08d);
-	animation: spark-pulse 2.4s ease-in-out infinite;
-	transform-origin: 12px 12px;
-}
-@keyframes orb-float {
+@keyframes hero-float {
 	0%, 100% { transform: translateY(0); }
 	50% { transform: translateY(-7px); }
-}
-@keyframes spark-pulse {
-	0%, 100% { opacity: 0.4; transform: scale(0.44); }
-	50% { opacity: 1; transform: scale(0.56); }
 }
 .empty-title {
 	font-size: 1.35em;
@@ -1145,6 +1135,7 @@ details.thinking > summary:hover { color: var(--vscode-foreground); }
 	.working-word { animation: none; }
 	.thor-glyph { animation: none; opacity: 1; }
 	.message.streaming .body::after { animation: none; }
+	.empty-hero { animation: none; }
 }
 
 /* ---- Agent task checklist ---- */

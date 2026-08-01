@@ -1523,7 +1523,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	<title>${settingsOnly ? 'OpenVS Settings' : 'OpenVS Thor'}</title>
 </head>
 <body class="${settingsOnly ? 'settings-window' : ''}">
-	<script nonce="${nonce}">window.__OPENVS_SETTINGS_ONLY__ = ${settingsOnly ? 'true' : 'false'};</script>
+	<script nonce="${nonce}">window.__OPENVS_SETTINGS_ONLY__ = ${settingsOnly ? 'true' : 'false'};
+	window.__OPENVS_HERO_URI__ = ${JSON.stringify(String(mediaUri('hero.png')))};</script>
 ${CHAT_APP_HTML}
 	<script nonce="${nonce}" src="${mediaUri('prompts.js')}"></script>
 	<script nonce="${nonce}" src="${mediaUri('main.js')}"></script>
