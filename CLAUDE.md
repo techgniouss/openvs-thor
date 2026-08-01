@@ -105,6 +105,14 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   `openrouter.ts`, `kimi.ts` (Moonshot), `qwen.ts` (DashScope), `custom.ts` (any
   OpenAI-compatible endpoint — Ollama/LM Studio/vLLM/etc., no key required),
   `openaiCompatible.ts`) implementing the shared `ChatProvider` interface (`types.ts`),
+  with `toolCalls.ts` holding the model-agnostic robustness layer: it repairs the malformed
+  tool-call JSON weaker models emit (fences, Python literals, trailing commas, truncation)
+  and recovers tool calls a model wrote into its prose (`<tool_call>`, `<function=…>`,
+  fenced JSON) — `agentRunner.recoverTextToolCalls` applies the latter to every provider,
+  and `tools.normalizeToolCall` maps other products' tool/argument names onto ours (including
+  the keys *inside* `edit_file`'s batch array), with `asString`/`asNumber`/`asBoolean`
+  coercing every model-supplied argument — `test-tool-conformance.mjs` is the matrix that
+  keeps this honest and fails if a tool gains no case,
   looked up via `registry.ts`. NVIDIA and most other gateways reuse the OpenAI-compatible
   client — add a new backend by pointing a `baseUrl` setting at it, or by copying `kimi.ts`.
   The shared client streams `reasoning_content` (DeepSeek-R1-style models) and uses a 150s
@@ -130,6 +138,10 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   `media/prompts.js` (rendering) — never as a global modal, so the card can carry a diff,
   say which tab is asking, offer "allow for this run", and take a written reason on denial
   (which is fed back to the model as the tool result).
+  `shell.ts` picks the shell `run_command` executes through — on Windows it prefers the Git
+  Bash that ships with Git over `cmd.exe`, because models emit POSIX syntax by default;
+  `run_command` streams output through a rolling head+tail collector rather than buffering
+  it, so a verbose build always yields a real exit code.
   `search_files` prefers the editor's own ripgrep via `workspace.findTextInFiles`, which
   is why `enabledApiProposals: ["findTextInFiles"]` is in the extension's package.json —
   that keeps this extension **built-in only** (a packaged VSIX would be refused). The
@@ -162,7 +174,9 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
 Guardrails in `agent/guardrails.ts` are hard-enforced in code (denied commands, protected
 paths, workspace-root confinement, untrusted-workspace write blocking) and cannot be
 overridden by model output; `rules.ts` content is soft steering only. Keep that distinction
-when changing either.
+when changing either. The *approval policy* is separate and defaults to `yolo` (no
+confirmation cards for writes or commands) — the hard guardrails above still apply at every
+policy, and `ask_user` remains how the agent raises a decision that is genuinely the user's.
 
 ## Coding guidelines (apply repo-wide, including `openvs-chat`)
 

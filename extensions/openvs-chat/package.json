@@ -450,7 +450,7 @@
             "%config.guardrails.approval.autoEdits%",
             "%config.guardrails.approval.yolo%"
           ],
-          "default": "auto-edits",
+          "default": "yolo",
           "description": "%config.guardrails.approval%"
         },
         "openvsChat.guardrails.deniedCommands": {

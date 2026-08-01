@@ -8,6 +8,7 @@ import {
 	ProviderInfo, STREAM_FETCH_OPTS, StreamChatResult, ToolCall, apiFetch, describeHttpError,
 	normalizeFinishReason, readSSE, retryNotice,
 } from './types';
+import { parseToolArgs } from './toolCalls';
 
 const ANTHROPIC_VERSION = '2023-06-01';
 const OAUTH_BETA = 'oauth-2025-04-20';
@@ -200,15 +201,7 @@ export class AnthropicProvider implements ChatProvider {
 		const toolCalls: ToolCall[] = [...blocks.entries()]
 			.filter(([, b]) => b.type === 'tool_use')
 			.sort((a, b) => a[0] - b[0])
-			.map(([, b]) => {
-				let input: Record<string, unknown> = {};
-				try {
-					input = b.json ? JSON.parse(b.json) : {};
-				} catch {
-					input = { _raw: b.json };
-				}
-				return { id: b.id ?? '', name: b.name ?? 'unknown', args: input };
-			});
+			.map(([, b]) => ({ id: b.id ?? '', name: b.name ?? 'unknown', args: parseToolArgs(b.json) }));
 		return { content, toolCalls, truncated, finishReason };
 	}
 }

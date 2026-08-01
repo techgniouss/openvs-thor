@@ -17,8 +17,17 @@ import * as vscode from 'vscode';
  */
 export type ApprovalPolicy = 'always' | 'auto-edits' | 'yolo';
 
-/** The shipped policy, used for an unset or unrecognized setting. */
-export const DEFAULT_APPROVAL: ApprovalPolicy = 'auto-edits';
+/**
+ * The shipped policy, used for an unset or unrecognized setting.
+ *
+ * `yolo` because a confirmation card in front of every build, test and git command is the
+ * difference between an agent that finishes a task and one that stalls waiting on a click
+ * the user never noticed. Nothing here is unguarded: the deny-list, the protected paths,
+ * workspace-root confinement and the untrusted-workspace block are all enforced in code
+ * regardless of policy, and the agent still has `ask_user` for decisions that are genuinely
+ * the user's. Tighten it with `openvsChat.guardrails.approval`.
+ */
+export const DEFAULT_APPROVAL: ApprovalPolicy = 'yolo';
 
 /** Every policy the setting and the webview picker accept, strictest first. */
 export const APPROVAL_POLICIES: readonly ApprovalPolicy[] = ['always', 'auto-edits', 'yolo'];

@@ -3,10 +3,12 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { exec } from 'child_process';
+import { spawn } from 'child_process';
 import * as vscode from 'vscode';
+import { MALFORMED_ARGS } from '../providers/toolCalls';
 import { ToolCall, ToolSpec } from '../providers/types';
 import { Guardrails, WorkspacePath, autoApproves, autoApprovesWrites, checkCommand, checkPath, describeWorkspaceUri, loadGuardrails, normalizeWorkspacePath, resolveWorkspacePath } from './guardrails';
+import { resolveAgentShell } from './shell';
 
 /**
  * Most bytes of a file that are decoded for one read_file call. Well above the page cap
@@ -343,8 +345,167 @@ function locate(rawPath: string, forWrite: boolean, g: Guardrails): Located {
 	return { ok: true, target };
 }
 
+/**
+ * Names other agent products use for the same tools, mapped onto ours.
+ *
+ * Smaller and non-frontier models have these baked in from training and reach for them by
+ * reflex — `bash`, `str_replace_editor`, `view` — no matter what the tool schema says. The
+ * call is well-formed and the intent is unambiguous; refusing it with "Unknown tool" spends
+ * a step and the model usually repeats itself. Accepting the synonym costs nothing and is
+ * the difference between a weak model working and a weak model spinning.
+ */
+const TOOL_ALIASES: Record<string, string> = {
+	bash: 'run_command', shell: 'run_command', terminal: 'run_command', execute_command: 'run_command',
+	run_terminal_cmd: 'run_command', run_in_terminal: 'run_command', exec: 'run_command', command: 'run_command',
+	view: 'read_file', cat: 'read_file', open_file: 'read_file', read: 'read_file', readfile: 'read_file', get_file: 'read_file',
+	str_replace: 'edit_file', str_replace_editor: 'edit_file', str_replace_based_edit_tool: 'edit_file',
+	apply_patch: 'edit_file', replace_in_file: 'edit_file', edit: 'edit_file', patch_file: 'edit_file',
+	create_file: 'write_file', create: 'write_file', save_file: 'write_file', write: 'write_file', writefile: 'write_file',
+	ls: 'list_dir', list_files: 'list_dir', list_directory: 'list_dir', dir: 'list_dir', listdir: 'list_dir',
+	grep: 'search_files', grep_search: 'search_files', ripgrep: 'search_files', codebase_search: 'search_files',
+	search: 'search_files', find_in_files: 'search_files',
+	glob: 'glob_files', find_files: 'glob_files', file_search: 'glob_files', find: 'glob_files',
+};
+
+/**
+ * Argument names other agent products use, per tool. Same reasoning as {@link TOOL_ALIASES}:
+ * a model that sends `file_path` instead of `path` knows exactly which file it wants, and
+ * answering "an empty path was supplied" teaches it nothing it can act on.
+ */
+const ARG_ALIASES: Record<string, Record<string, string>> = {
+	read_file: { file_path: 'path', filepath: 'path', filename: 'path', file: 'path', target_file: 'path', start_line: 'offset', line_offset: 'offset', num_lines: 'limit', end_line: 'limit' },
+	list_dir: { file_path: 'path', directory: 'path', dir: 'path', target_directory: 'path', relative_workspace_path: 'path' },
+	write_file: { file_path: 'path', filepath: 'path', filename: 'path', file: 'path', target_file: 'path', text: 'content', contents: 'content', body: 'content', file_text: 'content' },
+	edit_file: { file_path: 'path', filepath: 'path', filename: 'path', file: 'path', target_file: 'path', old_str: 'oldText', new_str: 'newText', old_string: 'oldText', new_string: 'newText', old_text: 'oldText', new_text: 'newText', search: 'oldText', replace: 'newText', replace_all: 'replaceAll' },
+	search_files: { pattern: 'query', regex: 'query', search: 'query', q: 'query', text: 'query', include: 'glob', include_pattern: 'glob', is_regex: 'isRegex' },
+	glob_files: { glob: 'pattern', query: 'pattern', path: 'pattern', file_pattern: 'pattern', max_results: 'limit' },
+	run_command: { cmd: 'command', shell_command: 'command', script: 'command', working_directory: 'cwd', directory: 'cwd', workdir: 'cwd' },
+};
+
+/** Names models use for `edit_file`'s batch array. The first one present wins. */
+const EDIT_LIST_KEYS = ['edits', 'changes', 'replacements', 'operations', 'diffs', 'edit'];
+
+/** Renames the keys of one object through `aliases`, leaving correctly-spelled keys alone. */
+function renameKeys(source: Record<string, unknown>, aliases: Record<string, string>): Record<string, unknown> {
+	const out: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(source)) {
+		const canonical = aliases[key.toLowerCase()] ?? key;
+		// A correctly-spelled argument always wins over an alias for the same slot.
+		if (out[canonical] === undefined || key === canonical) {
+			out[canonical] = value;
+		}
+	}
+	return out;
+}
+
+/**
+ * Normalizes `edit_file`'s batch: the array's own name, and the keys of each entry inside it.
+ *
+ * The entries need this as much as the top level does, and for a while did not get it —
+ * `edits: [{old_str, new_str}]` (Anthropic's own text-editor vocabulary, which most models
+ * have seen far more of than ours) reached {@link parseEdits} unrenamed, every entry read
+ * as an empty `oldText`, and the call died on "oldText must not be empty". The model had
+ * supplied the anchor all along; only the key was spelled differently.
+ */
+function normalizeEditArgs(args: Record<string, unknown>): Record<string, unknown> {
+	const out = { ...args };
+	const key = EDIT_LIST_KEYS.find(k => out[k] !== undefined);
+	if (key === undefined) {
+		return out;
+	}
+	const list = out[key];
+	if (key !== 'edits') {
+		delete out[key];
+	}
+	// A single edit sent as a bare object rather than a one-element array is accepted too.
+	const entries = Array.isArray(list) ? list : [list];
+	out.edits = entries.map(entry => typeof entry === 'object' && entry !== null && !Array.isArray(entry)
+		? renameKeys(entry as Record<string, unknown>, ARG_ALIASES.edit_file)
+		: entry);
+	return out;
+}
+
+/**
+ * Reads an argument the schema declares as a string.
+ *
+ * JSON has types and a tool schema declares them, but a model-supplied argument is only ever
+ * a suggestion: gateways that rebuild tool calls from text, and models that reason about
+ * files as lists of lines, both routinely send the wrong one. An array is joined rather than
+ * stringified — `String(['a','b'])` is `'a,b'`, which as file content is silent corruption —
+ * and a number is accepted as its text, which is what the model meant by it.
+ */
+export function asString(value: unknown): string {
+	if (typeof value === 'string') {
+		return value;
+	}
+	if (typeof value === 'number' || typeof value === 'boolean') {
+		return String(value);
+	}
+	if (Array.isArray(value)) {
+		return value.map(asString).join('\n');
+	}
+	return '';
+}
+
+/** Reads an argument the schema declares as a number, accepting the string form of one. */
+export function asNumber(value: unknown): number | undefined {
+	if (typeof value === 'number') {
+		return Number.isFinite(value) ? value : undefined;
+	}
+	if (typeof value === 'string' && value.trim()) {
+		const parsed = Number(value.trim());
+		return Number.isFinite(parsed) ? parsed : undefined;
+	}
+	return undefined;
+}
+
+/**
+ * Reads an argument the schema declares as a boolean.
+ *
+ * The string forms matter more than they look: `replaceAll: "true"` read as a strict
+ * `=== true` is false, so the flag is dropped, the edit then matches several places, and the
+ * model is told to "set replaceAll:true" — which it already did.
+ */
+export function asBoolean(value: unknown): boolean {
+	if (typeof value === 'boolean') {
+		return value;
+	}
+	if (typeof value === 'string') {
+		return ['true', 'yes', '1', 'y'].includes(value.trim().toLowerCase());
+	}
+	return value === 1;
+}
+
+/**
+ * Rewrites a call onto this toolset's vocabulary: a synonym for a tool name, and synonyms
+ * for its argument names. Returns the call unchanged when nothing matched, and never
+ * overwrites an argument the model already spelled correctly.
+ */
+export function normalizeToolCall(call: ToolCall): ToolCall {
+	const lower = call.name.trim().toLowerCase();
+	const name = CALLABLE_TOOL_NAMES.has(lower) ? lower : (TOOL_ALIASES[lower] ?? call.name);
+	const aliases = ARG_ALIASES[name];
+	if (!aliases) {
+		return name === call.name ? call : { ...call, name };
+	}
+	const renamed = renameKeys(call.args, aliases);
+	return { ...call, name, args: name === 'edit_file' ? normalizeEditArgs(renamed) : renamed };
+}
+
 /** Executes a single tool call, applying guardrails and prompting for approval on side effects. */
-export async function executeTool(call: ToolCall, approver: ToolApprover, guardrails?: Guardrails): Promise<ToolResult> {
+export async function executeTool(rawCall: ToolCall, approver: ToolApprover, guardrails?: Guardrails): Promise<ToolResult> {
+	const call = normalizeToolCall(rawCall);
+	// Arguments that never parsed are reported as such, with the text quoted back. Falling
+	// through would run the tool with no arguments at all, and its complaint ("an empty path
+	// was supplied") points the model at the wrong problem entirely.
+	if (call.args[MALFORMED_ARGS] !== undefined) {
+		return {
+			result: `The arguments for ${call.name} were not valid JSON, so the call could not be run. `
+				+ `Send them again as a plain JSON object matching the tool's schema — no code fence, no comments, no trailing commas. `
+				+ `What arrived was:\n${String(call.args[MALFORMED_ARGS]).slice(0, 800)}`,
+			isError: true,
+		};
+	}
 	const g = guardrails ?? loadGuardrails();
 	const root = workspaceRoot();
 	if (!root) {
@@ -360,14 +521,12 @@ export async function executeTool(call: ToolCall, approver: ToolApprover, guardr
 	}
 	// Every path-taking tool resolves through the same guarded step, so none of them can
 	// reach the filesystem with a path the guardrails did not clear.
-	const pathArg = (forWrite: boolean): Located => locate(String(call.args.path ?? (call.name === 'list_dir' ? '.' : '')), forWrite, g);
+	const pathArg = (forWrite: boolean): Located => locate(asString(call.args.path) || (call.name === 'list_dir' ? '.' : ''), forWrite, g);
 	try {
 		switch (call.name) {
 			case 'read_file': {
 				const found = pathArg(false);
-				return found.ok ? await readFile(found.target,
-					typeof call.args.offset === 'number' ? call.args.offset : undefined,
-					typeof call.args.limit === 'number' ? call.args.limit : undefined)
+				return found.ok ? await readFile(found.target, asNumber(call.args.offset), asNumber(call.args.limit))
 					: { result: found.error, isError: true };
 			}
 			case 'list_dir': {
@@ -375,34 +534,50 @@ export async function executeTool(call: ToolCall, approver: ToolApprover, guardr
 				return found.ok ? await listDir(found.target) : { result: found.error, isError: true };
 			}
 			case 'search_files':
-				return await searchFiles(String(call.args.query ?? ''), !!call.args.isRegex, String(call.args.glob ?? ''));
+				return await searchFiles(asString(call.args.query), asBoolean(call.args.isRegex), asString(call.args.glob));
 			case 'glob_files':
-				return await globFiles(String(call.args.pattern ?? ''),
-					typeof call.args.limit === 'number' ? call.args.limit : undefined);
+				return await globFiles(asString(call.args.pattern), asNumber(call.args.limit));
 			case 'write_file': {
 				const found = pathArg(true);
-				return found.ok ? await writeFile(found.target, String(call.args.content ?? ''), approver, g)
+				return found.ok ? await writeFile(found.target, asString(call.args.content), approver, g)
 					: { result: found.error, isError: true };
 			}
 			case 'edit_file': {
 				const found = pathArg(true);
-				return found.ok ? await editFile(found.target, parseEdits(call.args), approver, g)
-					: { result: found.error, isError: true };
+				if (!found.ok) {
+					return { result: found.error, isError: true };
+				}
+				const misuse = describeEditMisuse(call.args);
+				return misuse
+					? { result: misuse, isError: true }
+					: await editFile(found.target, parseEdits(call.args), approver, g);
 			}
 			case 'run_command': {
 				// An explicit cwd goes through the same guarded resolution as any other path,
 				// so a command cannot be aimed outside the workspace.
-				const raw = String(call.args.cwd ?? '').trim();
+				// A command sent as a list of steps is joined with `&&`, not newlines: the shell
+				// would run every line regardless of the previous one's exit code, so a failed
+				// build would be followed by a "successful" test run against stale output.
+				const command = Array.isArray(call.args.command)
+					? call.args.command.map(asString).filter(Boolean).join(' && ')
+					: asString(call.args.command);
+				const raw = asString(call.args.cwd).trim();
 				if (!raw) {
-					return await runCommand(root, '', String(call.args.command ?? ''), approver, g);
+					return await runCommand(root, '', command, approver, g);
 				}
 				const found = locate(raw, false, g);
 				return found.ok
-					? await runCommand(found.target.uri, found.target.display, String(call.args.command ?? ''), approver, g)
+					? await runCommand(found.target.uri, found.target.display, command, approver, g)
 					: { result: found.error, isError: true };
 			}
 			default:
-				return { result: `Unknown tool: ${call.name}`, isError: true };
+				// Naming the real tools matters: a model that invented a name has no way to
+				// recover from "Unknown tool" alone and simply calls it again next step.
+				return {
+					result: `There is no tool called "${rawCall.name}". The tools you have are: ${AGENT_TOOLS.map(t => t.name).join(', ')}. `
+						+ 'Call one of those instead — shell programs go through run_command.',
+					isError: true,
+				};
 		}
 	} catch (err) {
 		return { result: `Tool "${call.name}" failed: ${err instanceof Error ? err.message : String(err)}`, isError: true };
@@ -801,14 +976,37 @@ interface FileEdit {
  */
 function parseEdits(args: Record<string, unknown>): FileEdit[] {
 	const one = (raw: Record<string, unknown>): FileEdit => ({
-		oldText: String(raw.oldText ?? ''),
-		newText: String(raw.newText ?? ''),
-		replaceAll: raw.replaceAll === true,
+		oldText: asString(raw.oldText),
+		newText: asString(raw.newText),
+		replaceAll: asBoolean(raw.replaceAll),
 	});
 	if (Array.isArray(args.edits)) {
 		return args.edits.map(entry => one(typeof entry === 'object' && entry !== null ? entry as Record<string, unknown> : {}));
 	}
 	return [one(args)];
+}
+
+/**
+ * The mistake behind an `edit_file` call that carries no anchor at all, or undefined when
+ * the call is worth attempting.
+ *
+ * Checked before the edit runs so the model is told what it actually did wrong. The generic
+ * "oldText must not be empty" is true but unhelpful — it does not distinguish a model that
+ * meant `write_file` from one that simply omitted the anchor, so the model tends to retry
+ * the same shape. Naming the keys that arrived is what lets it correct itself in one step.
+ */
+function describeEditMisuse(args: Record<string, unknown>): string | undefined {
+	if (Array.isArray(args.edits) ? args.edits.length : asString(args.oldText)) {
+		return undefined;
+	}
+	const supplied = Object.keys(args).filter(k => k !== 'path');
+	if (args.content !== undefined) {
+		return 'edit_file was called with "content" but no "oldText". "content" belongs to write_file, which replaces a whole file. '
+			+ 'Either call write_file with that content, or call edit_file with "oldText" (the exact text to find) and "newText" (its replacement).';
+	}
+	return 'edit_file needs an anchor: "oldText" (the exact existing text to find) and "newText" (what replaces it), or a non-empty "edits" array of those pairs. '
+		+ `This call supplied ${supplied.length ? `only: ${supplied.join(', ')}` : 'no arguments besides the path'}. `
+		+ 'To create a file or replace one entirely, use write_file instead.';
 }
 
 /** Leading whitespace of a line. */
@@ -1020,7 +1218,11 @@ type EditOutcome =
 /** Applies one replacement to `current`, or explains why it could not be applied. */
 function applyEdit(current: string, edit: FileEdit, path: string, label: string): EditOutcome {
 	if (!edit.oldText) {
-		return { ok: false, error: `${label}oldText must not be empty. To create a new file or replace one entirely, use write_file.` };
+		return {
+			ok: false,
+			error: `${label}oldText is empty, so there is nothing to find and replace. Every entry needs "oldText" (the exact existing text) `
+				+ 'and "newText" (its replacement). To create a file or replace one entirely, use write_file.',
+		};
 	}
 	// The model copied its anchor straight out of a numbered read result. Strip the gutter
 	// and carry on rather than making it read the file again to learn that.
@@ -1198,16 +1400,6 @@ const MAX_CMD_OUTPUT = 16_000;
 const CMD_HEAD_CHARS = 4_000;
 const CMD_TAIL_CHARS = MAX_CMD_OUTPUT - CMD_HEAD_CHARS;
 
-/** Keeps the start (what ran) and the end (where errors land) of long command output. */
-function capCommandOutput(out: string): string {
-	if (out.length <= MAX_CMD_OUTPUT) {
-		return out;
-	}
-	const head = out.slice(0, CMD_HEAD_CHARS);
-	const tail = out.slice(-CMD_TAIL_CHARS);
-	return `${head}\n[… ${out.length - head.length - tail.length} chars of output omitted …]\n${tail}`;
-}
-
 /**
  * Identity of a command for "allow for this run", taken as its first two words.
  *
@@ -1222,11 +1414,54 @@ export function commandSignature(command: string): string {
 }
 
 /**
- * Output buffer for one command. Generous because the cap is enforced by killing the
- * process: a verbose build that trips it loses its exit status entirely, turning a green
- * build into an unexplained failure. {@link capCommandOutput} trims what the model sees.
+ * Rolling output collector for one command.
+ *
+ * Output is streamed and discarded as it goes rather than buffered whole. The previous
+ * implementation used `exec`, which holds every byte in memory and kills the child once the
+ * buffer is exceeded — so a verbose build (`npm run compile` in a monorepo trips 16MB
+ * easily) came back as "killed, exit status unknown" even though it had succeeded. The
+ * agent then re-ran it, tripped it again, and the run went nowhere. Nothing here can kill
+ * the process, so the exit code is always real.
+ *
+ * The head is kept whole (what ran, and the first errors), the tail rolls (where a failing
+ * build puts its summary), and everything between is counted and dropped.
  */
-const CMD_MAX_BUFFER = 16 * 1024 * 1024;
+class OutputCollector {
+	private head = '';
+	private tail: string[] = [];
+	private tailChars = 0;
+	private dropped = 0;
+
+	add(chunk: string): void {
+		let rest = chunk;
+		if (this.head.length < CMD_HEAD_CHARS) {
+			const room = CMD_HEAD_CHARS - this.head.length;
+			this.head += rest.slice(0, room);
+			rest = rest.slice(room);
+		}
+		if (!rest) {
+			return;
+		}
+		this.tail.push(rest);
+		this.tailChars += rest.length;
+		while (this.tailChars - this.tail[0].length >= CMD_TAIL_CHARS) {
+			this.tailChars -= this.tail[0].length;
+			this.dropped += this.tail.shift()!.length;
+		}
+	}
+
+	/** What the model sees: head, an honest count of what was dropped, then the tail. */
+	render(): string {
+		const tail = this.tail.join('');
+		// The oldest retained chunk may still overshoot the tail budget on its own.
+		const trimmed = tail.length > CMD_TAIL_CHARS ? tail.slice(-CMD_TAIL_CHARS) : tail;
+		const omitted = this.dropped + (tail.length - trimmed.length);
+		if (!omitted) {
+			return this.head + trimmed;
+		}
+		return `${this.head}\n[… ${omitted} chars of output omitted …]\n${trimmed}`;
+	}
+}
 
 async function runCommand(dir: vscode.Uri, dirLabel: string, command: string, approver: ToolApprover, g: Guardrails): Promise<ToolResult> {
 	if (!command.trim()) {
@@ -1260,36 +1495,50 @@ async function runCommand(dir: vscode.Uri, dirLabel: string, command: string, ap
 			return { result: denialMessage('command', feedback), isError: true };
 		}
 	}
+	const shell = resolveAgentShell(g.shell);
 	return new Promise<ToolResult>(resolvePromise => {
-		exec(command, { cwd: dir.fsPath, timeout: g.commandTimeoutMs, maxBuffer: CMD_MAX_BUFFER, shell: g.shell || undefined },
-			(error, stdout, stderr) => {
-				const out = capCommandOutput([stdout, stderr].filter(Boolean).join('\n'));
-				const fault = error as (Error & { killed?: boolean; code?: number | string; signal?: string }) | null;
-				const partial = out ? `\n\nOutput before it was killed:\n${out}` : '';
-				// Both of these kill the child, so `killed` is set either way and the exit
-				// status is lost. They must be told apart: reporting an output-flood as a
-				// timeout sends the model chasing performance, and reporting either as a
-				// plain failure sends it fixing code that never broke.
-				if (fault?.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
-					return resolvePromise({
-						result: `The command produced more than ${Math.round(CMD_MAX_BUFFER / 1024 / 1024)}MB of output and was killed — it did NOT fail on its own. `
-							+ `Its exit status is unknown. Re-run it quieter (a narrower target, or redirect output to a file and read that).${partial}`,
-						isError: true,
-					});
-				}
-				if (fault?.killed) {
-					const seconds = Math.round(g.commandTimeoutMs / 1000);
-					return resolvePromise({
-						result: `The command was killed after the ${seconds}s timeout (openvsChat.agent.commandTimeoutMs) — it did NOT fail on its own. `
-							+ `Its exit status is unknown. Re-run a faster subset, or raise the timeout.${partial}`,
-						isError: true,
-					});
-				}
-				if (fault && !stdout && !stderr) {
-					return resolvePromise({ result: `Command failed: ${fault.message}`, isError: true });
-				}
-				const status = fault ? `\n\n[exit code ${fault.code ?? 'unknown'}]` : '';
-				resolvePromise({ result: (out || '(no output)') + status, isError: !!fault });
-			});
+		const collector = new OutputCollector();
+		let settled = false;
+		const finish = (result: ToolResult) => {
+			if (!settled) {
+				settled = true;
+				clearTimeout(timer);
+				resolvePromise(result);
+			}
+		};
+
+		let child;
+		try {
+			child = spawn(command, { cwd: dir.fsPath, shell: shell.path ?? true, windowsHide: true });
+		} catch (err) {
+			return finish({ result: `Command could not be started: ${err instanceof Error ? err.message : String(err)}`, isError: true });
+		}
+
+		let timedOut = false;
+		const timer = setTimeout(() => {
+			timedOut = true;
+			child.kill();
+		}, g.commandTimeoutMs);
+
+		child.stdout?.on('data', (chunk: Buffer) => collector.add(chunk.toString()));
+		child.stderr?.on('data', (chunk: Buffer) => collector.add(chunk.toString()));
+		child.on('error', err => finish({ result: `Command failed to run: ${err.message}`, isError: true }));
+		child.on('close', (code, signal) => {
+			const out = collector.render();
+			// A timeout is the one case where the exit status is meaningless, so it is
+			// reported as such rather than as a failing build the model would try to fix.
+			if (timedOut) {
+				const seconds = Math.round(g.commandTimeoutMs / 1000);
+				return finish({
+					result: `The command was killed after the ${seconds}s timeout (openvsChat.agent.commandTimeoutMs) — it did NOT fail on its own. `
+						+ `Its exit status is unknown. Re-run a faster subset, or raise the timeout.`
+						+ (out ? `\n\nOutput before it was killed:\n${out}` : ''),
+					isError: true,
+				});
+			}
+			const failed = code !== 0;
+			const status = failed ? `\n\n[exit code ${code ?? `killed by ${signal}`}]` : '';
+			finish({ result: (out || '(no output)') + status, isError: failed });
+		});
 	});
 }

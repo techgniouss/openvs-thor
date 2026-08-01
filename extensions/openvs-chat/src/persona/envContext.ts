@@ -5,6 +5,7 @@
 
 import { execFile } from 'child_process';
 import * as vscode from 'vscode';
+import { resolveAgentShell } from '../agent/shell';
 
 const CACHE_MS = 30_000;
 const MAX_CHARS = 1_500;
@@ -29,13 +30,8 @@ function sanitize(text: string): string {
 
 /** Describes the shell `run_command` will use, so the model writes compatible syntax. */
 function agentShell(): string {
-	const configured = vscode.workspace.getConfiguration('openvsChat').get<string>('agent.shell')?.trim();
-	if (configured) {
-		return configured;
-	}
-	return process.platform === 'win32'
-		? 'cmd.exe (Windows) — use Windows command syntax, not POSIX'
-		: '/bin/sh (POSIX)';
+	const configured = vscode.workspace.getConfiguration('openvsChat').get<string>('agent.shell') ?? '';
+	return resolveAgentShell(configured).description;
 }
 
 /** Filenames of open editor tabs, active-first, capped. */

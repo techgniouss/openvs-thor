@@ -7,11 +7,12 @@ import { McpToolset } from '../mcp/manager';
 import { SUBAGENT_PREAMBLE } from '../persona/prompts';
 import { stripThinking } from '../persona/thinking';
 import { TodoItem, UPDATE_TODOS_TOOL, parseTodoUpdate } from '../persona/todos';
+import { extractTextToolCalls } from '../providers/toolCalls';
 import { AgentStep, CONTINUE_PROMPT, ChatProvider, ChatMessage, ToolCall, ToolSpec } from '../providers/types';
 import { canCompact, compactMessages, compactionThreshold, shouldCompact } from './compaction';
 import { estimateMessagesTokens, isContextLengthError, trimMessages } from './context';
 import { Guardrails, autoApproves, loadGuardrails, resolveWorkspacePath } from './guardrails';
-import { AGENT_TOOLS, ASK_USER_TOOL, AskOption, MAX_ASK_OPTIONS, READ_ONLY_TOOL_NAMES, SPAWN_SUBAGENT_TOOL, ToolApprover, VerifyCommand, detectVerificationCommands, executeTool } from './tools';
+import { AGENT_TOOLS, ASK_USER_TOOL, AskOption, MAX_ASK_OPTIONS, READ_ONLY_TOOL_NAMES, SPAWN_SUBAGENT_TOOL, ToolApprover, VerifyCommand, asBoolean, asString, detectVerificationCommands, executeTool } from './tools';
 
 const MCP_PREFIX = 'mcp__';
 
@@ -506,13 +507,13 @@ export class AgentRunner {
 	 * malformed call costs one step instead of the whole run.
 	 */
 	private async askUser(call: ToolCall): Promise<{ result: string; isError: boolean }> {
-		const question = String(call.args.question ?? '').trim();
+		const question = asString(call.args.question ?? call.args.prompt ?? call.args.text).trim();
 		if (!question) {
 			return { result: 'ask_user requires a non-empty "question".', isError: true };
 		}
 		// Every entry is parsed before trimming, so the surplus shown to the user is the
 		// real remainder rather than whatever happened to follow the cut.
-		const parsed = parseAskOptions(call.args.options);
+		const parsed = parseAskOptions(call.args.options ?? call.args.choices ?? call.args.answers);
 		const options = parsed.slice(0, MAX_ASK_OPTIONS);
 		if (options.length < 2) {
 			return {
@@ -532,7 +533,7 @@ export class AgentRunner {
 		const answer = (await this.approver.ask({
 			question,
 			options,
-			multiSelect: call.args.multiSelect === true,
+			multiSelect: asBoolean(call.args.multiSelect),
 			detail: surplus.length ? `Also offered, type to choose: ${surplus.join(' · ')}` : undefined,
 		})).trim();
 		return answer
@@ -562,7 +563,7 @@ export class AgentRunner {
 			onNotice: text => callbacks.onNote(text),
 		});
 		try {
-			return await ask(this.contextBudget);
+			return this.recoverTextToolCalls(await ask(this.contextBudget));
 		} catch (err) {
 			if (!(err instanceof Error) || !isContextLengthError(err.message)) {
 				throw err;
@@ -571,8 +572,31 @@ export class AgentRunner {
 			// rest of the run so every later step stays inside the real window.
 			this.contextBudget = Math.max(MIN_CONTEXT_TOKENS, Math.floor(this.contextBudget / 2));
 			callbacks.onNote(`The conversation outgrew the model's context window — trimming older tool output and retrying.`);
-			return ask(this.contextBudget);
+			return this.recoverTextToolCalls(await ask(this.contextBudget));
 		}
+	}
+
+	/**
+	 * Promotes tool calls a model wrote into its prose into real tool calls.
+	 *
+	 * Applied here rather than per-provider so every backend gets it: whether a model's
+	 * `<tool_call>{…}</tool_call>` reaches us as text is a property of the model and the
+	 * gateway, not of the provider class. Without this the step looks like "prose, no tool
+	 * call", which the loop reads as a finished answer — so a run with a weaker model ends
+	 * having written nothing, while appearing to have worked the whole time.
+	 */
+	private recoverTextToolCalls(step: AgentStep): AgentStep {
+		if (step.toolCalls.length || !step.content.trim()) {
+			return step;
+		}
+		const known = new Set(this.tools().map(t => t.name));
+		// The raw content, not the thinking-stripped version: whatever is left becomes the
+		// visible bubble, and stripping here would silently delete the model's reasoning.
+		const { calls, text } = extractTextToolCalls(step.content, known);
+		if (!calls.length) {
+			return step;
+		}
+		return { ...step, content: text, toolCalls: calls };
 	}
 
 	/** Runs the summarizer through the same provider/model; failures return undefined so the run falls back to trimming. */
@@ -678,8 +702,8 @@ export class AgentRunner {
 				callbacks.onToolEnd(call, result, isError);
 				return { call, result, isError };
 			};
-			const readOnly = spawnCalls.filter(c => c.args.readOnly === true);
-			const writal = spawnCalls.filter(c => c.args.readOnly !== true);
+			const readOnly = spawnCalls.filter(c => asBoolean(c.args.readOnly));
+			const writal = spawnCalls.filter(c => !asBoolean(c.args.readOnly));
 			if (writal.length) {
 				// A write-capable delegate may have changed anything; the parent must not
 				// then declare the task verified on the strength of an earlier build.
@@ -729,8 +753,10 @@ export class AgentRunner {
 		params: AgentParams,
 		callbacks: AgentCallbacks,
 	): Promise<{ result: string; isError: boolean }> {
-		const goal = String(call.args.goal ?? '').trim();
-		const readOnly = call.args.readOnly === true;
+		const goal = asString(call.args.goal ?? call.args.task ?? call.args.prompt).trim();
+		// Coerced rather than compared strictly: `readOnly: "true"` read as false would hand a
+		// delegate that asked for research-only powers a write-capable agent instead.
+		const readOnly = asBoolean(call.args.readOnly);
 		if (!goal) {
 			return { result: 'spawn_subagent requires a non-empty "goal".', isError: true };
 		}
@@ -842,12 +868,14 @@ function parseAskOptions(raw: unknown): AskOption[] {
 	}
 	const options: AskOption[] = [];
 	for (const entry of raw) {
-		const isObject = typeof entry === 'object' && entry !== null;
-		const label = (isObject ? String((entry as Record<string, unknown>).label ?? '') : String(entry ?? '')).trim();
+		const fields = typeof entry === 'object' && entry !== null ? entry as Record<string, unknown> : undefined;
+		const label = (fields
+			? asString(fields.label ?? fields.option ?? fields.value ?? fields.title ?? fields.text ?? fields.name)
+			: asString(entry)).trim();
 		if (!label) {
 			continue;
 		}
-		const description = isObject ? String((entry as Record<string, unknown>).description ?? '').trim() : '';
+		const description = fields ? asString(fields.description ?? fields.detail ?? fields.hint).trim() : '';
 		options.push(description ? { label, description } : { label });
 	}
 	return options;

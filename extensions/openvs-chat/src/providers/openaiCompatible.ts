@@ -8,6 +8,7 @@ import {
 	ModelEntry, ProviderInfo, RetryInfo, STREAM_FETCH_OPTS, StreamChatResult, ToolCall, apiFetch,
 	describeHttpError, normalizeFinishReason, readSSE, retryNotice,
 } from './types';
+import { parseToolArgs } from './toolCalls';
 import { CLOSE_MARK, OPEN_MARK } from '../persona/thinking';
 
 /**
@@ -216,13 +217,7 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 		const toolCalls: ToolCall[] = [...acc.entries()]
 			.sort((a, b) => a[0] - b[0])
 			.map(([index, tc]) => {
-				let args: Record<string, unknown> = {};
-				try {
-					args = tc.args ? JSON.parse(tc.args) : {};
-				} catch {
-					args = { _raw: tc.args };
-				}
-				return { id: tc.id ?? `call_${index}`, name: tc.name ?? 'unknown', args };
+				return { id: tc.id ?? `call_${index}`, name: tc.name ?? 'unknown', args: parseToolArgs(tc.args) };
 			});
 		// A reasoning model that produced no answer and no tool calls would otherwise
 		// yield an empty step; fall back to its reasoning so the agent loop can react.

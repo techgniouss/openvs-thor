@@ -290,9 +290,9 @@ function reset(initial = {}, options = {}) {
 	}
 	// An unset or unrecognized policy falls back to the shipped default.
 	settings = {};
-	assert.strictEqual(loadGuardrails().approval, 'auto-edits');
+	assert.strictEqual(loadGuardrails().approval, 'yolo');
 	settings = { 'guardrails.approval': 'nonsense' };
-	assert.strictEqual(loadGuardrails().approval, 'auto-edits');
+	assert.strictEqual(loadGuardrails().approval, 'yolo');
 }
 
 // 15. Reads are line-numbered, so the model can cite `path:line` and aim its next read
