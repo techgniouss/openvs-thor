@@ -1,9 +1,16 @@
 <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-	<!-- Mjolnir with the Thor bolt knocked out of the head, matching media/icon.png.
-	     The activity bar renders this as a theme-colored mask, so only the silhouette
-	     (alpha) matters — no gradients, no strokes, one currentColor fill. The bolt is
-	     punched out with fill-rule="evenodd" and kept chunky so it survives the 16px
-	     activity-bar downscale. -->
-	<path fill="currentColor" fill-rule="evenodd" d="M5.1 3.5h13.8a1.6 1.6 0 0 1 1.6 1.6v4.8a1.6 1.6 0 0 1-1.6 1.6h-13.8a1.6 1.6 0 0 1-1.6-1.6v-4.8a1.6 1.6 0 0 1 1.6-1.6Zm8.6 1.1-4.2 4.1h2l-1.2 1.9 4.2-4.1h-2l1.2-1.9Z"/>
-	<rect fill="currentColor" x="10.8" y="11.5" width="2.4" height="9" rx="0.9"/>
+	<!-- The chat mark from media/icon.png and media/hero.png, reduced to a silhouette:
+	     Mjolnir over a speech bubble with the bot's face punched out of it.
+
+	     The activity bar renders this as a theme-colored mask, so only alpha survives —
+	     no gradients, no strokes, one currentColor fill, and every interior detail (the
+	     bolt, the eyes, the smile) has to be a hole rather than a lighter shade. The
+	     hero's outer lightning ring is deliberately dropped: at the 16px view-header size
+	     a 1px arc wrapping the bubble muds into the bubble's own edge.
+
+	     One path, fill-rule="evenodd" — so no two filled subpaths may overlap by any
+	     positive area or the overlap inverts into a hole. The handle stops at y=10.4,
+	     exactly the bubble's top edge, for that reason. Details stay chunky for the same
+	     reason the old hammer's bolt did: they have to survive the 16px downscale. -->
+	<path fill="currentColor" fill-rule="evenodd" d="M4.8 2h14.4a1.2 1.2 0 0 1 1.2 1.2v4a1.2 1.2 0 0 1-1.2 1.2H4.8a1.2 1.2 0 0 1-1.2-1.2v-4A1.2 1.2 0 0 1 4.8 2Zm10.2.9L9.6 5.8H12l-1.2 1.7 4.6-2.9H13Zm-3.9 5.5h1.8v2.2h-1.8Zm-4.9 2.2h11.6a2.6 2.6 0 0 1 2.6 2.6v3.8a2.6 2.6 0 0 1-2.6 2.6h-3.5l-2.6 3.2-1.3-3.2H6.2a2.6 2.6 0 0 1-2.6-2.6v-3.8a2.6 2.6 0 0 1 2.6-2.6Zm2.8 1.75a1.55 1.55 0 1 0 0 3.1 1.55 1.55 0 0 0 0-3.1Zm6 0a1.55 1.55 0 1 0 0 3.1 1.55 1.55 0 0 0 0-3.1Zm-5.9 3.65a2.9 2.9 0 0 0 5.8 0h-1.4a1.5 1.5 0 0 1-3 0Z"/>
 </svg>

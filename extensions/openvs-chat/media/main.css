@@ -716,15 +716,18 @@ body.settings-window #settingsPanel {
 	border-radius: 0 4px 4px 0;
 }
 .tool.running { opacity: 0.85; }
-/* A tool call is the longest wait in an agent run — crackle so it never reads as
-   stalled. Done via ::before so the summary's textContent stays exactly
-   'running…', which the stop/cleanup path compares against. */
-.tool.running > details > .tool-summary::before {
-	content: '⚡';
+/* A tool call is the longest wait in an agent run — it gets an animated Thor mark so it
+   never reads as stalled. The glyph is a real element (appendToolEl) rather than a ::before
+   glyph so it can be one of the four, not always the bolt; an <svg> holds no text, so the
+   summary's textContent stays 'running…' for the stop/cleanup path. Height only, width
+   auto: Stormbreaker is tall and narrow and must keep its own aspect. */
+.tool-glyph {
+	display: inline-flex;
+	align-items: center;
 	margin-right: 4px;
-	color: var(--vscode-charts-yellow, #e2c08d);
-	animation: bolt-crackle 1.4s steps(1, end) infinite;
+	vertical-align: -3px;
 }
+.tool-glyph .thor-glyph { width: auto; height: 15px; }
 .tool.tool-error { border-left-color: var(--vscode-inputValidation-errorBorder, #f14c4c); }
 .tool-head { font-size: 0.85em; font-weight: 600; margin-bottom: 4px; }
 .tool-out {
@@ -1041,12 +1044,17 @@ details.thinking > summary:hover { color: var(--vscode-foreground); }
 }
 .empty-recent-more:hover { background: var(--vscode-toolbar-hoverBackground); }
 
-/* ---- Working indicator (empty streaming bubble) ---- */
+/* ---- Working indicator ----
+   A strip at the foot of the transcript that lives for the whole run, not a placeholder
+   inside the empty streaming bubble (see startWorking). Until its first token that bubble
+   has nothing but a caret in it, so it stays hidden and the strip speaks for it. */
+.message.awaiting { display: none; }
 .working {
-	display: inline-flex;
+	display: flex;
 	align-items: baseline;
 	gap: 4px;
 	flex-wrap: wrap;
+	margin: 2px 2px 4px;
 	color: var(--vscode-descriptionForeground);
 }
 /* Fixed slot. The glyphs are not all the same shape — Stormbreaker is tall and narrow,

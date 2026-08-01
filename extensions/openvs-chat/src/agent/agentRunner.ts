@@ -63,6 +63,20 @@ const MAX_SUMMARIZER_FAILURES = 2;
 const MAX_EMPTY_ROUNDS = 3;
 
 /**
+ * The continuation round from which the resume prompt also tells the model to change
+ * tactics. Past this point "continue where you stopped" is demonstrably not working —
+ * the model is writing one enormous answer (or thinking without ever emitting a visible
+ * turn) and will keep being cut at the same place until the round cap kills the run.
+ */
+const TRUNCATION_BRAKE_ROUND = 3;
+
+/** Appended to {@link CONTINUE_PROMPT} once continuations stop paying off. */
+const TRUNCATION_BRAKE_PROMPT =
+	'\n\nYou have now been cut off several times in a row, so stop writing one long answer. '
+	+ 'Do the work in small steps with your tools instead: make ONE tool call now — write or '
+	+ 'edit a single file, or run a single command — and keep any prose to a sentence or two.';
+
+/**
  * Injected when a step produces prose but no tool call. Models routinely narrate a
  * next action ("now I'll update the config") without performing it; treating that as
  * "finished" was the main cause of runs stopping mid-task. One nudge per quiet
@@ -283,6 +297,11 @@ export class AgentRunner {
 		const messages: ChatMessage[] = [...seed];
 		let truncationRounds = 0;
 		let emptyRounds = 0;
+		// Text carried across a max-token cutoff, plus how many provisional turns hold it in
+		// `messages`. The pieces are rejoined before the next step is judged, so a response
+		// the limit cut in half is read as the one answer the model meant to write.
+		let carry = '';
+		let carryTurns = 0;
 
 		for (let step = 0; step < this.maxSteps;) {
 			if (params.signal.aborted) {
@@ -300,7 +319,9 @@ export class AgentRunner {
 			// `canCompact` is checked separately from the result: "not enough middle yet"
 			// is transient and resolves as the run grows, so it must never be mistaken for
 			// a failure — doing so used to disable compaction for a whole run at step 0.
-			if (this.contextWindow && !this.compactionExhausted
+			// Never mid-continuation: the provisional turns below are spliced back out by
+			// index, and summarizing them away would also throw out the half-written answer.
+			if (this.contextWindow && !this.compactionExhausted && !carryTurns
 				&& shouldCompact(messages, this.contextWindow, this.contextBudget)
 				&& canCompact(messages, this.keepHead)) {
 				const compacted = await this.compact(messages, params);
@@ -329,8 +350,60 @@ export class AgentRunner {
 			}
 
 			callbacks.onStepStart();
-			const result = await this.step(messages, params, callbacks);
-			callbacks.onStepEnd(result.content);
+			const raw = await this.step(messages, params, callbacks);
+			callbacks.onStepEnd(raw.content);
+
+			// Rejoin the halves of a response the token limit split before judging it. A tool
+			// call the model wrote as text (`<tool_call>…`, a fenced JSON object) parses in
+			// neither half alone, so without this the model re-writes the same call every
+			// continuation round, gets cut at the same place, and the run dies on the round
+			// cap having done nothing — the "kept hitting its output limit" dead end.
+			const result = carry ? this.recoverTextToolCalls({ ...raw, content: carry + raw.content }) : raw;
+
+			// A provider-side block ends the run, but must never be mistaken for success.
+			if (result.finishReason === 'filtered' || result.finishReason === 'refused') {
+				return {
+					reason: result.finishReason,
+					detail: result.finishReason === 'filtered'
+						? 'The provider blocked this response with its content filter. Rephrase the request or switch models.'
+						: 'The model refused to continue with this request.',
+				};
+			}
+
+			// Cut off by the token limit mid-answer: resume where it stopped. This is the
+			// model making progress, so it doesn't spend a step of the budget.
+			if (!result.toolCalls.length && result.truncated) {
+				if (truncationRounds >= MAX_TRUNCATION_ROUNDS) {
+					return {
+						reason: 'truncated',
+						detail: `The model kept hitting its output limit after ${MAX_TRUNCATION_ROUNDS} continuations — it is writing one very long answer instead of working in steps. Raise "openvsChat.maxTokens", ask for a smaller piece of work, or switch to a model that uses tools.`,
+					};
+				}
+				truncationRounds++;
+				// The partial answer stays in the conversation so the model can resume it, but
+				// as ONE provisional turn rebuilt from the joined text each round — stacking a
+				// fragment per round would leave the pieces unjoinable for the recovery above.
+				messages.splice(messages.length - carryTurns, carryTurns);
+				carry = result.content;
+				// An empty assistant turn is never recorded: several backends reject one.
+				const provisional: ChatMessage[] = carry.trim() ? [{ role: 'assistant', content: carry }] : [];
+				const resume = truncationRounds >= TRUNCATION_BRAKE_ROUND
+					? CONTINUE_PROMPT + TRUNCATION_BRAKE_PROMPT
+					: CONTINUE_PROMPT;
+				provisional.push({ role: 'user', content: resume });
+				messages.push(...provisional);
+				carryTurns = provisional.length;
+				continue;
+			}
+
+			// The cutoff resolved (or never happened): the provisional turns give way to the
+			// single whole assistant turn recorded below.
+			if (carryTurns) {
+				messages.splice(messages.length - carryTurns, carryTurns);
+				carry = '';
+				carryTurns = 0;
+			}
+			truncationRounds = 0;
 
 			// An assistant turn with neither text nor tool calls carries nothing, and several
 			// backends reject an empty assistant message outright — so it is never recorded.
@@ -344,30 +417,7 @@ export class AgentRunner {
 				emptyRounds = 0;
 			}
 
-			// A provider-side block ends the run, but must never be mistaken for success.
-			if (result.finishReason === 'filtered' || result.finishReason === 'refused') {
-				return {
-					reason: result.finishReason,
-					detail: result.finishReason === 'filtered'
-						? 'The provider blocked this response with its content filter. Rephrase the request or switch models.'
-						: 'The model refused to continue with this request.',
-				};
-			}
-
 			if (!result.toolCalls.length) {
-				// Cut off by the token limit mid-answer: resume where it stopped. This is
-				// the model making progress, so it doesn't spend a step of the budget.
-				if (result.truncated) {
-					if (truncationRounds >= MAX_TRUNCATION_ROUNDS) {
-						return {
-							reason: 'truncated',
-							detail: `The model kept hitting its output limit after ${MAX_TRUNCATION_ROUNDS} continuations. Raise "openvsChat.maxTokens" or ask for a smaller piece of work.`,
-						};
-					}
-					truncationRounds++;
-					messages.push({ role: 'user', content: CONTINUE_PROMPT });
-					continue;
-				}
 				// No text AND no tool call is a lost turn, not a finished answer. Ending the
 				// run here is what made the chat go blank mid-task — the webview drops the
 				// empty bubble and `done` says nothing, so the user sees the work simply
@@ -398,7 +448,6 @@ export class AgentRunner {
 				return { reason: 'done' };
 			}
 
-			truncationRounds = 0;
 			// Real tool work means the model is engaged again: let every nudge reason arm
 			// itself afresh for the next quiet stretch.
 			this.nudgeCounts.clear();

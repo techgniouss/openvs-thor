@@ -145,6 +145,44 @@ const noopCallbacks = () => {
 	assert.match(result.detail, /maxTokens/, 'tells the user which setting to raise');
 }
 
+// 5b. A tool call the model wrote as text and the token limit cut in half is recovered
+// from the rejoined halves — neither half parses alone, which used to burn every
+// continuation round and end the run with nothing done.
+{
+	const provider = fakeProvider([
+		{ content: 'On it.\n<tool_call>{"name": "list_files", "argum', toolCalls: [], truncated: true },
+		{ content: 'ents": {"path": "."}}</tool_call>', toolCalls: [], truncated: false },
+		{ content: 'Listed them.', toolCalls: [] },
+		{ content: 'yes really', toolCalls: [] },
+	]);
+	const runner = new AgentRunner(provider, approver, 10);
+	const calls = [];
+	const cb = noopCallbacks();
+	cb.onToolStart = c => calls.push(c.name);
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, cb);
+	assert.strictEqual(result.reason, 'done');
+	assert.deepStrictEqual(calls, ['list_files'], 'the split tool call ran once');
+	// The conversation keeps ONE assistant turn for the rejoined answer, not a fragment
+	// per round plus the continuation prompts that carried them.
+	const sent = provider.seen.at(-1);
+	assert.deepStrictEqual(
+		sent.filter(m => m.startsWith('assistant:')),
+		['assistant:On it.', 'assistant:Listed them.'],
+		'the halves were merged into one assistant turn with the recovered call stripped',
+	);
+	assert.ok(!sent.some(m => m.includes('cut off mid-response')), 'the provisional continuation prompt is gone');
+}
+
+// 5c. Once continuations stop paying off, the resume prompt tells the model to change
+// tactics instead of repeating "continue" until the cap kills the run.
+{
+	const provider = fakeProvider(Array.from({ length: 40 }, () => ({ content: 'x', toolCalls: [], truncated: true })));
+	const runner = new AgentRunner(provider, approver, 10);
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.strictEqual(result.reason, 'truncated');
+	assert.match(provider.seen.at(-1).at(-1), /make ONE tool call now/, 'the later rounds push the model to use tools');
+}
+
 // 6. Exhausting the step budget reports `limit` with a recovery hint.
 {
 	const provider = fakeProvider(Array.from({ length: 20 }, (_, i) => ({
