@@ -215,17 +215,21 @@ html, body {
 	box-shadow: 0 0 42px color-mix(in srgb, var(--vscode-charts-blue, #4ea1ff) 22%, transparent);
 	animation: orb-float 5s ease-in-out infinite;
 }
+/* The bolt is drawn at full 24px viewBox scale, so the idle pulse also does the
+   sizing — it must live in the keyframes, since a CSS transform animation would
+   override any `transform` presentation attribute on the path. */
 .empty-orb .spark {
+	color: var(--vscode-charts-yellow, #e2c08d);
 	animation: spark-pulse 2.4s ease-in-out infinite;
-	transform-origin: 12px 10.5px;
+	transform-origin: 12px 12px;
 }
 @keyframes orb-float {
 	0%, 100% { transform: translateY(0); }
 	50% { transform: translateY(-7px); }
 }
 @keyframes spark-pulse {
-	0%, 100% { opacity: 0.35; transform: scale(0.8); }
-	50% { opacity: 1; transform: scale(1.12); }
+	0%, 100% { opacity: 0.4; transform: scale(0.44); }
+	50% { opacity: 1; transform: scale(0.56); }
 }
 .empty-title {
 	font-size: 1.35em;
@@ -297,13 +301,20 @@ html, body {
 	background: var(--vscode-inputValidation-errorBackground, rgba(255, 0, 0, 0.1));
 	border: 1px solid var(--vscode-inputValidation-errorBorder, transparent);
 }
+/* Streaming caret: a crackling bolt instead of a block cursor. */
 .message.streaming .body::after {
-	content: '▋';
-	animation: blink 1s steps(2, start) infinite;
-	color: var(--vscode-descriptionForeground);
+	content: '⚡';
+	font-size: 0.9em;
+	animation: bolt-crackle 1.4s steps(1, end) infinite;
+	color: var(--vscode-charts-yellow, #e2c08d);
+	text-shadow: 0 0 6px color-mix(in srgb, var(--vscode-charts-yellow, #e2c08d) 60%, transparent);
 }
-@keyframes blink {
-	to { visibility: hidden; }
+@keyframes bolt-crackle {
+	0%, 44% { opacity: 1; }
+	50%, 60% { opacity: 0.15; }
+	66% { opacity: 1; }
+	72%, 82% { opacity: 0.15; }
+	88%, 100% { opacity: 1; }
 }
 
 .body pre {
@@ -715,6 +726,15 @@ body.settings-window #settingsPanel {
 	border-radius: 0 4px 4px 0;
 }
 .tool.running { opacity: 0.85; }
+/* A tool call is the longest wait in an agent run — crackle so it never reads as
+   stalled. Done via ::before so the summary's textContent stays exactly
+   'running…', which the stop/cleanup path compares against. */
+.tool.running > details > .tool-summary::before {
+	content: '⚡';
+	margin-right: 4px;
+	color: var(--vscode-charts-yellow, #e2c08d);
+	animation: bolt-crackle 1.4s steps(1, end) infinite;
+}
 .tool.tool-error { border-left-color: var(--vscode-inputValidation-errorBorder, #f14c4c); }
 .tool-head { font-size: 0.85em; font-weight: 600; margin-bottom: 4px; }
 .tool-out {
@@ -1039,6 +1059,67 @@ details.thinking > summary:hover { color: var(--vscode-foreground); }
 	flex-wrap: wrap;
 	color: var(--vscode-descriptionForeground);
 }
+/* Fixed slot. The glyphs are not all the same shape — Stormbreaker is tall and narrow,
+   the rest are square — so without a pinned box the verb after it would jump sideways
+   every time the glyph rotates. */
+.working-glyph {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	align-self: center;
+	width: 22px;
+	height: 22px;
+	line-height: 0;
+}
+/* One animation per glyph: Mjolnir swings, the bolt strikes, the helm hovers. */
+.thor-glyph { display: block; }
+.thor-glyph.hammer {
+	/* Percentages, not px: transform-origin resolves against the rendered element box,
+	   not the glyph's viewBox units, so px values silently drift if the size changes.
+	   50% 96% is the pommel — Mjolnir swings from the butt of the handle.
+	   No colour override: it inherits the surrounding text colour so the outline stays
+	   theme-correct, leaving the handle's red as the only accent. */
+	transform-origin: 50% 96%;
+	animation: mjolnir-swing 1.8s ease-in-out infinite;
+}
+.thor-glyph.stormbreaker {
+	transform-origin: 50% 92%;
+	animation: mjolnir-swing 2.1s ease-in-out infinite;
+}
+.thor-glyph.bolt {
+	color: var(--vscode-charts-yellow, #e2c08d);
+	filter: drop-shadow(0 0 4px color-mix(in srgb, var(--vscode-charts-yellow, #e2c08d) 55%, transparent));
+	animation: bolt-strike 1.5s steps(1, end) infinite;
+}
+/* No colour rule: the helm carries its own fills. The bolt keeps one because the same
+   class also renders the flat currentColor mark on collapsed reasoning blocks. */
+.thor-glyph.helm {
+	animation: helm-hover 2.4s ease-in-out infinite;
+}
+/* Inline marks on finished content (a closed reasoning block) sit still. */
+.thor-glyph.still {
+	display: inline-block;
+	animation: none;
+	filter: none;
+	vertical-align: -1px;
+	opacity: 0.85;
+}
+@keyframes mjolnir-swing {
+	0%, 100% { transform: rotate(-16deg); }
+	42% { transform: rotate(14deg); }
+	52% { transform: rotate(9deg) translateY(1px); }
+}
+@keyframes bolt-strike {
+	0%, 30% { opacity: 1; transform: scale(1); }
+	38%, 46% { opacity: 0.2; transform: scale(0.9); }
+	54% { opacity: 1; transform: scale(1.15); }
+	62%, 74% { opacity: 0.3; transform: scale(0.95); }
+	82%, 100% { opacity: 1; transform: scale(1); }
+}
+@keyframes helm-hover {
+	0%, 100% { transform: translateY(1px); opacity: 0.7; }
+	50% { transform: translateY(-2px); opacity: 1; }
+}
 .working-word {
 	font-style: italic;
 	animation: working-breathe 1.6s ease-in-out infinite;
@@ -1062,6 +1143,8 @@ details.thinking > summary:hover { color: var(--vscode-foreground); }
 }
 @media (prefers-reduced-motion: reduce) {
 	.working-word { animation: none; }
+	.thor-glyph { animation: none; opacity: 1; }
+	.message.streaming .body::after { animation: none; }
 }
 
 /* ---- Agent task checklist ---- */
