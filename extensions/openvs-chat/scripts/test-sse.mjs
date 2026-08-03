@@ -174,4 +174,143 @@ assert.strictEqual(m.normalizeFinishReason(undefined), undefined);
 	assert.deepStrictEqual(out, { text: 'part one part two', truncated: false });
 }
 
+// --- repeat-loop guard ----------------------------------------------------------
+// The signature of a model stuck in a loop, and the near misses that must not trip it.
+{
+	const bullet = "- Unused variable 'e' etc; ignore.\n";
+	const cycle = '- The first of the pair.\n- The second of the pair.\n';
+	assert.deepStrictEqual([
+		m.endsInRepeatLoop(bullet.repeat(9)),
+		// Mid-stream, the last line is a half-written copy of the one above it.
+		m.endsInRepeatLoop(bullet.repeat(9) + "- Unused variable 'e' etc; ig"),
+		// A cycle of lines is the same failure; it needs fewer repeats to be unmistakable.
+		m.endsInRepeatLoop(cycle.repeat(5)),
+		m.endsInRepeatLoop(bullet.repeat(4)),
+		m.endsInRepeatLoop(cycle.repeat(2)),
+		// Formatting, not a loop: closing braces and table rules repeat legitimately.
+		m.endsInRepeatLoop('}\n'.repeat(12)),
+		m.endsInRepeatLoop('| --- |\n'.repeat(12)),
+		// A loop the model pulled out of is not a loop any more.
+		m.endsInRepeatLoop(bullet.repeat(9) + 'So: three real findings, listed above.\nDone.'),
+		m.endsInRepeatLoop(''),
+	], [true, true, true, false, false, false, false, false, false]);
+}
+
+// A loop that fills its budget arrives as a max-token cutoff, indistinguishable from a
+// long answer being clipped — so the continuation rounds used to hand it another budget,
+// eight times over. It must be stopped at the first cutoff instead, with a notice.
+{
+	const line = 'The same sentence, over and over.\n';
+	let calls = 0;
+	const notices = [];
+	const looper = {
+		info: { id: 'p', label: 'P', supportsAssistantPrefill: true },
+		async streamChat(request) {
+			calls++;
+			request.onToken(line.repeat(9));
+			return { truncated: true };
+		},
+		async listModels() { return []; },
+	};
+	const out = await m.streamChatWithContinuation(looper, {
+		messages: [{ role: 'user', content: 'hi' }],
+		model: 'm', apiKey: 'k', baseUrl: 'u', maxTokens: 10, signal: never,
+		onToken: () => { },
+		onNotice: text => notices.push(text),
+	});
+	assert.deepStrictEqual(
+		[calls, out.truncated, out.text === line.repeat(9), notices.length],
+		[1, false, true, 1],
+		'a repeating reply is returned as-is after one call, not continued');
+}
+
+// Mid-stream: the guard aborts the provider rather than letting the loop run to the end of
+// its budget, and what streamed before the abort is kept.
+{
+	const line = 'The same sentence, over and over.\n';
+	const seen = [];
+	let aborted = false;
+	const streamer = {
+		info: { id: 'p', label: 'P', supportsAssistantPrefill: true },
+		async streamChat(request) {
+			for (let i = 0; i < 400; i++) {
+				if (request.signal.aborted) { aborted = true; break; }
+				request.onToken(line);
+			}
+			if (request.signal.aborted) {
+				throw new DOMException('Aborted', 'AbortError');
+			}
+			return { truncated: false };
+		},
+		async listModels() { return []; },
+	};
+	const out = await m.streamChatWithContinuation(streamer, {
+		messages: [{ role: 'user', content: 'hi' }],
+		model: 'm', apiKey: 'k', baseUrl: 'u', maxTokens: 10, signal: never,
+		onToken: delta => seen.push(delta),
+		onNotice: () => { },
+	});
+	assert.deepStrictEqual(
+		[aborted, seen.length < 400, out.text.startsWith(line), out.truncated],
+		[true, true, true, false],
+		'the loop is cut off mid-stream and its text is kept');
+}
+
+// The mid-stream scan only ever looks at a bounded tail, so a loop that starts after a
+// legitimate first round is still caught — the earlier text and the new chunk have to be
+// stitched together for that, which is the part a naive tail-of-the-chunk check misses.
+{
+	const line = 'The same sentence, over and over.\n';
+	let calls = 0;
+	const notices = [];
+	const provider = {
+		info: { id: 'p', label: 'P', supportsAssistantPrefill: true },
+		async streamChat(request) {
+			calls++;
+			if (calls === 1) {
+				request.onToken('A long and perfectly sensible answer. '.repeat(200));
+				return { truncated: true };
+			}
+			// Delivered in small pieces so the scan runs on the stitched tail, not one chunk.
+			for (let i = 0; i < 40; i++) {
+				if (request.signal.aborted) { throw new DOMException('Aborted', 'AbortError'); }
+				request.onToken(line);
+			}
+			return { truncated: false };
+		},
+		async listModels() { return []; },
+	};
+	const out = await m.streamChatWithContinuation(provider, {
+		messages: [{ role: 'user', content: 'hi' }],
+		model: 'm', apiKey: 'k', baseUrl: 'u', maxTokens: 10, signal: never,
+		onToken: () => { },
+		onNotice: text => notices.push(text),
+	});
+	assert.deepStrictEqual(
+		[calls, notices.length, out.truncated, out.text.startsWith('A long and')],
+		[2, 1, false, true],
+		'a loop that begins in a continuation round is caught too');
+}
+
+// The user's own Stop still surfaces as an abort, even from inside a repeating response —
+// swallowing it would report a cancelled run as a completed one.
+{
+	const line = 'The same sentence, over and over.\n';
+	const controller = new AbortController();
+	const stopper = {
+		info: { id: 'p', label: 'P', supportsAssistantPrefill: true },
+		async streamChat(request) {
+			request.onToken(line.repeat(9));
+			controller.abort();
+			throw new DOMException('Aborted', 'AbortError');
+		},
+		async listModels() { return []; },
+	};
+	await assert.rejects(() => m.streamChatWithContinuation(stopper, {
+		messages: [{ role: 'user', content: 'hi' }],
+		model: 'm', apiKey: 'k', baseUrl: 'u', maxTokens: 10, signal: controller.signal,
+		onToken: () => { },
+	}), err => m.isAbortError(err));
+}
+
 console.log('test-sse: all assertions passed');

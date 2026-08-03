@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { ChatMessage } from '../providers/types';
+import { ChatMessage, ToolSpec } from '../providers/types';
 
 /**
  * Conversation-window management. A long agent run accumulates every file it read and
@@ -46,6 +46,28 @@ function estimateMessageTokens(m: ChatMessage): number {
 	// doesn't sail past the budget undetected.
 	for (const img of m.images ?? []) {
 		total += estimateTokens(img.data);
+	}
+	return total;
+}
+
+/**
+ * Estimated token cost of the tool schemas, which every agent request carries alongside
+ * the conversation.
+ *
+ * Counted because they are not free and not small: the built-in set alone serializes to
+ * roughly 1.9k tokens, and a connected MCP server can add several times that with no
+ * upper bound. Budgeting against the messages alone therefore understated every agent
+ * request by a fixed amount — enough, on a 32k-window model, to push a request the budget
+ * called safe over the real limit, which costs a wasted round trip on the halve-and-retry
+ * path and delays compaction that should already have run.
+ */
+export function estimateToolsTokens(tools: ToolSpec[]): number {
+	let total = 0;
+	for (const tool of tools) {
+		// Serialized rather than measured field by field: the JSON punctuation of a nested
+		// parameter schema is most of its cost, and omitting it would repeat the original
+		// mistake at a smaller scale.
+		total += estimateTokens(JSON.stringify({ name: tool.name, description: tool.description, parameters: tool.parameters }));
 	}
 	return total;
 }

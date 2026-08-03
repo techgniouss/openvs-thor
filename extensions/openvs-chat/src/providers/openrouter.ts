@@ -46,11 +46,24 @@ export class OpenRouterProvider extends OpenAICompatibleProvider {
 			'claude', 'gpt-4o', 'gpt-4\\.1', 'gpt-5', '^openai/o[0-9]',
 			'gemini', 'pixtral', '-vl', 'vision', 'omni', 'llama-3\\.2',
 		],
+		// OpenAI/Grok/DeepSeek models behind OpenRouter are cached automatically; Anthropic
+		// and Gemini ones are cached from the breakpoints below. Either way a long agent
+		// conversation is not the per-step cost it would be on an uncached gateway.
+		cachesPrompts: true,
 	};
 
 	protected override extraHeaders(): Record<string, string> {
 		// App attribution headers recommended by OpenRouter (shown on their rankings).
 		return { 'HTTP-Referer': 'https://github.com/openvs', 'X-Title': 'OpenVS Thor' };
+	}
+
+	/**
+	 * Anthropic and Gemini cache only what they are told to; every other upstream OpenRouter
+	 * fronts caches a repeated prefix on its own. Sending breakpoints to those would be
+	 * harmless but pointless, so the conversion is spent only where it buys something.
+	 */
+	protected override wantsCacheBreakpoints(model: string): boolean {
+		return /^(anthropic|google)\//i.test(model);
 	}
 
 	/**

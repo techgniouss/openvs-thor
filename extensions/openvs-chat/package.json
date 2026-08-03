@@ -419,6 +419,21 @@
           "default": true,
           "description": "%config.agent.parallelResearch%"
         },
+        "openvsChat.agent.parallelReads": {
+          "type": "boolean",
+          "default": true,
+          "description": "%config.agent.parallelReads%"
+        },
+        "openvsChat.agent.maxRunMinutes": {
+          "type": "number",
+          "default": 30,
+          "description": "%config.agent.maxRunMinutes%"
+        },
+        "openvsChat.agent.traceTiming": {
+          "type": "boolean",
+          "default": false,
+          "description": "%config.agent.traceTiming%"
+        },
         "openvsChat.rules": {
           "type": "string",
           "editPresentation": "multilineText",

@@ -291,21 +291,10 @@ html, body {
 	background: var(--vscode-inputValidation-errorBackground, rgba(255, 0, 0, 0.1));
 	border: 1px solid var(--vscode-inputValidation-errorBorder, transparent);
 }
-/* Streaming caret: a crackling bolt instead of a block cursor. */
-.message.streaming .body::after {
-	content: '⚡';
-	font-size: 0.9em;
-	animation: bolt-crackle 1.4s steps(1, end) infinite;
-	color: var(--vscode-charts-yellow, #e2c08d);
-	text-shadow: 0 0 6px color-mix(in srgb, var(--vscode-charts-yellow, #e2c08d) 60%, transparent);
-}
-@keyframes bolt-crackle {
-	0%, 44% { opacity: 1; }
-	50%, 60% { opacity: 0.15; }
-	66% { opacity: 1; }
-	72%, 82% { opacity: 0.15; }
-	88%, 100% { opacity: 1; }
-}
+/* No streaming caret on the bubble: a ::after on the body is laid out after the last
+   block child, so it never trailed the text as a caret — it sat on its own line under
+   the answer (or under the reasoning pill) for the whole run. The working strip already
+   carries an animated Thor glyph and a live verb, so the bolt was duplicate motion. */
 
 .body pre {
 	background: var(--vscode-textCodeBlock-background, rgba(127, 127, 127, 0.15));
@@ -746,6 +735,13 @@ details[open] > .tool-summary { margin-bottom: 4px; }
    Collapsed by default: a run's thinking dwarfs its answer, so it shows as a single
    muted line ("✻ Thought for 12s") until the user opens it. */
 details.thinking { margin: 4px 0; }
+/* A turn that has only produced reasoning so far is one small pill — and the pill carries
+   its own chip background, so the bubble's padded grey frame around it read as a big empty
+   box. Drop the frame until the answer itself arrives. */
+.message .body:has(> details.thinking:only-child) {
+	padding: 0;
+	background: transparent;
+}
 details.thinking > summary {
 	font-size: 0.85em; cursor: pointer; user-select: none; list-style: none;
 	color: var(--vscode-descriptionForeground);
@@ -1142,7 +1138,6 @@ details.thinking > summary:hover { color: var(--vscode-foreground); }
 @media (prefers-reduced-motion: reduce) {
 	.working-word { animation: none; }
 	.thor-glyph { animation: none; opacity: 1; }
-	.message.streaming .body::after { animation: none; }
 	.empty-hero { animation: none; }
 }
 

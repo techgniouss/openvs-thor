@@ -51,6 +51,9 @@ export class AnthropicProvider implements ChatProvider {
 		// The Messages API continues a trailing assistant turn in place (prefill),
 		// which gives seamless auto-continuation after a max-token cutoff.
 		supportsAssistantPrefill: true,
+		// Explicit breakpoints are sent on the system block and the last message block —
+		// see `buildSystem` and `withCacheBreakpoint`.
+		cachesPrompts: true,
 	};
 
 	private url(baseUrl: string, path: string): string {

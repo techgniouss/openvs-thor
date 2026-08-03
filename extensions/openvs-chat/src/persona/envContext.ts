@@ -12,7 +12,23 @@ const MAX_CHARS = 1_500;
 const MAX_STATUS_LINES = 20;
 const MAX_OPEN_TABS = 15;
 
-let cached: { at: number; text: string } | undefined;
+/**
+ * The environment snapshot, split by how often it changes.
+ *
+ * `stable` goes in the system prompt, where it belongs: it is the same for the whole
+ * session. `volatile` must not, and that is not a stylistic preference — the system prompt
+ * is the head of every request, and it is exactly the prefix a caching backend matches on.
+ * Git status changes the moment the agent writes a file and the open-tab list changes when
+ * the user clicks a tab, so leaving either in the system prompt meant the next turn of a
+ * conversation missed the cache entirely and re-read the whole history at full price. It is
+ * placed just ahead of the newest request instead, where everything before it still matches.
+ */
+interface EnvContext {
+	readonly stable: string;
+	readonly volatile: string;
+}
+
+let cached: { at: number; env: EnvContext } | undefined;
 
 /** Runs git with the given args in `cwd`, resolving to stdout or '' on any failure. */
 function git(cwd: string, args: string[]): Promise<string> {
@@ -55,20 +71,22 @@ function openTabs(): string[] {
 }
 
 /**
- * Builds the environment snapshot injected into every system prompt (Claude Code
- * style): workspace root, platform, date, git branch/status, open editor tabs.
+ * Builds the environment snapshot (Claude Code style): workspace root, platform, date and
+ * git branch as {@link EnvContext.stable}; working-tree status and open editor tabs as
+ * {@link EnvContext.volatile}.
  * Every probe fails soft (section omitted); result is cached for {@link CACHE_MS}
- * and hard-capped at {@link MAX_CHARS} characters. Git probes are skipped entirely
+ * and each half is hard-capped at {@link MAX_CHARS} characters. Git probes are skipped entirely
  * in untrusted workspaces (a malicious repo's `.git/config` can turn `git status`
  * into code execution), and all repo-derived strings (branch, status lines, open
  * tab paths) are sanitized to strip ANSI escapes and control characters before
  * being injected into the prompt.
  */
-export async function buildEnvContext(): Promise<string> {
+export async function buildEnvContext(): Promise<EnvContext> {
 	if (cached && Date.now() - cached.at < CACHE_MS) {
-		return cached.text;
+		return cached.env;
 	}
 	const lines: string[] = [];
+	const volatileLines: string[] = [];
 	const folders = vscode.workspace.workspaceFolders ?? [];
 	const root = folders[0]?.uri;
 	if (root?.scheme === 'file') {
@@ -97,25 +115,31 @@ export async function buildEnvContext(): Promise<string> {
 		const cwd = root.fsPath;
 		const branch = sanitize(await git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD'])).split('\n')[0].slice(0, 100);
 		if (branch) {
+			// The branch is stable for the session; its working-tree status is not — it changes
+			// with every file the agent writes, which is both a cache-buster and, mid-run,
+			// simply out of date.
 			lines.push(`Git branch: ${branch}`);
 			const status = await git(cwd, ['status', '--porcelain']);
 			if (status) {
 				const statusLines = sanitize(status).split('\n').map(l => l.slice(0, 200));
 				const shown = statusLines.slice(0, MAX_STATUS_LINES);
 				const more = statusLines.length > shown.length ? `\n… ${statusLines.length - shown.length} more` : '';
-				lines.push(`Git status:\n${shown.join('\n')}${more}`);
+				volatileLines.push(`Git status:\n${shown.join('\n')}${more}`);
 			} else {
-				lines.push('Git status: clean');
+				volatileLines.push('Git status: clean');
 			}
 		}
 	}
 
 	const tabs = openTabs();
 	if (tabs.length) {
-		lines.push(`Open editors (active first): ${tabs.join(', ')}`);
+		volatileLines.push(`Open editors (active first): ${tabs.join(', ')}`);
 	}
 
-	const text = lines.join('\n').slice(0, MAX_CHARS);
-	cached = { at: Date.now(), text };
-	return text;
+	const env: EnvContext = {
+		stable: lines.join('\n').slice(0, MAX_CHARS),
+		volatile: volatileLines.join('\n').slice(0, MAX_CHARS),
+	};
+	cached = { at: Date.now(), env };
+	return env;
 }

@@ -365,12 +365,15 @@
 	function renderMarkdown(text) {
 		let rest = String(text);
 		let html = '';
+		// An empty segment is not blank prose: renderBlocks turns '' into a <br />, so the
+		// usual case — reasoning opening the turn, with nothing before it — used to render a
+		// stray line break above the block and another below every closed one.
 		for (let i = 0; ; i++) {
 			const open = rest.indexOf(THINK_OPEN);
 			if (open === -1) {
-				return html + renderProse(rest);
+				return html + (rest ? renderProse(rest) : '');
 			}
-			html += renderProse(rest.slice(0, open));
+			if (open > 0) { html += renderProse(rest.slice(0, open)); }
 			const after = rest.slice(open + THINK_OPEN.length);
 			const close = after.indexOf(THINK_CLOSE);
 			// No closing marker yet: the block is still streaming (or the stream died in it).
@@ -658,7 +661,12 @@
 		// Cards append straight into the transcript, which would leave them below the
 		// working strip — the run is still going, so the strip has to stay at the foot.
 		container: { appendChild: node => { els.messages.appendChild(node); keepWorkingLast(); } },
-		post: m => vscode.postMessage(m),
+		// Answering a card hands the wait back to the model, so the strip's clock starts
+		// over — the seconds the user spent reading a diff are not the model being slow.
+		post: m => {
+			if (m && m.type === 'promptResponse') { noteWorkingProgress(); }
+			vscode.postMessage(m);
+		},
 		scroll: () => scrollToBottom(),
 	});
 
@@ -1540,11 +1548,43 @@
 		return glyph;
 	}
 
+	/**
+	 * When the wait now on the clock began. Reset on every sign of progress rather than
+	 * once per run: a run that streams, calls ten tools and streams again is not one wait,
+	 * and reporting it as one produced numbers like "1059s" that say nothing about whether
+	 * anything is stuck. What the user is actually asking the strip is "how long has *this*
+	 * been going", so that is what it counts.
+	 */
+	let workingSince = 0;
+	/** Whether the provider-queue hint is currently on the strip. */
+	let workingHintShown = false;
+
 	function stopWorking() {
 		clearInterval(workingTimer);
 		workingTimer = 0;
 		workingEl?.remove();
 		workingEl = null;
+		workingHintShown = false;
+	}
+
+	/**
+	 * Restarts the strip's clock — something visibly happened (a token, a tool starting or
+	 * finishing, a new phase). Also retracts the "still queued at the provider" hint, which
+	 * is a claim about silence and is simply false once output is moving again.
+	 */
+	function noteWorkingProgress() {
+		if (!workingEl) { return; }
+		workingSince = Date.now();
+		if (workingHintShown) {
+			workingEl.querySelector('.working-hint')?.remove();
+			workingHintShown = false;
+		}
+	}
+
+	/** Seconds as a clock a human reads at a glance: past a minute, "17m 39s" not "1059s". */
+	function formatElapsed(secs) {
+		if (secs < 60) { return `${secs}s`; }
+		return `${Math.floor(secs / 60)}m ${secs % 60}s`;
 	}
 
 	/** Keeps the strip at the foot of the transcript as bubbles and tool blocks land. */
@@ -1563,21 +1603,22 @@
 	 * only sign of life left was the caret. The strip lives as long as the run does, so
 	 * the verb and the rotating Thor glyph stay on screen across streaming and tool calls.
 	 *
-	 * Idempotent: every agent step re-opens a stream, and the elapsed clock is the run's,
-	 * not the step's, so a second call re-anchors the existing strip instead of restarting it.
+	 * Idempotent: every agent step re-opens a stream, so a second call re-anchors the
+	 * existing strip instead of building a new one. The clock it shows is not this
+	 * function's business — `noteWorkingProgress` owns it, and restarts it per wait.
 	 */
 	function startWorking() {
 		if (workingEl) {
 			// A transcript rebuild (tab switch, history restore) empties #messages and
 			// detaches the strip without the run having ended. Re-attach the same element
-			// rather than building a new one, so the elapsed clock keeps counting the run
-			// instead of restarting from zero every time the user looks away.
+			// rather than building a new one, so the clock keeps counting the wait in
+			// progress instead of restarting from zero every time the user looks away.
 			if (!workingEl.isConnected) { els.messages.appendChild(workingEl); }
 			keepWorkingLast();
 			return;
 		}
 		stopWorking();
-		const started = Date.now();
+		workingSince = Date.now();
 		const el = document.createElement('div');
 		el.className = 'working';
 		el.innerHTML = '<span class="working-glyph"></span><span class="working-word"></span><span class="working-meta"></span>';
@@ -1593,15 +1634,18 @@
 		// never matches and the glyph was being rewritten every tick — which restarted the
 		// CSS animation each second, so the swing/hover never played through.
 		let drawn = '';
-		let hintShown = false;
 		const render = () => {
-			const secs = Math.floor((Date.now() - started) / 1000);
+			const secs = Math.floor((Date.now() - workingSince) / 1000);
 			if (drawn !== glyph) { glyphEl.innerHTML = glyph; drawn = glyph; }
 			wordEl.textContent = `${word}…`;
-			metaEl.textContent = secs >= 8 ? ` ${secs}s` : '';
+			metaEl.textContent = secs >= 8 ? ` ${formatElapsed(secs)}` : '';
 			// Long silence is almost always the provider-side free-tier queue: say so once.
-			if (secs >= 25 && !hintShown) {
-				hintShown = true;
+			// 25s of *silence*, not of run time — mid-run this used to accuse the provider of
+			// queueing while tool output was actively scrolling past. An open approval or
+			// question card is the other false positive: there the run is blocked on the
+			// user, who is looking at the card the hint would be talking over.
+			if (secs >= 25 && !workingHintShown && !prompts.size()) {
+				workingHintShown = true;
 				const hint = document.createElement('span');
 				hint.className = 'working-hint';
 				hint.textContent = 'Still queued at the provider — free-tier models can take a minute or two when busy. Consistently slow? Try a smaller model or another provider.';
@@ -1634,6 +1678,8 @@
 			// status, an empty bubble is a grey box with a lone caret in it.
 			activeAssistantBody.parentElement?.classList.add('streaming', 'awaiting');
 			startWorking();
+			// Agent steps and Auto phases re-open a stream mid-run; that is a new wait.
+			noteWorkingProgress();
 		}
 	}
 
@@ -2194,6 +2240,7 @@
 				if (s.pending === null) { openStream(s); }
 				s.pending += msg.delta;
 				if (s.id === activeSessionId && activeAssistantBody) {
+					noteWorkingProgress();
 					scheduleStreamRender(s);
 				}
 				break;
@@ -2204,6 +2251,7 @@
 				if (!s) { break; }
 				commitPending(s);
 				if (s.id === activeSessionId) {
+					noteWorkingProgress();
 					appendPhaseHeader(msg.label, msg.provider, msg.model, msg.source);
 				}
 				if (msg.streaming) { openStream(s); }
@@ -2240,6 +2288,7 @@
 				commitPending(s);
 				// Tool blocks are rendered live only for the visible tab.
 				if (s.id === activeSessionId) {
+					noteWorkingProgress();
 					const el = appendToolEl(msg.name, msg.args);
 					toolEls.set(toolKey(s.id, msg.id || ('t' + (toolSeq++))), el);
 				}
@@ -2253,6 +2302,9 @@
 				const prefix = toolKey(s.id, '');
 				const key = msg.id ? toolKey(s.id, msg.id) : [...toolEls.keys()].find(k => k.startsWith(prefix));
 				const t = key ? toolEls.get(key) : undefined;
+				// Outside the block lookup: a tool that started while this tab was in the
+				// background has no block here, but its finishing is still progress.
+				noteWorkingProgress();
 				if (key && t) {
 					t.wrap.classList.remove('running');
 					t.wrap.classList.toggle('tool-error', !!msg.isError);
@@ -2273,6 +2325,7 @@
 				if (!s) { break; }
 				commitPending(s);
 				if (s.id === activeSessionId) {
+					noteWorkingProgress();
 					prompts.render(msg);
 				} else {
 					// Belongs to a background tab: remember it so switching there draws it,

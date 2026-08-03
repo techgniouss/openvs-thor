@@ -172,4 +172,23 @@ for (const msg of [
 	assert.strictEqual(m.trimMessages(small, 1_000_000), small, 'a fitting conversation is not copied');
 }
 
+// The tool schemas ride along with every agent request, so they have to be charged against
+// the same budget. Counting only the messages understated every request by a fixed amount.
+{
+	const tools = [
+		{
+			name: 'read_file',
+			description: 'Read a file from the workspace.',
+			parameters: { type: 'object', properties: { path: { type: 'string', description: 'Workspace-relative path.' } }, required: ['path'] },
+		},
+		{ name: 'noop', description: '', parameters: { type: 'object', properties: {} } },
+	];
+	assert.strictEqual(m.estimateToolsTokens([]), 0, 'no tools cost nothing');
+	// The nested parameter schema is most of the cost, so a tool with one is worth several
+	// times one without — the reason this is measured on the serialized form.
+	const [described, bare] = tools.map(t => m.estimateToolsTokens([t]));
+	assert.ok(described > bare * 2, 'a real parameter schema dominates the estimate');
+	assert.strictEqual(m.estimateToolsTokens(tools), described + bare, 'tools sum');
+}
+
 console.log('test-context: all assertions passed');

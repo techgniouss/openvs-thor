@@ -74,6 +74,19 @@ function fakeProvider(steps) {
 	};
 }
 
+const m = await import(new URL('../out/agent/context.js', import.meta.url));
+const { loadGuardrails } = await import(new URL('../out/agent/guardrails.js', import.meta.url));
+/** The default guardrails, spread into per-test overrides so only the policy varies. */
+const guardrails = loadGuardrails();
+
+/** `n` steps that each make one harmless tool call, for exercising the step budget. */
+function busySteps(n) {
+	return Array.from({ length: n }, (_, i) => ({
+		content: '',
+		toolCalls: [{ id: `c${i}`, name: 'list_files', args: { path: '.' } }],
+	}));
+}
+
 const approver = { confirm: async () => ({ approved: true }), ask: async () => '' };
 const params = { model: 'm', apiKey: 'k', baseUrl: 'u', maxTokens: 100, signal: new AbortController().signal };
 const noopCallbacks = () => {
@@ -162,6 +175,21 @@ const noopCallbacks = () => {
 	assert.match(result.detail, /maxTokens/, 'tells the user which setting to raise');
 }
 
+// 5a. A model looping on one line runs out of output budget doing it, which arrives as a
+// truncated step — identical to a long answer being clipped. Resuming it hands the loop
+// another budget every round, so the run ends instead.
+{
+	const looped = "- Unused variable 'e' etc; ignore.\n".repeat(9);
+	const provider = fakeProvider([
+		{ content: looped, toolCalls: [], truncated: true },
+		{ content: looped, toolCalls: [], truncated: true },
+	]);
+	const runner = new AgentRunner(provider, approver, 10);
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.strictEqual(result.reason, 'stalled');
+	assert.strictEqual(provider.seen.length, 1, 'the repeating step is not resumed');
+}
+
 // 5b. A tool call the model wrote as text and the token limit cut in half is recovered
 // from the rejoined halves — neither half parses alone, which used to burn every
 // continuation round and end the run with nothing done.
@@ -200,17 +228,41 @@ const noopCallbacks = () => {
 	assert.match(provider.seen.at(-1).at(-1), /make ONE tool call now/, 'the later rounds push the model to use tools');
 }
 
-// 6. Exhausting the step budget reports `limit` with a recovery hint.
+// 6. Exhausting the step budget reports `limit` with a recovery hint. Under a policy that
+// still asks (`always`), the cap is the cap — stopping to be told "continue" is the point.
 {
-	const provider = fakeProvider(Array.from({ length: 20 }, (_, i) => ({
-		content: '',
-		toolCalls: [{ id: `c${i}`, name: 'list_files', args: { path: '.' } }],
-	})));
-	const runner = new AgentRunner(provider, approver, 3);
+	const provider = fakeProvider(busySteps(20));
+	const runner = new AgentRunner(provider, approver, 3, { guardrails: { ...guardrails, approval: 'always' } });
 	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
 	assert.strictEqual(result.reason, 'limit');
+	assert.strictEqual(provider.seen.length, 3, 'a policy that asks stops at the cap');
 	assert.match(result.detail, /3-step limit/);
 	assert.match(result.detail, /continue/i, 'tells the user how to resume');
+}
+
+// 6a. Full Auto extends itself instead: the user already said not to ask, so pausing at the
+// cap to collect the word "continue" is a prompt in all but name. It still ends at a hard
+// ceiling, and says out loud each time it goes past a budget.
+{
+	const provider = fakeProvider(busySteps(100));
+	const cb = noopCallbacks();
+	const runner = new AgentRunner(provider, approver, 3, { guardrails: { ...guardrails, approval: 'yolo' } });
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, cb);
+	assert.strictEqual(result.reason, 'limit');
+	assert.strictEqual(provider.seen.length, 6, 'runs to 2x the budget, then stops for good');
+	assert.strictEqual(cb.notes.filter(n => /Full Auto keeps going/.test(n)).length, 1,
+		'one notice per extension, not one per step');
+	assert.match(result.detail, /hard ceiling of 6 steps/);
+}
+
+// 6b. A sub-agent never extends: its budget is a share of its parent's, and doubling it
+// at every level multiplies out across the tree.
+{
+	const provider = fakeProvider(busySteps(20));
+	const runner = new AgentRunner(provider, approver, 3, { guardrails: { ...guardrails, approval: 'yolo' }, depth: 1 });
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.strictEqual(result.reason, 'limit');
+	assert.strictEqual(provider.seen.length, 3, 'depth > 0 stops at the plain cap');
 }
 
 // 7. A provider-side content block is reported, never mistaken for a finished answer.
@@ -253,8 +305,8 @@ const noopCallbacks = () => {
 	);
 }
 
-// 11. Auto-compaction: when the conversation passes 70% of contextWindow, the runner
-// summarizes old turns via streamChat before the next step.
+// 11. Auto-compaction: when the conversation passes the provider's share of contextWindow,
+// the runner summarizes old turns via streamChat before the next step.
 {
 	const big = 'x'.repeat(60_000); // ~15k estimated tokens per message
 	let streamChatCalls = 0;
@@ -272,7 +324,8 @@ const noopCallbacks = () => {
 			return { content: 'done', toolCalls: [], truncated: false };
 		},
 	};
-	// contextWindow 50_000 → trigger at 35k estimated tokens; the big seed turns cross it.
+	// contextWindow 50_000 and an uncached provider → trigger at 22.5k estimated tokens;
+	// the big seed turns cross it several times over.
 	const runner = new AgentRunner(provider, approver, 10, {
 		readOnly: true,
 		contextWindow: 50_000,
@@ -536,8 +589,9 @@ const noopCallbacks = () => {
 		{ ...cb, onTodos: items => { reported = items; } });
 	assert.strictEqual(result.reason, 'done');
 	assert.deepStrictEqual(reported, todos, 'the checklist reached the UI');
-	// Step 2 and 3 are both nudged about the open item; the fourth quiet step ends it.
-	assert.strictEqual(provider.seen.length, 4, 'the open item is chased twice, then the run ends');
+	// Step 2 is nudged about the open item; the third quiet step ends it. A nudge is a full
+	// round trip at the longest the conversation ever gets, so each reason asks once.
+	assert.strictEqual(provider.seen.length, 3, 'the open item is chased once, then the run ends');
 	const nudge = provider.seen[2].at(-1);
 	assert.match(nudge, /Update the tests/, 'the nudge quotes the outstanding item');
 	// The tool result echoes the list, so it survives in the transcript as the model's plan.
@@ -578,7 +632,7 @@ const noopCallbacks = () => {
 	const runner = new AgentRunner(provider, approver, 10, { mcp });
 	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
 	assert.strictEqual(result.reason, 'done');
-	assert.strictEqual(provider.seen.length, 4, 'the unannotated MCP write armed the gate');
+	assert.strictEqual(provider.seen.length, 3, 'the unannotated MCP write armed the gate');
 	assert.match(provider.seen[2].at(-1), /npm run test/, 'the nudge names a command this workspace really has');
 }
 
@@ -1124,7 +1178,10 @@ async function runAuto(agentSteps, { maxSteps = 20 } = {}) {
 // of reporting success without checking.
 {
 	const busy = id => ({ content: '', toolCalls: [{ id, name: 'read_file', args: { path: `f${id}.ts` } }] });
-	const prompt = await runAuto([busy('1'), busy('2'), busy('3')], { maxSteps: 2 });
+	// Enough steps to exhaust the ceiling, not just the budget: under Full Auto the
+	// implementer extends past `maxSteps` on its own (see 6a), so a run that merely reaches
+	// the budget is still going, and would reach the reviewer as a *complete* one.
+	const prompt = await runAuto(Array.from({ length: 12 }, (_, i) => busy(String(i))), { maxSteps: 2 });
 	assert.deepStrictEqual(
 		[/did NOT run to completion/.test(prompt), /step limit/.test(prompt), /do not report the work complete/.test(prompt)],
 		[true, true, true],
@@ -1137,6 +1194,194 @@ async function runAuto(agentSteps, { maxSteps = 20 } = {}) {
 {
 	const prompt = await runAuto([{ content: 'all done', toolCalls: [] }, { content: 'all done', toolCalls: [] }]);
 	assert.ok(!/did NOT run to completion/.test(prompt), 'a completed implementation is not flagged as partial');
+}
+
+// 27. Adjacent read-only calls in one step run concurrently. The agent doctrine tells the
+// model to batch independent reads; running the batch one at a time made following that
+// advice slower than ignoring it.
+{
+	const provider = fakeProvider([
+		{
+			content: '', toolCalls: [
+				{ id: 'r1', name: 'read_file', args: { path: 'a.ts' } },
+				{ id: 'r2', name: 'list_dir', args: { path: '.' } },
+				{ id: 'r3', name: 'glob_files', args: { pattern: '*.ts' } },
+			],
+		},
+		{ content: 'done', toolCalls: [] },
+	]);
+	const order = [];
+	const cb = { ...noopCallbacks(), onToolStart: c => order.push(`start:${c.id}`), onToolEnd: c => order.push(`end:${c.id}`) };
+	const runner = new AgentRunner(provider, approver, 10, { readOnly: true });
+	await runner.run([{ role: 'user', content: 'go' }], params, cb);
+	// Every call starts before any of them ends — the signature of one batch in flight
+	// rather than three round trips end to end. Callbacks stay in call order either way,
+	// so the transcript reads the same as it always did.
+	assert.deepStrictEqual(order, [
+		'start:r1', 'start:r2', 'start:r3',
+		'end:r1', 'end:r2', 'end:r3',
+	], 'the batch goes out at once and reports in call order');
+}
+
+// 27b. A write between two reads breaks the batch: the second read must see the change,
+// and reordering across it would answer from before the write.
+{
+	const provider = fakeProvider([
+		{
+			content: '', toolCalls: [
+				{ id: 'r1', name: 'read_file', args: { path: 'a.ts' } },
+				{ id: 'w1', name: 'write_file', args: { path: 'b.ts', content: 'x' } },
+				{ id: 'r2', name: 'read_file', args: { path: 'b.ts' } },
+			],
+		},
+		{ content: 'done', toolCalls: [] },
+	]);
+	const order = [];
+	const cb = { ...noopCallbacks(), onToolStart: c => order.push(`start:${c.id}`), onToolEnd: c => order.push(`end:${c.id}`) };
+	const runner = new AgentRunner(provider, approver, 10);
+	await runner.run([{ role: 'user', content: 'go' }], params, cb);
+	assert.deepStrictEqual(order, [
+		'start:r1', 'end:r1', 'start:w1', 'end:w1', 'start:r2', 'end:r2',
+	], 'a write is never overtaken by a read beside it');
+}
+
+// 27c. Batching must not become a way around the repeat-read guard: a read already answered
+// this run is refused inside a batch exactly as it is on its own, and the batch's own
+// duplicates are answered once rather than fetched twice.
+{
+	const provider = fakeProvider([
+		{ content: '', toolCalls: [{ id: 'r0', name: 'read_file', args: { path: 'a.ts' } }] },
+		{
+			content: '', toolCalls: [
+				{ id: 'r1', name: 'read_file', args: { path: 'a.ts' } },
+				{ id: 'r2', name: 'read_file', args: { path: 'package.json' } },
+				{ id: 'r3', name: 'read_file', args: { path: 'package.json' } },
+			],
+		},
+		{ content: 'done', toolCalls: [] },
+	]);
+	const results = new Map();
+	const cb = { ...noopCallbacks(), onToolEnd: (c, r, e) => results.set(c.id, { result: r, error: e }) };
+	const runner = new AgentRunner(provider, approver, 10, { readOnly: true });
+	await runner.run([{ role: 'user', content: 'go' }], params, cb);
+	assert.deepStrictEqual(
+		[
+			results.get('r1').error,
+			/already ran/.test(results.get('r1').result),
+			results.get('r2').error,
+			results.get('r2').result === results.get('r3').result,
+		],
+		[true, true, false, true],
+		'the repeat is refused; the batch-internal duplicate shares one answer',
+	);
+}
+
+// 28. The step budget caps how many times the model is asked, not how long each ask takes.
+// On a queued free tier one step can stall for minutes without the step count moving, so a
+// run also ends on the clock — with a reason, rather than by going quiet.
+{
+	let clock = 0;
+	const provider = fakeProvider(busySteps(50));
+	const runner = new AgentRunner(provider, approver, 50, {
+		maxRunMs: 10_000,
+		// Each step "takes" four seconds, so the third one finds the budget spent.
+		now: () => (clock += 4_000),
+	});
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.strictEqual(result.reason, 'limit');
+	assert.match(result.detail, /minute ceiling/, 'the run says it ran out of time, not steps');
+	assert.match(result.detail, /continue/i, 'and how to resume');
+	assert.ok(provider.seen.length < 50, 'the run stopped well short of its step budget');
+}
+
+// 28b. maxRunMs: 0 disables the ceiling — a user who turns it off must not be stopped by it
+// however long the run takes.
+{
+	const provider = fakeProvider([{ content: 'done', toolCalls: [] }]);
+	const runner = new AgentRunner(provider, approver, 5, { maxRunMs: 0, now: () => 1e12 });
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.strictEqual(result.reason, 'done', 'no ceiling means no time-based stop');
+}
+
+// 28c. Every top-level run closes with what it cost. A slow run is almost always a large
+// prompt being re-sent each step, and that number is otherwise invisible to the user.
+{
+	const provider = fakeProvider([{ content: 'done', toolCalls: [] }]);
+	const cb = noopCallbacks();
+	await new AgentRunner(provider, approver, 5).run([{ role: 'user', content: 'go' }], params, cb);
+	assert.ok(cb.notes.some(n => /Run finished in .*largest prompt sent/.test(n)), 'the run reports its cost');
+}
+
+// 29. How eagerly a run compacts is read off the provider. Compacting early is a cost
+// control: it shrinks the conversation that every step re-sends. On a backend that caches
+// its prompt prefix that conversation is already cheap, and compacting it *invalidates*
+// the cache — so the identical run must compact on one provider and not on the other.
+{
+	const big = 'x'.repeat(28_000); // ~7k estimated tokens per message
+	const seed = [
+		{ role: 'system', content: 'SYS' },
+		{ role: 'user', content: 'GOAL' },
+		{ role: 'assistant', content: big },
+		{ role: 'assistant', content: big },
+		{ role: 'assistant', content: big },
+		{ role: 'assistant', content: big },
+		{ role: 'user', content: 'q1' }, { role: 'assistant', content: 'a1' },
+		{ role: 'user', content: 'q2' }, { role: 'assistant', content: 'a2' },
+		{ role: 'user', content: 'q3' }, { role: 'assistant', content: 'a3' },
+	];
+	// ~28k estimated tokens in a 50k window: past the uncached trigger (22.5k), short of
+	// the cached one (35k).
+	const compactedWith = async cachesPrompts => {
+		const base = fakeProvider([]);
+		let summarized = 0;
+		const provider = {
+			...base,
+			info: { ...base.info, cachesPrompts },
+			async streamChat(request) { summarized++; request.onToken('SUMMARY'); return { truncated: false }; },
+			async runAgentStep() { return { content: 'done', toolCalls: [], truncated: false }; },
+		};
+		const runner = new AgentRunner(provider, approver, 10, {
+			readOnly: true,
+			contextWindow: 50_000,
+			maxContextTokens: 1_000_000, // keep trimming out of the way
+		});
+		await runner.run(seed, params, noopCallbacks());
+		return summarized;
+	};
+	assert.deepStrictEqual(
+		[await compactedWith(false), await compactedWith(true)],
+		[1, 0],
+		'the uncached provider compacts; the caching one leaves its cached prefix intact',
+	);
+}
+
+// 30. The conversation gets what is left of the context budget after the tool schemas,
+// which every agent request also carries. Budgeting against the messages alone let a
+// request the budget called safe go over the model's real window.
+{
+	const provider = fakeProvider([{ content: 'done', toolCalls: [] }]);
+	const seen = [];
+	const spy = {
+		...provider,
+		async runAgentStep(request) { seen.push(request); return { content: 'done', toolCalls: [], truncated: false }; },
+	};
+	const budget = 20_000;
+	const runner = new AgentRunner(spy, approver, 3, { maxContextTokens: budget });
+	// Old tool output is what trimming actually shrinks, so the conversation needs a
+	// trimmable middle — a handful of protected turns can't be reduced at all, and would
+	// prove nothing either way.
+	const seed = [{ role: 'system', content: 'SYS' }, { role: 'user', content: 'go' }];
+	for (let i = 0; i < 30; i++) {
+		seed.push({ role: 'assistant', content: '', toolCalls: [{ id: `c${i}`, name: 'read_file', args: { path: `f${i}.ts` } }] });
+		seed.push({ role: 'tool', content: 'y'.repeat(4_000), toolCallId: `c${i}` }); // ~1k tokens each
+	}
+	await runner.run(seed, params, noopCallbacks());
+	const sent = seen[0];
+	const toolTokens = m.estimateToolsTokens(sent.tools);
+	assert.ok(toolTokens > 500, 'the built-in tool set is not free');
+	assert.ok(m.estimateMessagesTokens(seed) > budget, 'the fixture is over budget to begin with');
+	assert.ok(m.estimateMessagesTokens(sent.messages) + toolTokens <= budget,
+		'messages plus tool schemas fit the budget, rather than messages alone');
 }
 
 console.log('test-agent-loop: all assertions passed');

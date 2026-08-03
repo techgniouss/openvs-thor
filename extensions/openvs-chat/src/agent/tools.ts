@@ -16,8 +16,18 @@ import { resolveAgentShell } from './shell';
  * isn't pulled through the decoder.
  */
 const MAX_DECODE_BYTES = 1_000_000;
-/** Default character cap for one read_file result — a whole-file dump eats the context budget for the rest of the run. */
-const MAX_READ_CHARS = 48_000;
+/**
+ * Default character cap for one read_file result — a whole-file dump eats the context
+ * budget for the rest of the run.
+ *
+ * ~6k tokens. The cap is not really about this one result: an agent step re-sends the
+ * whole conversation, so a read is paid for again on every later step. Four 48k-char
+ * reads used to put ~48k tokens of file text into every subsequent prompt for the rest of
+ * the run. Reads are paged rather than lost — each truncated result names the offset to
+ * continue from — so the cost of a tighter cap is one extra call on the rare file that
+ * genuinely needs reading whole.
+ */
+const MAX_READ_CHARS = 24_000;
 
 /**
  * Width of the line-number gutter prefixed to every line of a read_file result, and the

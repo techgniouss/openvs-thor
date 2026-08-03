@@ -115,6 +115,26 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   keeps this honest and fails if a tool gains no case,
   looked up via `registry.ts`. NVIDIA and most other gateways reuse the OpenAI-compatible
   client — add a new backend by pointing a `baseUrl` setting at it, or by copying `kimi.ts`.
+  A backend that refuses `content` and `tool_calls` on one assistant message (NVIDIA) gets
+  the narration as its own assistant turn ahead of the tool calls rather than losing it —
+  without that record the model re-derives its plan, and re-reads the same files, on every
+  step. `test-provider-messages.mjs` pins all three wire forms and the fallback between them.
+  **Prompt caching is a first-class provider property** (`ProviderInfo.cachesPrompts`),
+  because an agent step re-sends the whole conversation and whether that is expensive
+  decides how eagerly the run compacts (`COMPACT_TRIGGER` vs `CACHED_COMPACT_TRIGGER` —
+  compaction rewrites the middle, so on a caching backend it *destroys* the cached prefix
+  and is worth doing later, not sooner). Anthropic sends explicit `cache_control`
+  breakpoints on the system block and the moving tail; OpenAI caches automatically;
+  OpenRouter needs explicit breakpoints for `anthropic/*` and `google/*` models and gets
+  them from `wantsCacheBreakpoints`. Everything else declares nothing and compacts early.
+  Anything that varies per turn must therefore stay **out** of the system prompt — that is
+  why `persona/envContext.ts` splits its snapshot into `stable` (system prompt) and
+  `volatile` (git status, open tabs; placed just ahead of the newest request).
+  Everything that lands in the per-step prompt is budgeted, because it is paid for on every
+  step: rules are capped at 12k chars, active skills at 16k each and 24k combined, and the
+  tool schemas (~1.9k tokens built-in, unbounded once MCP servers connect) are charged
+  against the context budget via `estimateToolsTokens` — counting only the messages
+  understated every agent request by that whole amount.
   The shared client streams `reasoning_content` (DeepSeek-R1-style models) and uses a 150s
   first-byte timeout for chat POSTs (free tiers queue server-side). NVIDIA's model list is
   filtered to chat-capable models. Keys are stored in VS Code `SecretStorage`, never in
@@ -133,6 +153,16 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   path and touch another), `agentRunner.ts` (the loop itself, including `spawn_subagent`
   delegation and the completion gate that refuses to call a run "done" while the model's
   own `update_todos` checklist has open items or it wrote files without verifying them).
+  A run is bounded on **two** axes, because they come apart: `openvsChat.agent.maxSteps`
+  caps how many times the model is asked (Full Auto extends itself to 2× that, nothing
+  else does), and `openvsChat.agent.maxRunMinutes` caps how long the asking may take —
+  on a queued free tier one step can stall for minutes without the step count moving.
+  Sub-agents inherit the parent's *remaining* time rather than a fresh budget. Each
+  top-level run closes with a note giving its elapsed time and peak prompt size;
+  `openvsChat.agent.traceTiming` adds the same per step. Within a step, adjacent
+  read-only tool calls run concurrently (`openvsChat.agent.parallelReads`) — the guards
+  are evaluated in order before anything is dispatched, so batching can't be used to slip
+  past the repeat-read breaker.
   Approvals and questions reach the user as inline cards in the chat tab that raised them,
   via the per-run `SessionApprover` in `chatViewProvider.ts` (host side) and
   `media/prompts.js` (rendering) — never as a global modal, so the card can carry a diff,

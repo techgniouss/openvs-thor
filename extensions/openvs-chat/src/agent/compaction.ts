@@ -14,8 +14,31 @@ import { dropOrphanToolResults, estimateMessagesTokens } from './context';
  * summary, preserving the task state in far fewer tokens.
  */
 
-/** Share of the model's context window at which compaction kicks in. */
-export const COMPACT_TRIGGER = 0.7;
+/**
+ * Share of the model's context window at which compaction kicks in on a backend that does
+ * NOT cache prompt prefixes (NVIDIA's gateway, most local/self-hosted endpoints).
+ *
+ * Deliberately well under the window rather than just inside it. An agent step re-sends
+ * the entire conversation, so with no caching the per-step cost is the conversation's
+ * current size and the run's total cost is quadratic in its length. Letting the history
+ * grow to 70% of a 128k window meant every step past that point paid ~85k tokens of
+ * prefill before the model emitted a character. Compacting earlier trades a handful of
+ * extra summarizer calls for a prompt that stays roughly half the size for the rest of
+ * the run, which is the better bargain by a wide margin.
+ */
+export const COMPACT_TRIGGER = 0.45;
+
+/**
+ * The same share on a backend that DOES cache prompt prefixes (see
+ * `ProviderInfo.cachesPrompts`).
+ *
+ * There the bargain inverts. A long prompt is served from cache — cheap and quick to first
+ * token — while compaction costs a summarizer call *and* rewrites the middle of the
+ * conversation, which invalidates the cached prefix and makes the next step pay full
+ * price for everything. So compaction stays where it was: a measure for staying inside
+ * the window, not a cost control.
+ */
+export const CACHED_COMPACT_TRIGGER = 0.7;
 
 /**
  * Share of the trim budget compaction must stay under. Trimming is the lossy fallback,
@@ -46,16 +69,17 @@ const SUMMARY_PROMPT =
 /**
  * The estimated-token count at which compaction should run.
  *
- * Normally {@link COMPACT_TRIGGER} of the model's window. But the conversation is also
- * subject to `trimBudget` — the lossy trim that blanks old tool output — and on a small
- * window that budget bites first: it reserves the whole response allowance up front, so
- * for any window below roughly ten times `maxTokens` (a 32k local model, say) 70% of the
- * window lands *above* it. Trimming would then degrade the conversation before compaction
- * ever got a chance to summarize it. Clamping to the budget's headroom keeps compaction
- * first for every model, which is the entire point of having it.
+ * Normally `trigger` ({@link COMPACT_TRIGGER}, or {@link CACHED_COMPACT_TRIGGER} on a
+ * caching backend) of the model's window. But the conversation is also subject to
+ * `trimBudget` — the lossy trim that blanks old tool output — and on a small window that
+ * budget can bite first: it reserves the whole response allowance up front, so for a
+ * tight window (or a user-pinned `maxContextTokens`) the share can land *above* it.
+ * Trimming would then degrade the conversation before compaction ever got a chance to
+ * summarize it. Clamping to the budget's headroom keeps compaction first for every model,
+ * which is the entire point of having it.
  */
-export function compactionThreshold(contextWindow: number, trimBudget?: number): number {
-	const byWindow = contextWindow * COMPACT_TRIGGER;
+export function compactionThreshold(contextWindow: number, trimBudget?: number, trigger = COMPACT_TRIGGER): number {
+	const byWindow = contextWindow * trigger;
 	return trimBudget && trimBudget > 0 ? Math.min(byWindow, trimBudget * TRIM_HEADROOM) : byWindow;
 }
 
@@ -64,8 +88,16 @@ export function compactionThreshold(contextWindow: number, trimBudget?: number):
  * `trimBudget` (the ceiling handed to {@link trimMessages}) wherever it is known, so the
  * threshold accounts for it — see {@link compactionThreshold}.
  */
-export function shouldCompact(messages: ChatMessage[], contextWindow: number, trimBudget?: number): boolean {
-	return contextWindow > 0 && estimateMessagesTokens(messages) > compactionThreshold(contextWindow, trimBudget);
+export function shouldCompact(
+	messages: ChatMessage[],
+	contextWindow: number,
+	trimBudget?: number,
+	trigger?: number,
+	/** Tokens the request carries beyond the messages — the tool schemas. See `estimateToolsTokens`. */
+	extraTokens = 0,
+): boolean {
+	return contextWindow > 0
+		&& estimateMessagesTokens(messages) + extraTokens > compactionThreshold(contextWindow, trimBudget, trigger);
 }
 
 /**

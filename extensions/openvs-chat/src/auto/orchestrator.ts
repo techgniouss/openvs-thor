@@ -79,7 +79,31 @@ export class AutoOrchestrator {
 		 * state the implementer still needed. The plain Agent path has always used it.
 		 */
 		private readonly catalog?: (providerId: string) => ModelEntry[] | undefined,
+		/**
+		 * Wall-clock ceiling for the whole Auto run, in ms; 0 for none. Shared across the
+		 * phases rather than granted to each: three phases with a 30-minute ceiling apiece
+		 * is a 90-minute run, which is not what the setting says.
+		 */
+		private readonly maxRunMs = 0,
+		/** Per-step timing notes, forwarded to every runner this orchestrates. */
+		private readonly traceTiming = false,
 	) { }
+
+	/** When this Auto run started, so each phase gets what is left rather than a fresh budget. */
+	private startedAt = Date.now();
+
+	/** The wall-clock allowance to hand the next runner, floored so a late phase still runs. */
+	private remainingRunMs(): number {
+		if (this.maxRunMs <= 0) {
+			return 0;
+		}
+		return Math.max(60_000, this.maxRunMs - (Date.now() - this.startedAt));
+	}
+
+	/** The run-length options every runner in this pipeline shares. */
+	private runLimits(): { maxRunMs: number; traceTiming: boolean } {
+		return { maxRunMs: this.remainingRunMs(), traceTiming: this.traceTiming };
+	}
 
 	/** Context-window and trim budget for a role's model, catalog-aware where possible. */
 	private budgetFor(assignment: RoleAssignment, maxTokens: number): { contextWindow: number; maxContextTokens: number } {
@@ -91,6 +115,7 @@ export class AutoOrchestrator {
 	}
 
 	async run(params: AutoRunParams, cb: AutoCallbacks): Promise<void> {
+		this.startedAt = Date.now();
 		const planCandidates = await this.router.resolveRoleCandidates('plan');
 		const codeCandidates = await this.router.resolveRoleCandidates('code');
 		const reviewEnabled = this.router.isReviewEnabled();
@@ -258,6 +283,7 @@ export class AutoOrchestrator {
 				...this.budgetFor(a, maxTokens),
 				keepHead: seed.length,
 				steering,
+				...this.runLimits(),
 			});
 			try {
 				const outcome = await runner.run(
@@ -338,6 +364,7 @@ export class AutoOrchestrator {
 				...this.budgetFor(a, maxTokens),
 				keepHead: stepSeed.length,
 				steering: params.steering,
+				...this.runLimits(),
 			});
 			const outcome = await runner.run(stepSeed, runParams, agentCallbacks(cb, sink));
 			noteOutcome(cb, sink, outcome, `Step ${i + 1}/${steps.length}`);

@@ -12,6 +12,25 @@ import { parseToolArgs } from './toolCalls';
 import { CLOSE_MARK, OPEN_MARK } from '../persona/thinking';
 
 /**
+ * How an assistant turn that carries both narration and tool calls is put on the wire.
+ * `inline` is the OpenAI shape; `split` emits the narration as its own assistant turn
+ * immediately before the tool-call turn; `drop` discards it (last resort — see
+ * {@link OpenAICompatibleProvider.postWithNarrationFallback}).
+ */
+type NarrationMode = 'inline' | 'split' | 'drop';
+
+/**
+ * A 400 complaining about the *shape* of the message list rather than its contents — the
+ * signature of a backend that will not take two consecutive assistant turns.
+ *
+ * Deliberately loose. A false positive costs one extra request that fails the same way and
+ * surfaces the same error, because the retry only removes narration; a false negative would
+ * leave the session permanently unable to make a request the backend would have accepted.
+ */
+const MESSAGE_SHAPE_REJECTION =
+	/assistant|consecutive|alternat|message.*(order|sequence|role)|role.*(order|sequence)/i;
+
+/**
  * Base implementation for any backend that speaks the OpenAI Chat Completions API
  * (OpenAI itself, NVIDIA's `integrate.api.nvidia.com`, local gateways, etc.).
  * Subclasses only need to supply `info`.
@@ -30,14 +49,75 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 	}
 
 	/**
+	 * Whether `model` needs EXPLICIT `cache_control` breakpoints to have its prompt prefix
+	 * cached. False for backends that cache automatically (OpenAI) and for those that don't
+	 * cache at all; true only where the gateway forwards breakpoints to an upstream that
+	 * requires them — Anthropic and Gemini models behind OpenRouter, notably.
+	 */
+	protected wantsCacheBreakpoints(_model: string): boolean {
+		return false;
+	}
+
+	/**
 	 * Whether the backend accepts an assistant history turn that carries BOTH `content`
 	 * and `tool_calls`. OpenAI does; some gateways (notably NVIDIA) reject the combination
 	 * with HTTP 400 ("Assistant message must have either content or tool_calls, but not
-	 * both") — those override this to false and the narration text is dropped from the
-	 * serialized turn (it was already streamed to the user; the tool calls drive the loop).
+	 * both"). Those override this to false, and the narration is split into its own
+	 * assistant turn ahead of the tool calls rather than thrown away — see
+	 * {@link NarrationMode}.
 	 */
 	protected allowsContentWithToolCalls(): boolean {
 		return true;
+	}
+
+	/**
+	 * Set once a backend has rejected the split narration turn, so the rest of the session
+	 * drops narration instead of re-failing every request. Per-instance because providers
+	 * are long-lived singletons in the registry — one probe per session, not per call.
+	 */
+	private narrationSplitRejected = false;
+
+	/** How an assistant turn carrying both narration and tool calls is serialized. */
+	private narrationMode(): NarrationMode {
+		if (this.allowsContentWithToolCalls()) {
+			return 'inline';
+		}
+		return this.narrationSplitRejected ? 'drop' : 'split';
+	}
+
+	/**
+	 * Sends `body` (a function of the narration mode, since the mode changes the messages),
+	 * falling back to dropping narration if the backend rejects the split form.
+	 *
+	 * Splitting is the better history by a wide margin — dropping narration leaves the
+	 * model a transcript of its own tool calls with no record of *why* it made any of them,
+	 * so it re-derives its plan every single step and re-reads files it already read. But
+	 * whether a given gateway accepts two consecutive assistant turns can only be learned
+	 * from the gateway, so the first rejection demotes the session to `drop` and retries
+	 * rather than failing the step.
+	 */
+	private async postWithNarrationFallback(
+		url: string,
+		headers: Record<string, string>,
+		body: (mode: NarrationMode) => string,
+		signal: AbortSignal,
+		opts: ApiFetchOptions,
+	): Promise<Response> {
+		const mode = this.narrationMode();
+		const response = await apiFetch(url, { method: 'POST', headers, body: body(mode) }, signal, opts);
+		if (response.ok || mode !== 'split' || response.status !== 400) {
+			return response;
+		}
+		// Cloned, not consumed: a 400 about anything else has to reach the caller with its
+		// body intact so `describeHttpError` can quote what the backend actually said.
+		const text = await response.clone().text().catch(() => '');
+		if (!MESSAGE_SHAPE_REJECTION.test(text)) {
+			return response;
+		}
+		this.narrationSplitRejected = true;
+		// The rejected response is abandoned here, and an unread body holds its socket open.
+		await response.body?.cancel().catch(() => { /* already closed */ });
+		return apiFetch(url, { method: 'POST', headers, body: body('drop') }, signal, opts);
 	}
 
 	protected url(baseUrl: string, path: string): string {
@@ -75,17 +155,19 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 	}
 
 	async streamChat(request: ChatRequest): Promise<StreamChatResult> {
-		const response = await apiFetch(this.url(request.baseUrl, '/chat/completions'), {
-			method: 'POST',
-			headers: { ...this.authHeaders(request.apiKey), 'Accept': 'text/event-stream' },
-			body: JSON.stringify({
+		const response = await this.postWithNarrationFallback(
+			this.url(request.baseUrl, '/chat/completions'),
+			{ ...this.authHeaders(request.apiKey), 'Accept': 'text/event-stream' },
+			mode => JSON.stringify({
 				model: request.model,
-				messages: request.messages.map(m => serializeMessage(m, this.allowsContentWithToolCalls())),
+				messages: serializeMessages(request.messages, mode, this.wantsCacheBreakpoints(request.model)),
 				[this.tokenLimitField(request.model)]: request.maxTokens,
 				stream: true,
 				...this.extraBody(),
 			}),
-		}, request.signal, this.streamFetchOpts(request.onNotice));
+			request.signal,
+			this.streamFetchOpts(request.onNotice),
+		);
 
 		if (!response.ok) {
 			throw new Error(await describeHttpError(this.info.label, response));
@@ -145,12 +227,12 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 	}
 
 	async runAgentStep(request: AgentRequest): Promise<AgentStep> {
-		const response = await apiFetch(this.url(request.baseUrl, '/chat/completions'), {
-			method: 'POST',
-			headers: { ...this.authHeaders(request.apiKey), 'Accept': 'text/event-stream' },
-			body: JSON.stringify({
+		const response = await this.postWithNarrationFallback(
+			this.url(request.baseUrl, '/chat/completions'),
+			{ ...this.authHeaders(request.apiKey), 'Accept': 'text/event-stream' },
+			mode => JSON.stringify({
 				model: request.model,
-				messages: request.messages.map(m => serializeMessage(m, this.allowsContentWithToolCalls())),
+				messages: serializeMessages(request.messages, mode, this.wantsCacheBreakpoints(request.model)),
 				[this.tokenLimitField(request.model)]: request.maxTokens,
 				tools: request.tools.map(t => ({
 					type: 'function',
@@ -160,7 +242,9 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 				stream: true,
 				...this.extraBody(),
 			}),
-		}, request.signal, this.streamFetchOpts(request.onNotice));
+			request.signal,
+			this.streamFetchOpts(request.onNotice),
+		);
 
 		if (!response.ok) {
 			throw new Error(await describeHttpError(this.info.label, response));
@@ -223,6 +307,57 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 		// yield an empty step; fall back to its reasoning so the agent loop can react.
 		return { content: content || (toolCalls.length ? '' : reasoning), toolCalls, truncated, finishReason };
 	}
+}
+
+/** Serializes the conversation into the OpenAI Chat Completions wire format. */
+function serializeMessages(messages: ChatMessage[], mode: NarrationMode, breakpoints = false): Record<string, unknown>[] {
+	const out: Record<string, unknown>[] = [];
+	for (const m of messages) {
+		// `split` puts the narration in its own turn ahead of the tool calls. The model's
+		// account of what it was doing is the most valuable thing in an agent transcript —
+		// without it every step starts from the tool log alone.
+		if (mode === 'split' && m.role === 'assistant' && m.toolCalls?.length && m.content.trim()) {
+			out.push({ role: 'assistant', content: m.content });
+		}
+		out.push(serializeMessage(m, mode === 'inline'));
+	}
+	return breakpoints ? withCacheBreakpoints(out) : out;
+}
+
+/**
+ * Marks the system turn and the last text-carrying turn as cache breakpoints, in the
+ * OpenAI-shaped form gateways forward to Anthropic/Gemini (`content` becomes an array of
+ * parts, the marked part carries `cache_control`).
+ *
+ * Two, in the same places the native Anthropic client puts them: one fixes the system
+ * prompt and tools, which never change during a run; the other moves to the end of the
+ * conversation each step, so the cache extends to cover everything the previous step had.
+ * Without these an agent run against `anthropic/claude-*` through a gateway re-reads the
+ * entire conversation at full price on every step — the same defect the native client
+ * fixed years ago, reintroduced by the change of route.
+ */
+function withCacheBreakpoints(messages: Record<string, unknown>[]): Record<string, unknown>[] {
+	const mark = (index: number) => {
+		const message = messages[index];
+		const text = message.content;
+		if (typeof text !== 'string' || !text) {
+			return false;
+		}
+		messages[index] = { ...message, content: [{ type: 'text', text, cache_control: { type: 'ephemeral' } }] };
+		return true;
+	};
+	const system = messages.findIndex(m => m.role === 'system');
+	if (system >= 0) {
+		mark(system);
+	}
+	// Walks back from the end: the final turn is often a tool result or a tool-call turn,
+	// neither of which carries the plain string content this form needs.
+	for (let i = messages.length - 1; i > system; i--) {
+		if (mark(i)) {
+			break;
+		}
+	}
+	return messages;
 }
 
 /** Serializes an internal message into the OpenAI Chat Completions wire format. */

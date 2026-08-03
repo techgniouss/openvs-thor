@@ -55,7 +55,9 @@ export class NvidiaProvider extends OpenAICompatibleProvider {
 	/**
 	 * NVIDIA's endpoint rejects assistant turns that carry both narration text and
 	 * tool_calls (HTTP 400 "Assistant message must have either content or tool_calls,
-	 * but not both"), so the serialized history keeps only the tool_calls.
+	 * but not both"). The base class therefore splits the narration into its own assistant
+	 * turn ahead of the tool calls — keeping it, rather than dropping it, is what stops the
+	 * model re-deriving its plan (and re-reading the same files) on every step of a run.
 	 */
 	protected override allowsContentWithToolCalls(): boolean {
 		return false;
