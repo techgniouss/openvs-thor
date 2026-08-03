@@ -71,33 +71,53 @@ assert.strictEqual(await m.compactMessages(convo(20, 4_000), async () => '   '),
 }
 
 
-// compactionThreshold: normally 70% of the window, but never above the point where the
-// lossy trim would already have kicked in — trimming must never get first crack.
+// compactionThreshold: COMPACT_TRIGGER (45%) of the window, but never above the point
+// where the lossy trim would already have kicked in — trimming must never get first crack.
 {
-	// Whichever is lower governs. For a 200k window the trim budget's headroom is just
-	// under the 70% mark, so it wins by a hair (136.6k vs 140k) — still ~68% of the
-	// window, and still guaranteed to precede the trim.
-	assert.strictEqual(m.compactionThreshold(200_000, 151_808), 151_808 * 0.9);
-	assert.ok(m.compactionThreshold(200_000, 151_808) < 151_808, 'compaction fires before trimming');
-	// The nominal 70% governs once the window dwarfs the response reservation.
-	assert.strictEqual(m.compactionThreshold(1_000_000, 791_808), 700_000);
-	// Small window: 0.7*32000 = 22400 would land ABOVE the 17408 trim budget, so the
-	// budget's headroom governs instead and compaction still precedes trimming.
-	assert.strictEqual(m.compactionThreshold(32_000, 17_408), Math.min(22_400, 17_408 * 0.9));
+	// The window share governs for every automatically-derived budget: that budget is ~80%
+	// of the window, so even its 90% headroom (72% of the window) sits well above 45%.
+	assert.strictEqual(m.compactionThreshold(200_000, 151_808), 90_000);
+	assert.strictEqual(m.compactionThreshold(1_000_000, 791_808), 450_000);
+	assert.strictEqual(m.compactionThreshold(32_000, 17_408), 14_400);
+	// Pinning openvsChat.agent.maxContextTokens far below the window puts the trim budget
+	// back in charge, and compaction must still precede it.
+	assert.strictEqual(m.compactionThreshold(200_000, 50_000), 45_000);
+	assert.ok(m.compactionThreshold(200_000, 50_000) < 50_000, 'compaction fires before trimming');
 	assert.ok(m.compactionThreshold(32_000, 17_408) < 17_408, 'compaction fires before trimming');
 	assert.ok(m.compactionThreshold(64_000, 43_008) < 43_008, 'compaction fires before trimming');
-	// No budget supplied: pure window behavior, unchanged.
-	assert.strictEqual(m.compactionThreshold(100_000), 70_000);
-	assert.strictEqual(m.compactionThreshold(100_000, 0), 70_000);
+	// No budget supplied: pure window behavior.
+	assert.strictEqual(m.compactionThreshold(100_000), 45_000);
+	assert.strictEqual(m.compactionThreshold(100_000, 0), 45_000);
 }
 
 // shouldCompact honors the budget-aware threshold when a trim budget is supplied.
 {
-	// ~20k estimated tokens: under 70% of a 32k window (22.4k) but over the budget-aware
-	// threshold (15.7k), so it must compact rather than wait for the lossy trim.
+	// ~20k estimated tokens: far under 45% of a 200k window (90k) but over the headroom of
+	// a pinned 10k budget, so it must compact rather than wait for the lossy trim.
 	const msgs = convo(10, 8_000);
-	assert.strictEqual(m.shouldCompact(msgs, 32_000), false, 'window-only threshold would not fire');
-	assert.strictEqual(m.shouldCompact(msgs, 32_000, 17_408), true, 'budget-aware threshold fires');
+	assert.strictEqual(m.shouldCompact(msgs, 200_000), false, 'window-only threshold would not fire');
+	assert.strictEqual(m.shouldCompact(msgs, 200_000, 10_000), true, 'budget-aware threshold fires');
+}
+
+// The trigger is provider-dependent, because compacting early is a cost control and only
+// pays on a backend where a long prompt is expensive. On one that caches its prefix,
+// compaction instead *invalidates* that cache, so it stays a measure for fitting the
+// window rather than for saving money.
+{
+	assert.strictEqual(m.compactionThreshold(100_000, 0, m.COMPACT_TRIGGER), 45_000);
+	assert.strictEqual(m.compactionThreshold(100_000, 0, m.CACHED_COMPACT_TRIGGER), 70_000);
+	assert.ok(m.CACHED_COMPACT_TRIGGER > m.COMPACT_TRIGGER, 'a caching backend compacts later');
+	// ~50k estimated tokens in a 100k window: past the uncached trigger, short of the
+	// cached one — the case the split exists for.
+	const msgs = convo(25, 8_000);
+	assert.deepStrictEqual(
+		[
+			m.shouldCompact(msgs, 100_000, 0, m.COMPACT_TRIGGER),
+			m.shouldCompact(msgs, 100_000, 0, m.CACHED_COMPACT_TRIGGER),
+		],
+		[true, false],
+		'the same conversation compacts on an uncached backend and not on a cached one',
+	);
 }
 
 // keepHead: an assembled request is [system, attached context, the request, ...]. The

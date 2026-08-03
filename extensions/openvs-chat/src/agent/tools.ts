@@ -6,7 +6,7 @@
 import { spawn } from 'child_process';
 import * as vscode from 'vscode';
 import { MALFORMED_ARGS } from '../providers/toolCalls';
-import { ToolCall, ToolSpec } from '../providers/types';
+import { ToolCall, ToolSpec, isAbortError } from '../providers/types';
 import { Guardrails, WorkspacePath, autoApproves, autoApprovesWrites, checkCommand, checkPath, describeWorkspaceUri, loadGuardrails, normalizeWorkspacePath, resolveWorkspacePath } from './guardrails';
 import { resolveAgentShell } from './shell';
 
@@ -16,8 +16,18 @@ import { resolveAgentShell } from './shell';
  * isn't pulled through the decoder.
  */
 const MAX_DECODE_BYTES = 1_000_000;
-/** Default character cap for one read_file result — a whole-file dump eats the context budget for the rest of the run. */
-const MAX_READ_CHARS = 48_000;
+/**
+ * Default character cap for one read_file result — a whole-file dump eats the context
+ * budget for the rest of the run.
+ *
+ * ~6k tokens. The cap is not really about this one result: an agent step re-sends the
+ * whole conversation, so a read is paid for again on every later step. Four 48k-char
+ * reads used to put ~48k tokens of file text into every subsequent prompt for the rest of
+ * the run. Reads are paged rather than lost — each truncated result names the offset to
+ * continue from — so the cost of a tighter cap is one extra call on the rare file that
+ * genuinely needs reading whole.
+ */
+const MAX_READ_CHARS = 24_000;
 
 /**
  * Width of the line-number gutter prefixed to every line of a read_file result, and the
@@ -558,9 +568,7 @@ export async function executeTool(rawCall: ToolCall, approver: ToolApprover, gua
 				// A command sent as a list of steps is joined with `&&`, not newlines: the shell
 				// would run every line regardless of the previous one's exit code, so a failed
 				// build would be followed by a "successful" test run against stale output.
-				const command = Array.isArray(call.args.command)
-					? call.args.command.map(asString).filter(Boolean).join(' && ')
-					: asString(call.args.command);
+				const command = commandTextOf(call.args);
 				const raw = asString(call.args.cwd).trim();
 				if (!raw) {
 					return await runCommand(root, '', command, approver, g);
@@ -580,6 +588,12 @@ export async function executeTool(rawCall: ToolCall, approver: ToolApprover, gua
 				};
 		}
 	} catch (err) {
+		// A cancellation is not a tool failure. Reported as one, the loop would hand the
+		// model "read_file failed: Aborted", it would pick a different approach, and the
+		// run the user just stopped would carry on doing work.
+		if (isAbortError(err)) {
+			throw err;
+		}
 		return { result: `Tool "${call.name}" failed: ${err instanceof Error ? err.message : String(err)}`, isError: true };
 	}
 }
@@ -1393,6 +1407,102 @@ export async function detectVerificationCommands(): Promise<VerifyCommand[]> {
 		}
 	}
 	return found;
+}
+
+/**
+ * Commands that actually check a change, as opposed to merely being a command.
+ *
+ * The completion gate treats "wrote files, then ran something that exited 0" as verified.
+ * Any command satisfying that is a hole the model walks straight through — `ls`, `git
+ * status`, `echo done` all clear the flag while proving nothing about the code that was
+ * just written. Matching the shape of a real build/test/lint invocation keeps the gate
+ * meaningful without demanding a specific command, which would be unenforceable across
+ * ecosystems. Deliberately generous: a false positive costs one skipped nudge, a false
+ * negative nags the model about work it already did.
+ */
+/** Test/build/lint runners recognized as the executable of a command. */
+const VERIFY_RUNNERS = new Set([
+	'pytest', 'mypy', 'ruff', 'flake8', 'pylint', 'eslint', 'stylelint', 'tsc',
+	'jest', 'vitest', 'mocha', 'ava', 'rspec', 'phpunit', 'dune', 'ctest',
+	'gradle', 'gradlew', 'mvn', 'make', 'cmake',
+]);
+
+/** Subcommands that mean "check the code" for each package/build front-end. */
+const VERIFY_SUBCOMMANDS: Record<string, ReadonlySet<string>> = {
+	npm: new Set(['test', 'build', 'lint', 'typecheck', 'type-check', 'check-types', 'compile', 'check', 'tsc']),
+	cargo: new Set(['check', 'build', 'test', 'clippy']),
+	go: new Set(['build', 'test', 'vet']),
+	dotnet: new Set(['build', 'test']),
+	python: new Set(['pytest', 'unittest', 'compileall', 'mypy', 'ruff']),
+	lang: new Set(['build', 'test']),
+};
+
+/** Front-ends whose first non-flag argument is looked up in {@link VERIFY_SUBCOMMANDS}. */
+const FRONT_ENDS: Record<string, keyof typeof VERIFY_SUBCOMMANDS> = {
+	npm: 'npm', pnpm: 'npm', yarn: 'npm', bun: 'npm', deno: 'npm',
+	cargo: 'cargo', go: 'go', dotnet: 'dotnet',
+	python: 'python', python3: 'python', py: 'python',
+	swift: 'lang', zig: 'lang', dart: 'lang', flutter: 'lang', mix: 'lang',
+};
+
+/**
+ * Whether `command` is plausibly a verification step (build, test, type-check, lint).
+ * Used by the agent loop to decide whether a successful command clears the "changed
+ * files but never checked them" flag.
+ *
+ * Matched against the *head* of each shell segment rather than anywhere in the string.
+ * A substring test looks equivalent and is not: `make` and `ava` are ordinary English,
+ * so `git commit -m "make it work"` read as a passing build and cleared the very gate
+ * this function exists to hold shut. Being fooled in that direction is the failure mode
+ * that matters — the run then reports success over unverified code.
+ */
+export function isVerificationCommand(command: string): boolean {
+	return command.split(/&&|\|\||[;|\n]/).some(isVerificationSegment);
+}
+
+/** Whether one shell segment invokes a verification runner. */
+function isVerificationSegment(segment: string): boolean {
+	// Leading `FOO=bar` environment assignments are not the command.
+	const tokens = segment.trim().split(/\s+/).filter(t => t && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t));
+	if (!tokens.length) {
+		return false;
+	}
+	// The executable, stripped of any directory prefix and Windows extension, so
+	// `./gradlew`, `node_modules/.bin/jest` and `tsc.cmd` all resolve to their name.
+	const head = (tokens[0].split(/[\\/]/).pop() ?? '').replace(/\.(exe|cmd|bat|ps1|sh)$/i, '').toLowerCase();
+	// Flags are dropped so `npm run build --if-present` and `python -m pytest -q` both
+	// present their meaningful argument first.
+	const args = tokens.slice(1).filter(t => !t.startsWith('-')).map(t => t.toLowerCase());
+	if (VERIFY_RUNNERS.has(head)) {
+		return true;
+	}
+	// `npx <runner>` / `pnpm dlx <runner>` delegate to a runner named in the arguments.
+	if ((head === 'npx' || head === 'dlx' || head === 'pnpm') && args.length) {
+		const delegated = (args[args[0] === 'dlx' ? 1 : 0] ?? '').split(/[\\/]/).pop() ?? '';
+		if (VERIFY_RUNNERS.has(delegated)) {
+			return true;
+		}
+	}
+	const family = FRONT_ENDS[head];
+	if (!family || !args.length) {
+		return false;
+	}
+	// `npm run build` — the subcommand is what follows `run`.
+	const subcommand = args[0] === 'run' && args.length > 1 ? args[1] : args[0];
+	// A script name like `test:unit` or `build-web` counts as its base verb.
+	return VERIFY_SUBCOMMANDS[family].has(subcommand)
+		|| VERIFY_SUBCOMMANDS[family].has(subcommand.split(/[:.\-_]/)[0]);
+}
+
+/**
+ * The command text of a `run_command` call, in the same joined form
+ * {@link executeTool} runs. Kept here so the loop's verification bookkeeping and the
+ * executor can never disagree about what was actually run.
+ */
+export function commandTextOf(args: Record<string, unknown>): string {
+	return Array.isArray(args.command)
+		? args.command.map(asString).filter(Boolean).join(' && ')
+		: asString(args.command);
 }
 
 const MAX_CMD_OUTPUT = 16_000;

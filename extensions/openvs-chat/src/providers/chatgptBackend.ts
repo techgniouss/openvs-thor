@@ -209,7 +209,12 @@ export async function chatgptAgentStep(label: string, request: AgentRequest): Pr
 			parameters: t.parameters,
 		})),
 		tool_choice: 'auto',
-		parallel_tool_calls: false,
+		// The agent loop has always executed a step's tool calls as a group, and its own
+		// doctrine tells the model to batch independent reads. Forcing one call per response
+		// made that instruction impossible to follow on this backend alone: four reads meant
+		// four full round trips instead of one. Multiple `function_call` items are collected
+		// by `streamResponses` above, so nothing downstream cares how many arrive.
+		parallel_tool_calls: true,
 		store: false,
 		stream: true,
 	}, request.signal, request.onToken, request.onNotice);

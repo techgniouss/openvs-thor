@@ -118,4 +118,77 @@ for (const msg of [
 	assert.ok(!m.isContextLengthError(msg), `should not detect: ${msg}`);
 }
 
+// The incremental token accounting inside trimMessages must agree exactly with a full
+// recount. Both passes track a running total instead of re-measuring the whole transcript
+// per iteration (that was quadratic, on a function called before every agent step), so a
+// drift in the delta arithmetic would silently trim too much or too little.
+{
+	/** A transcript with bulky tool output in the middle, the shape trimming targets. */
+	const build = n => {
+		const out = [
+			{ role: 'system', content: 'sys' },
+			{ role: 'user', content: 'the original request' },
+		];
+		for (let i = 0; i < n; i++) {
+			out.push({ role: 'assistant', content: `step ${i}`, toolCalls: [{ id: `c${i}`, name: 'read_file', args: { path: `f${i}.ts` } }] });
+			out.push({ role: 'tool', toolCallId: `c${i}`, content: `file ${i} contents `.repeat(120) });
+		}
+		out.push({ role: 'assistant', content: 'summary' });
+		return out;
+	};
+
+	const untrimmed = m.estimateMessagesTokens(build(12));
+	// The floor is what remains when everything trimmable is gone: the protected head and
+	// recent tail. It must be a real reduction, or every assertion below passes vacuously.
+	const floor = m.estimateMessagesTokens(m.trimMessages(build(12), 1));
+	assert.ok(floor < untrimmed / 2, `trimming must actually shrink the transcript (${untrimmed} → ${floor})`);
+
+	for (const budget of [500, 2_000, 5_000, 20_000, 200_000]) {
+		const trimmed = m.trimMessages(build(12), budget);
+		const actual = m.estimateMessagesTokens(trimmed);
+		// Either it fits, or it is already down to the floor — a budget below the protected
+		// head and tail cannot be met, and that is by design.
+		assert.ok(actual <= budget || actual <= floor,
+			`budget ${budget}: trimmed to ~${actual} tokens, which is neither under budget nor at the floor (~${floor})`);
+		// …and a budget the transcript genuinely exceeds must produce a real cut.
+		if (budget < untrimmed && budget > floor) {
+			assert.ok(actual < untrimmed, `budget ${budget}: nothing was trimmed at all`);
+		}
+		// The task itself is never trimmed away, whatever the budget.
+		assert.ok(trimmed.some(x => x.content === 'the original request'),
+			`budget ${budget}: the original request survived`);
+		// No tool result may outlive the assistant turn that called it.
+		const ids = new Set();
+		for (const msg of trimmed) {
+			for (const call of msg.toolCalls ?? []) { ids.add(call.id); }
+			if (msg.role === 'tool' && msg.toolCallId) {
+				assert.ok(ids.has(msg.toolCallId), `budget ${budget}: orphaned tool result ${msg.toolCallId}`);
+			}
+		}
+	}
+
+	// A conversation already under budget is returned untouched — the common case stays free.
+	const small = build(1);
+	assert.strictEqual(m.trimMessages(small, 1_000_000), small, 'a fitting conversation is not copied');
+}
+
+// The tool schemas ride along with every agent request, so they have to be charged against
+// the same budget. Counting only the messages understated every request by a fixed amount.
+{
+	const tools = [
+		{
+			name: 'read_file',
+			description: 'Read a file from the workspace.',
+			parameters: { type: 'object', properties: { path: { type: 'string', description: 'Workspace-relative path.' } }, required: ['path'] },
+		},
+		{ name: 'noop', description: '', parameters: { type: 'object', properties: {} } },
+	];
+	assert.strictEqual(m.estimateToolsTokens([]), 0, 'no tools cost nothing');
+	// The nested parameter schema is most of the cost, so a tool with one is worth several
+	// times one without — the reason this is measured on the serialized form.
+	const [described, bare] = tools.map(t => m.estimateToolsTokens([t]));
+	assert.ok(described > bare * 2, 'a real parameter schema dominates the estimate');
+	assert.strictEqual(m.estimateToolsTokens(tools), described + bare, 'tools sum');
+}
+
 console.log('test-context: all assertions passed');

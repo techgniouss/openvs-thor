@@ -3,13 +3,13 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { AgentCallbacks, AgentRunner } from '../agent/agentRunner';
-import { contextWindowFor } from '../agent/contextWindow';
-import { ToolApprover } from '../agent/tools';
+import { AgentCallbacks, AgentRunner, RunResult } from '../agent/agentRunner';
+import { contextBudgetFor, contextWindowFor } from '../agent/contextWindow';
+import { ToolApprover, asString, commandTextOf, normalizeToolCall } from '../agent/tools';
 import { McpToolset } from '../mcp/manager';
 import { TodoItem } from '../persona/todos';
 import { ProviderRegistry } from '../providers/registry';
-import { ChatMessage, ToolCall, streamChatWithContinuation } from '../providers/types';
+import { ChatMessage, ModelEntry, ToolCall, streamChatWithContinuation } from '../providers/types';
 import { AutoRole, RoleAssignment, RoleRouter } from './router';
 
 /** Events the orchestrator emits as it moves through the plan → code → review phases. */
@@ -46,6 +46,13 @@ export interface AutoRunParams {
 interface ChangeSink {
 	readonly narration: string[];
 	readonly changes: string[];
+	/**
+	 * How the implementation phase ended, when it ended for any reason other than
+	 * finishing. The reviewer is told: reviewing a half-applied change as though it were
+	 * the finished article is how an Auto run reports "correct and complete" over work
+	 * that stopped at the step limit.
+	 */
+	unfinished?: string;
 }
 
 /**
@@ -64,9 +71,51 @@ export class AutoOrchestrator {
 		private readonly approver: ToolApprover,
 		private readonly maxSteps: number,
 		private readonly mcp?: McpToolset,
+		/**
+		 * The host's cached model catalog for a provider, when it has been fetched. Without
+		 * it every Auto run sized its context window from the model *name* alone, so any
+		 * model the name table doesn't know fell back to the conservative default — which
+		 * made compaction fire after the first few file reads and summarize away the working
+		 * state the implementer still needed. The plain Agent path has always used it.
+		 */
+		private readonly catalog?: (providerId: string) => ModelEntry[] | undefined,
+		/**
+		 * Wall-clock ceiling for the whole Auto run, in ms; 0 for none. Shared across the
+		 * phases rather than granted to each: three phases with a 30-minute ceiling apiece
+		 * is a 90-minute run, which is not what the setting says.
+		 */
+		private readonly maxRunMs = 0,
+		/** Per-step timing notes, forwarded to every runner this orchestrates. */
+		private readonly traceTiming = false,
 	) { }
 
+	/** When this Auto run started, so each phase gets what is left rather than a fresh budget. */
+	private startedAt = Date.now();
+
+	/** The wall-clock allowance to hand the next runner, floored so a late phase still runs. */
+	private remainingRunMs(): number {
+		if (this.maxRunMs <= 0) {
+			return 0;
+		}
+		return Math.max(60_000, this.maxRunMs - (Date.now() - this.startedAt));
+	}
+
+	/** The run-length options every runner in this pipeline shares. */
+	private runLimits(): { maxRunMs: number; traceTiming: boolean } {
+		return { maxRunMs: this.remainingRunMs(), traceTiming: this.traceTiming };
+	}
+
+	/** Context-window and trim budget for a role's model, catalog-aware where possible. */
+	private budgetFor(assignment: RoleAssignment, maxTokens: number): { contextWindow: number; maxContextTokens: number } {
+		const entries = this.catalog?.(assignment.providerId);
+		return {
+			contextWindow: contextWindowFor(assignment.model, entries),
+			maxContextTokens: contextBudgetFor(assignment.model, maxTokens, 0, entries),
+		};
+	}
+
 	async run(params: AutoRunParams, cb: AutoCallbacks): Promise<void> {
+		this.startedAt = Date.now();
 		const planCandidates = await this.router.resolveRoleCandidates('plan');
 		const codeCandidates = await this.router.resolveRoleCandidates('code');
 		const reviewEnabled = this.router.isReviewEnabled();
@@ -130,6 +179,10 @@ export class AutoOrchestrator {
 					`Plan that was followed:\n${planText}\n\n` +
 					`Implementer's summary:\n${sink.narration.join('\n') || '(none)'}\n\n` +
 					`Actual changes made:\n${sink.changes.join('\n\n') || '(no file or command changes were recorded)'}\n\n` +
+					(sink.unfinished
+						? `IMPORTANT — the implementation did NOT run to completion:\n${sink.unfinished}\n` +
+						`Treat the changes above as partial. Say explicitly what is still missing; do not report the work complete.\n\n`
+						: '') +
 					`Review the changes above against the request and plan. Point out correctness bugs, ` +
 					`missed steps and risks. Be concise and specific. If it is correct and complete, say so.`,
 			},
@@ -227,9 +280,10 @@ export class AutoOrchestrator {
 			// instruction); only what the agent produces during the run may be compacted.
 			const runner = new AgentRunner(provider, this.approver, this.maxSteps, {
 				mcp: this.mcp,
-				contextWindow: contextWindowFor(a.model),
+				...this.budgetFor(a, maxTokens),
 				keepHead: seed.length,
 				steering,
+				...this.runLimits(),
 			});
 			try {
 				const outcome = await runner.run(
@@ -243,9 +297,7 @@ export class AutoOrchestrator {
 					},
 					agentCallbacks(cb, sink),
 				);
-				if (outcome.reason !== 'done' && outcome.detail) {
-					cb.note(outcome.detail);
-				}
+				noteOutcome(cb, sink, outcome);
 				return;
 			} catch (err) {
 				if (signal.aborted) {
@@ -309,14 +361,13 @@ export class AutoOrchestrator {
 			const runner = new AgentRunner(provider, this.approver, this.maxSteps, {
 				budget,
 				mcp: this.mcp,
-				contextWindow: contextWindowFor(a.model),
+				...this.budgetFor(a, maxTokens),
 				keepHead: stepSeed.length,
 				steering: params.steering,
+				...this.runLimits(),
 			});
 			const outcome = await runner.run(stepSeed, runParams, agentCallbacks(cb, sink));
-			if (outcome.reason !== 'done' && outcome.detail) {
-				cb.note(`Step ${i + 1} stopped early — ${outcome.detail}`);
-			}
+			noteOutcome(cb, sink, outcome, `Step ${i + 1}/${steps.length}`);
 		}
 	}
 
@@ -336,6 +387,23 @@ function agentCallbacks(cb: AutoCallbacks, sink: ChangeSink): AgentCallbacks {
 		onNote: text => cb.note(text),
 		onTodos: items => cb.onTodos?.(items),
 	};
+}
+
+/**
+ * Surfaces an implementation outcome to the user and, when it is not "done", records it
+ * for the reviewer. A run that hit the step limit, was cut short by the provider or gave
+ * up on a stalled model has produced a *partial* change; the reviewer must be told, or it
+ * reviews half a change against the whole plan and signs it off.
+ */
+function noteOutcome(cb: AutoCallbacks, sink: ChangeSink, outcome: RunResult, label?: string): void {
+	if (outcome.reason === 'done') {
+		return;
+	}
+	const detail = outcome.detail ?? outcome.reason;
+	cb.note(label ? `${label} stopped early — ${detail}` : detail);
+	sink.unfinished = sink.unfinished
+		? `${sink.unfinished}\n${label ?? 'Implementation'}: ${detail}`
+		: `${label ?? 'Implementation'}: ${detail}`;
 }
 
 /** Extracts numbered steps ("1. …", "2) …") from a plan for decomposition. */
@@ -372,24 +440,41 @@ function truncate(text: string, max: number): string {
 	return text.length > max ? text.slice(0, max) + `\n… [truncated, ${text.length} chars total]` : text;
 }
 
-function recordChangeStart(sink: ChangeSink, call: ToolCall): void {
+/**
+ * Records a change for the reviewer.
+ *
+ * The call is normalized first, exactly as the executor normalizes it. Reading the raw
+ * arguments meant this saw nothing whenever the model used another product's vocabulary
+ * (`old_string`/`new_string`, `file_path`) or `edit_file`'s batch form — and "nothing" was
+ * recorded as an edit with empty before/after text. The reviewer was then handed a diff of
+ * two empty strings and, having no changes to fault, reported the work correct and
+ * complete. A reviewer that cannot see the change is worse than no reviewer at all.
+ */
+function recordChangeStart(sink: ChangeSink, raw: ToolCall): void {
+	const call = normalizeToolCall(raw);
 	if (call.name === 'write_file') {
-		const path = String(call.args.path ?? '');
-		const content = String(call.args.content ?? '');
-		sink.changes.push(`Wrote \`${path}\`:\n\`\`\`\n${truncate(content, 2000)}\n\`\`\``);
+		const path = asString(call.args.path);
+		sink.changes.push(`Wrote \`${path}\`:\n\`\`\`\n${truncate(asString(call.args.content), 2000)}\n\`\`\``);
 	}
 	if (call.name === 'edit_file') {
-		const path = String(call.args.path ?? '');
-		const oldText = String(call.args.oldText ?? '');
-		const newText = String(call.args.newText ?? '');
-		sink.changes.push(`Edited \`${path}\`:\nReplaced:\n\`\`\`\n${truncate(oldText, 1000)}\n\`\`\`\nWith:\n\`\`\`\n${truncate(newText, 1000)}\n\`\`\``);
+		const path = asString(call.args.path);
+		// `edits` is canonical after normalization; a single-edit call is the one-element case.
+		const entries = Array.isArray(call.args.edits) ? call.args.edits : [call.args];
+		const rendered = entries.map(entry => {
+			const fields = typeof entry === 'object' && entry !== null ? entry as Record<string, unknown> : {};
+			return `Replaced:\n\`\`\`\n${truncate(asString(fields.oldText), 1000)}\n\`\`\`\nWith:\n\`\`\`\n${truncate(asString(fields.newText), 1000)}\n\`\`\``;
+		}).join('\n');
+		const count = entries.length > 1 ? ` (${entries.length} edits)` : '';
+		sink.changes.push(`Edited \`${path}\`${count}:\n${rendered}`);
 	}
 }
 
-function recordChangeEnd(sink: ChangeSink, call: ToolCall, result: string, _isError: boolean): void {
+function recordChangeEnd(sink: ChangeSink, raw: ToolCall, result: string, _isError: boolean): void {
+	const call = normalizeToolCall(raw);
 	if (call.name === 'run_command') {
-		const command = String(call.args.command ?? '');
-		sink.changes.push(`Ran \`${command}\`\nOutput:\n${truncate(result, 1500)}`);
+		// `commandTextOf` joins the list form the same way the executor does; `String(...)`
+		// on an array renders `a,b`, which is not what ran.
+		sink.changes.push(`Ran \`${commandTextOf(call.args)}\`\nOutput:\n${truncate(result, 1500)}`);
 	}
 }
 

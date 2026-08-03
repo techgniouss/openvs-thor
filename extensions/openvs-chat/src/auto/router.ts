@@ -5,7 +5,7 @@
 
 import * as vscode from 'vscode';
 import { ProviderRegistry } from '../providers/registry';
-import { modelSupportsTools } from '../providers/types';
+import { ModelEntry, ProviderInfo, entrySupportsTools } from '../providers/types';
 
 /**
  * The phases of an Auto run. Each phase can be served by a different model/provider,
@@ -88,7 +88,21 @@ const INFERENCE_CANDIDATES: Record<AutoRole, Array<{ providerId: string; model: 
  * left unset, it infers a sensible model from whichever providers currently have a key.
  */
 export class RoleRouter {
-	constructor(private readonly registry: ProviderRegistry) { }
+	constructor(
+		private readonly registry: ProviderRegistry,
+		/**
+		 * The host's cached model catalog for a provider, when fetched. Tool capability was
+		 * decided from the model *name* alone, while every other surface prefers the
+		 * catalog's own report — so Auto could refuse a model as "not tool-capable" that
+		 * plain Agent mode ran happily, and the user had no way to tell which was right.
+		 */
+		private readonly catalog?: (providerId: string) => ModelEntry[] | undefined,
+	) { }
+
+	/** Whether `model` can drive the tool loop, preferring the provider catalog's own report. */
+	private toolCapable(providerId: string, info: ProviderInfo, model: string): boolean {
+		return entrySupportsTools(info, this.catalog?.(providerId), model);
+	}
 
 	/** Reads the raw `provider:model` setting for a role (empty string if unset). */
 	getConfigured(role: AutoRole): { providerId: string; model: string } | undefined {
@@ -177,7 +191,7 @@ export class RoleRouter {
 			return { role, roleLabel, providerId, providerLabel, model, source, ready: false, problem: 'No model set.' };
 		}
 		// The implementation phase runs the tool loop, so its model must support tools.
-		if (role === 'code' && !modelSupportsTools(provider.info, model)) {
+		if (role === 'code' && !this.toolCapable(providerId, provider.info, model)) {
 			return {
 				role, roleLabel, providerId, providerLabel, model, source, ready: false,
 				problem: `"${model}" is not tool-capable, but the implementation phase needs tools. Pick a tool-capable model.`,
@@ -200,7 +214,7 @@ export class RoleRouter {
 			if (!provider) {
 				continue;
 			}
-			if (role === 'code' && !modelSupportsTools(provider.info, candidate.model)) {
+			if (role === 'code' && !this.toolCapable(candidate.providerId, provider.info, candidate.model)) {
 				continue;
 			}
 			const hasKey = await this.registry.hasCredentials(candidate.providerId);

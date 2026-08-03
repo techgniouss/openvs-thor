@@ -172,6 +172,19 @@ export interface ProviderInfo {
 	 * seamlessly instead of asking for a continuation in a new user turn.
 	 */
 	readonly supportsAssistantPrefill?: boolean;
+	/**
+	 * True when the backend serves a repeated prompt prefix from cache — Anthropic's
+	 * explicit `cache_control` breakpoints, OpenAI's automatic prefix caching, or a
+	 * gateway that provides one of those.
+	 *
+	 * This changes what a long conversation *costs*, which is why the agent loop asks:
+	 * every step re-sends the whole conversation, so without caching the per-step cost is
+	 * the conversation's current size and the run's total cost is quadratic in its length.
+	 * With caching the same prompt is a fraction of the price and far quicker to first
+	 * token, and compaction — which rewrites the middle and so invalidates the cached
+	 * prefix — becomes something to do later rather than sooner. See `COMPACT_TRIGGER`.
+	 */
+	readonly cachesPrompts?: boolean;
 }
 
 /**
@@ -236,6 +249,89 @@ const MAX_CONTINUATION_ROUNDS = 8;
  * backends without assistant prefill. Worded to prevent the two classic continuation
  * artifacts: re-sending earlier content and re-opening a fresh code fence.
  */
+/**
+ * What counts as a loop. A single line has to repeat {@link REPEAT_RUN_LIMIT} times; a
+ * cycle of several lines only {@link REPEAT_CYCLE_LIMIT}, since a model that keeps
+ * re-emitting the same *paragraph* has clearly lost the thread. Cycles shorter than
+ * {@link REPEAT_MIN_LINE_CHARS} in total are ignored: a run of `}` or `---` or `| --- |`
+ * is ordinary formatting, a run of the same sentence is not.
+ */
+const REPEAT_RUN_LIMIT = 8;
+const REPEAT_CYCLE_LIMIT = 4;
+const REPEAT_MAX_PERIOD = 4;
+const REPEAT_MIN_LINE_CHARS = 12;
+/** How much of the tail to inspect, and how many new characters to let by between scans. */
+const REPEAT_TAIL_CHARS = 4000;
+const REPEAT_SCAN_INTERVAL = 400;
+
+/**
+ * Whether `text` ends in the same line — or the same short cycle of lines — repeated over
+ * and over.
+ *
+ * A model that loses the plot mid-answer often emits one line (or one bullet pair) until
+ * its output budget runs out, and that cutoff reaches us as a max-token stop, identical to
+ * a genuinely long answer being clipped. Continuation then makes it worse, handing the
+ * loop another full budget up to {@link MAX_CONTINUATION_ROUNDS} times over.
+ */
+export function endsInRepeatLoop(text: string): boolean {
+	const tail = text.length > REPEAT_TAIL_CHARS ? text.slice(-REPEAT_TAIL_CHARS) : text;
+	const lines: string[] = [];
+	for (const raw of tail.split('\n')) {
+		const line = raw.trim();
+		if (line) {
+			lines.push(line);
+		}
+	}
+	// The last line is excluded rather than counted: mid-stream it is a half-written copy
+	// of the one above it, which would never compare equal.
+	const end = lines.length - 1;
+	for (let period = 1; period <= REPEAT_MAX_PERIOD; period++) {
+		const need = period === 1 ? REPEAT_RUN_LIMIT : REPEAT_CYCLE_LIMIT;
+		if (end < period * need) {
+			continue;
+		}
+		const cycle = lines.slice(end - period, end);
+		// Measured per line, not summed: two `| --- |` rules add up to a "long" cycle while
+		// still being nothing but table formatting.
+		if (!cycle.some(line => line.length >= REPEAT_MIN_LINE_CHARS)) {
+			continue;
+		}
+		let reps = 0;
+		for (let start = end - period; start >= 0; start -= period) {
+			let same = true;
+			for (let i = 0; i < period && same; i++) {
+				same = lines[start + i] === cycle[i];
+			}
+			if (!same) {
+				break;
+			}
+			reps++;
+		}
+		if (reps >= need) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * The last {@link REPEAT_TAIL_CHARS} of `earlier` followed by `latest`, without building
+ * the whole response to look at its end — the scan runs every few hundred characters, so
+ * concatenating a growing answer each time is quadratic in exactly the long responses this
+ * guard exists for.
+ */
+function repeatScanTail(earlier: string, latest: string): string {
+	if (latest.length >= REPEAT_TAIL_CHARS) {
+		return latest;
+	}
+	return earlier.slice(-(REPEAT_TAIL_CHARS - latest.length)) + latest;
+}
+
+/** Shown when a run is cut short by {@link endsInRepeatLoop} rather than by the model. */
+const REPEAT_LOOP_NOTICE =
+	'The model started repeating itself, so the response was stopped there instead of ' +
+	'being continued. Send the message again, or switch to a stronger model.';
+
 export const CONTINUE_PROMPT =
 	'Your previous message was cut off mid-response by the output token limit. ' +
 	'Continue EXACTLY where it stopped: output only the continuation, without repeating ' +
@@ -259,18 +355,65 @@ export async function streamChatWithContinuation(
 	let messages = request.messages;
 	for (let round = 0; ; round++) {
 		let chunk = '';
-		const result = await provider.streamChat({
-			...request,
-			messages,
-			onToken: delta => { chunk += delta; request.onToken(delta); },
-		});
+		// Aborting the provider is the only way to stop a loop while it is still burning
+		// tokens. It gets its own controller so ours stays distinguishable from the user's
+		// Stop — theirs must still propagate as an abort, ours must not.
+		const guard = new AbortController();
+		const relayAbort = () => guard.abort();
+		request.signal.addEventListener('abort', relayAbort, { once: true });
+		if (request.signal.aborted) {
+			guard.abort();
+		}
+		let looping = false;
+		let sinceScan = 0;
+		let result: StreamChatResult | undefined;
+		try {
+			result = (await provider.streamChat({
+				...request,
+				messages,
+				signal: guard.signal,
+				onToken: delta => {
+					chunk += delta;
+					request.onToken(delta);
+					// Scanning the tail on every token would be O(n²) over a long answer.
+					sinceScan += delta.length;
+					if (looping || sinceScan < REPEAT_SCAN_INTERVAL) {
+						return;
+					}
+					sinceScan = 0;
+					if (endsInRepeatLoop(repeatScanTail(full, chunk))) {
+						looping = true;
+						guard.abort();
+					}
+				},
+			})) || undefined;
+		} catch (err) {
+			// Our own abort ends the response where it stands; anything else is a real
+			// failure (including the user's Stop) and still belongs to the caller.
+			if (!looping || request.signal.aborted || !isAbortError(err)) {
+				throw err;
+			}
+		} finally {
+			request.signal.removeEventListener('abort', relayAbort);
+		}
 		full += chunk;
+		if (looping) {
+			request.onNotice?.(REPEAT_LOOP_NOTICE);
+			return { text: full, truncated: false };
+		}
 		const truncated = !!result?.truncated;
 		// A chunk with no real text means the model made no progress; bail rather than loop.
 		// Whitespace counts as no progress: continuing on it would also build a prefill turn
 		// that is empty after the trailing-whitespace strip below, which Anthropic rejects.
 		if (!truncated || !chunk.trim() || !full.trim() || round >= MAX_CONTINUATION_ROUNDS) {
 			return { text: full, truncated };
+		}
+		// The mid-stream scan can miss a loop that only became one on the last few lines, or
+		// that arrived in a single chunk from a non-streaming backend. Cut off *and* ending
+		// in a repeat means the loop ate the budget — continuing just buys it another.
+		if (endsInRepeatLoop(full)) {
+			request.onNotice?.(REPEAT_LOOP_NOTICE);
+			return { text: full, truncated: false };
 		}
 		if (provider.info.supportsAssistantPrefill) {
 			// A trailing assistant turn is continued in place. Trailing whitespace must be
@@ -581,6 +724,71 @@ export async function apiFetch(
 			throw lastError;
 		}
 	}
+}
+
+/**
+ * Whether a rejection is a cancellation rather than a failure.
+ *
+ * Broader than `err instanceof DOMException`: an abort reaches us as a `DOMException`
+ * from `fetch`, as a plain `Error` named `AbortError` from some runtimes and polyfills,
+ * and as a Node system error carrying `ABORT_ERR`. Getting this wrong is user-visible in
+ * the worst way — the agent loop turns an unrecognized rejection into a reported failure,
+ * so pressing Stop would pop an error toast blaming the provider.
+ */
+export function isAbortError(err: unknown): boolean {
+	if (err instanceof DOMException && err.name === 'AbortError') {
+		return true;
+	}
+	const candidate = err as { name?: unknown; code?: unknown } | null | undefined;
+	return !!candidate && (candidate.name === 'AbortError' || candidate.code === 'ABORT_ERR');
+}
+
+/**
+ * Failures that are definitively the caller's fault and will fail identically forever:
+ * a bad key, a revoked token, a model the account can't reach. Checked first, because a
+ * 403 body routinely contains words ("try again", "temporarily") that the transient
+ * patterns below would otherwise match.
+ */
+const PERMANENT_PATTERNS: RegExp[] = [
+	/authentication failed/,
+	/\bhttp 40[13]\b/,
+	/invalid api key|incorrect api key|no api key|unauthorized|forbidden/,
+	/does not support/,
+];
+
+/**
+ * Failures that a later identical request has a real chance of surviving: the provider
+ * fell over, the gateway queue timed out, the socket dropped mid-stream. Matched against
+ * the messages this module produces ({@link describeHttpError}, {@link readSSE},
+ * {@link apiFetch}) plus the raw runtime network errors underneath them.
+ */
+const TRANSIENT_PATTERNS: RegExp[] = [
+	/\bhttp 5\d\d\b/,
+	/\bhttp (408|409|425|429)\b/,
+	/rate limited/,
+	/response stalled/,
+	/ended before it was complete/,
+	/did not start responding within/,
+	/fetch failed|network error|socket hang up|premature close|terminated/,
+	/econnreset|econnrefused|etimedout|enotfound|eai_again|epipe/,
+	/temporarily unavailable|service unavailable|overloaded|bad gateway|gateway timeout/,
+];
+
+/**
+ * Whether a failed provider request is worth retrying as-is.
+ *
+ * The agent loop uses this to decide between resuming a run and ending it: a dropped
+ * stream halfway through a twenty-step task used to destroy the whole run — every tool
+ * result it had gathered lives only in that run's message array — while a bad API key
+ * retried three times just wastes the user's time. Unrecognized failures are treated as
+ * permanent, so a genuinely broken request fails fast and loudly.
+ */
+export function isTransientProviderError(message: string): boolean {
+	const m = message.toLowerCase();
+	if (PERMANENT_PATTERNS.some(p => p.test(m))) {
+		return false;
+	}
+	return TRANSIENT_PATTERNS.some(p => p.test(m));
 }
 
 /** Builds a friendly error message from a failed (non-OK) HTTP response. */

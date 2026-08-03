@@ -200,13 +200,74 @@
 		sessions = [s];
 		activeSessionId = s.id;
 	}
+	/**
+	 * Total base64 image data kept in persisted state, newest first.
+	 *
+	 * Attachments live in `messages` as base64, and `saveState` serializes every session on
+	 * every commit — so a few 5MB screenshots turned each save into a multi-megabyte
+	 * synchronous write, dozens of times a run. Recent images are the ones still worth
+	 * restoring; older ones are replaced by a marker so the transcript still shows that an
+	 * image was there. In-memory `messages` are untouched, so nothing changes for the
+	 * current session — only what survives a reload.
+	 */
+	const MAX_PERSISTED_IMAGE_BYTES = 2 * 1024 * 1024;
+
+	/**
+	 * Copies `messages` for persistence, keeping image data only while under the budget.
+	 * `budget` is threaded through the caller so the cap is global, not per session.
+	 * @param {Msg[]} messages
+	 * @param {{ left: number }} budget
+	 */
+	function messagesForState(messages, budget) {
+		const out = [];
+		// Newest first: the tail of the conversation is what a reload most needs intact.
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const m = messages[i];
+			if (!m.images?.length) {
+				out.push(m);
+				continue;
+			}
+			const bytes = m.images.reduce((sum, img) => sum + img.data.length, 0);
+			if (bytes <= budget.left) {
+				budget.left -= bytes;
+				out.push(m);
+			} else {
+				const count = m.images.length;
+				const note = `\n\n_[${count} image${count === 1 ? '' : 's'} not kept after reload]_`;
+				out.push({ role: m.role, content: (m.content || '') + note, kind: m.kind });
+			}
+		}
+		return out.reverse();
+	}
+
 	function saveState() {
+		const budget = { left: MAX_PERSISTED_IMAGE_BYTES };
+		// The budget is spent in order, so spend it on the tab the user is actually looking
+		// at before any background one — otherwise the visible conversation could lose its
+		// screenshot to a tab nobody has open. `sessions` order (and thus the tab strip) is
+		// untouched; only the order the budget is *allocated* in changes.
+		const byPriority = [...sessions].sort((a, b) =>
+			(a.id === activeSessionId ? 0 : 1) - (b.id === activeSessionId ? 0 : 1));
+		/** @type {Map<string, Msg[]>} */
+		const kept = new Map();
+		for (const s of byPriority) {
+			kept.set(s.id, messagesForState(s.messages, budget));
+		}
 		vscode.setState({
-			sessions: sessions.map(s => ({ id: s.id, title: s.title, messages: s.messages, queue: s.queue, compactSummary: s.compactSummary, compactedUpTo: s.compactedUpTo })),
+			sessions: sessions.map(s => ({
+				id: s.id,
+				title: s.title,
+				messages: kept.get(s.id) ?? s.messages,
+				queue: s.queue,
+				compactSummary: s.compactSummary,
+				compactedUpTo: s.compactedUpTo,
+			})),
 			activeSessionId,
 			mode,
 			selectedProvider,
-			history,
+			// Archived conversations are never re-sent to a model, so their image bytes buy
+			// nothing at all and are dropped outright.
+			history: history.map(h => ({ ...h, messages: messagesForState(h.messages, { left: 0 }) })),
 		});
 	}
 
@@ -304,12 +365,15 @@
 	function renderMarkdown(text) {
 		let rest = String(text);
 		let html = '';
+		// An empty segment is not blank prose: renderBlocks turns '' into a <br />, so the
+		// usual case — reasoning opening the turn, with nothing before it — used to render a
+		// stray line break above the block and another below every closed one.
 		for (let i = 0; ; i++) {
 			const open = rest.indexOf(THINK_OPEN);
 			if (open === -1) {
-				return html + renderProse(rest);
+				return html + (rest ? renderProse(rest) : '');
 			}
-			html += renderProse(rest.slice(0, open));
+			if (open > 0) { html += renderProse(rest.slice(0, open)); }
 			const after = rest.slice(open + THINK_OPEN.length);
 			const close = after.indexOf(THINK_CLOSE);
 			// No closing marker yet: the block is still streaming (or the stream died in it).
@@ -378,6 +442,8 @@
 
 	function renderAll() {
 		const s = cur();
+		// The whole transcript is about to be rebuilt, `pending` included.
+		cancelStreamRender();
 		els.messages.innerHTML = '';
 		activeAssistantBody = null;
 		toolEls.clear();
@@ -450,10 +516,11 @@
 		if (s.pending !== null) {
 			activeAssistantBody = appendMessageEl('assistant', s.pending);
 			activeAssistantBody.parentElement?.classList.add('streaming');
-			if (s.pending === '') {
-				startWorking(activeAssistantBody, s);
-			}
+			if (s.pending === '') { activeAssistantBody.parentElement?.classList.add('awaiting'); }
 		}
+		// The strip belongs to whichever tab is on screen: start it for a live run, and drop
+		// a strip left over from the tab we just switched away from.
+		if (s.streaming) { startWorking(); } else { stopWorking(); }
 		renderOpenPrompts();
 		scrollToBottom();
 	}
@@ -483,6 +550,7 @@
 		wrap.appendChild(roleEl);
 		wrap.appendChild(body);
 		els.messages.appendChild(wrap);
+		keepWorkingLast();
 		return body;
 	}
 	function appendToolEl(name, args) {
@@ -495,6 +563,15 @@
 		const summary = document.createElement('summary');
 		summary.className = 'tool-summary';
 		summary.textContent = 'running…';
+		// A tool call is the longest wait in a run, so it gets a Thor mark too — drawn from
+		// the same rotating set as the working indicator, otherwise the bolt was the only
+		// glyph a user ever saw (the four only rotated in the brief empty-bubble window).
+		// An <svg> holds no text nodes, so summary.textContent stays exactly 'running…',
+		// which the stop/cleanup path at 'stopped' compares against.
+		const mark = document.createElement('span');
+		mark.className = 'tool-glyph';
+		mark.innerHTML = pickGlyph();
+		summary.insertBefore(mark, summary.firstChild);
 		const out = document.createElement('pre');
 		out.className = 'tool-out';
 		details.appendChild(summary);
@@ -502,6 +579,7 @@
 		wrap.appendChild(head);
 		wrap.appendChild(details);
 		els.messages.appendChild(wrap);
+		keepWorkingLast();
 		scrollToBottom();
 		return { wrap, out, details, summary };
 	}
@@ -580,8 +658,15 @@
 	// to load, and these cards are the one place where a silent rendering failure strands
 	// an agent run rather than merely looking wrong.
 	const prompts = OpenVSPrompts.create({
-		container: els.messages,
-		post: m => vscode.postMessage(m),
+		// Cards append straight into the transcript, which would leave them below the
+		// working strip — the run is still going, so the strip has to stay at the foot.
+		container: { appendChild: node => { els.messages.appendChild(node); keepWorkingLast(); } },
+		// Answering a card hands the wait back to the model, so the strip's clock starts
+		// over — the seconds the user spent reading a diff are not the model being slow.
+		post: m => {
+			if (m && m.type === 'promptResponse') { noteWorkingProgress(); }
+			vscode.postMessage(m);
+		},
 		scroll: () => scrollToBottom(),
 	});
 
@@ -1115,7 +1200,7 @@
 			row.className = 'role-row' + (r.ready ? '' : ' not-ready');
 			const provOpts = ['<option value="">Auto-select</option>']
 				.concat(providers.map(p =>
-					`<option value="${p.id}"${pinned && p.id === r.providerId ? ' selected' : ''}>${escapeHtml(p.label)}</option>`))
+					`<option value="${escapeHtml(p.id)}"${pinned && p.id === r.providerId ? ' selected' : ''}>${escapeHtml(p.label)}</option>`))
 				.join('');
 			const listId = `auto-models-${r.role}`;
 			const sourceText = pinned
@@ -1325,7 +1410,11 @@
 			scrollToBottom();
 		}
 		saveState();
-		vscode.postMessage({ type: 'steer', sessionId: s.id, text });
+		// Stamped with the run it was typed into, exactly like every other run-scoped
+		// message. Without it a correction typed as one run finished was delivered to
+		// whichever run started next in this tab — the user watched their instruction be
+		// applied to the wrong task.
+		vscode.postMessage({ type: 'steer', sessionId: s.id, runId: s.runId, text });
 	}
 
 	// ---- Working indicator ------------------------------------------------------
@@ -1333,11 +1422,20 @@
 	// shows a whimsical cycling verb + elapsed time, so a queued or slow model never
 	// looks like the chat went idle. The first real token replaces it.
 
+	// Two halves on purpose. The plain verbs are the ones that read as "a mind is working"
+	// — they carry the message. The Asgard lines are flavour; they only land because they
+	// are the minority, so keep the first block at least as long as the second.
 	const WORKING_WORDS = [
-		'Thinking', 'Pondering', 'Mooshing', 'Percolating', 'Noodling', 'Brewing',
-		'Cogitating', 'Ruminating', 'Marinating', 'Conjuring', 'Untangling', 'Scheming',
-		'Musing', 'Simmering', 'Whirring', 'Crunching', 'Focusing', 'Reticulating splines',
-		'Herding tokens', 'Warming neurons', 'Consulting the manuals', 'Wrangling bits',
+		'Thinking', 'Pondering', 'Musing', 'Imagining', 'Percolating', 'Noodling',
+		'Brewing', 'Cogitating', 'Ruminating', 'Marinating', 'Conjuring', 'Untangling',
+		'Scheming', 'Simmering', 'Whirring', 'Crunching', 'Focusing', 'Deliberating',
+		'Reticulating splines', 'Herding tokens', 'Warming neurons', 'Wrangling bits',
+		'Summoning lightning', 'Swinging Mjolnir', 'Charging Stormbreaker',
+		'Calling the storm', 'Gathering thunder', 'Proving worthy', 'Sharpening the axe',
+		'Consulting Heimdall', 'Opening the Bifrost', 'Channeling the Odinforce',
+		'Rousing Asgard', 'Waking the Warriors Three', 'Out-scheming Loki',
+		'Assembling the Avengers', 'Rallying the Revengers', 'Consulting the Ancient One',
+		'Checking 14,000,605 outcomes', 'Bargaining with the Grandmaster',
 	];
 	// Thor-themed glyphs shown beside the verb, one picked per rotation: Mjolnir, a
 	// lightning bolt, and Thor's winged helm. Inline SVG rather than emoji or an image
@@ -1428,6 +1526,8 @@
 	let workingTimer = 0;
 	let lastWorkingWord = '';
 	let lastGlyph = '';
+	/** The live status strip, or null when the visible tab has nothing running. */
+	let workingEl = null;
 
 	function pickWorkingWord() {
 		let word = lastWorkingWord;
@@ -1448,33 +1548,104 @@
 		return glyph;
 	}
 
+	/**
+	 * When the wait now on the clock began. Reset on every sign of progress rather than
+	 * once per run: a run that streams, calls ten tools and streams again is not one wait,
+	 * and reporting it as one produced numbers like "1059s" that say nothing about whether
+	 * anything is stuck. What the user is actually asking the strip is "how long has *this*
+	 * been going", so that is what it counts.
+	 */
+	let workingSince = 0;
+	/** Whether the provider-queue hint is currently on the strip. */
+	let workingHintShown = false;
+
 	function stopWorking() {
 		clearInterval(workingTimer);
 		workingTimer = 0;
+		workingEl?.remove();
+		workingEl = null;
+		workingHintShown = false;
 	}
 
-	/** Attaches the animated working indicator to an (empty) streaming bubble. */
-	function startWorking(body, s) {
+	/**
+	 * Restarts the strip's clock — something visibly happened (a token, a tool starting or
+	 * finishing, a new phase). Also retracts the "still queued at the provider" hint, which
+	 * is a claim about silence and is simply false once output is moving again.
+	 */
+	function noteWorkingProgress() {
+		if (!workingEl) { return; }
+		workingSince = Date.now();
+		if (workingHintShown) {
+			workingEl.querySelector('.working-hint')?.remove();
+			workingHintShown = false;
+		}
+	}
+
+	/** Seconds as a clock a human reads at a glance: past a minute, "17m 39s" not "1059s". */
+	function formatElapsed(secs) {
+		if (secs < 60) { return `${secs}s`; }
+		return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+	}
+
+	/** Keeps the strip at the foot of the transcript as bubbles and tool blocks land. */
+	function keepWorkingLast() {
+		if (workingEl && workingEl.parentElement === els.messages && workingEl.nextSibling) {
+			els.messages.appendChild(workingEl);
+		}
+	}
+
+	/**
+	 * Shows the animated working indicator for the visible tab's run.
+	 *
+	 * It is a strip pinned to the foot of the transcript rather than a placeholder inside
+	 * the empty streaming bubble, because that bubble's first token overwrote it about a
+	 * second in — so for the whole rest of a run, the part that actually feels slow, the
+	 * only sign of life left was the caret. The strip lives as long as the run does, so
+	 * the verb and the rotating Thor glyph stay on screen across streaming and tool calls.
+	 *
+	 * Idempotent: every agent step re-opens a stream, so a second call re-anchors the
+	 * existing strip instead of building a new one. The clock it shows is not this
+	 * function's business — `noteWorkingProgress` owns it, and restarts it per wait.
+	 */
+	function startWorking() {
+		if (workingEl) {
+			// A transcript rebuild (tab switch, history restore) empties #messages and
+			// detaches the strip without the run having ended. Re-attach the same element
+			// rather than building a new one, so the clock keeps counting the wait in
+			// progress instead of restarting from zero every time the user looks away.
+			if (!workingEl.isConnected) { els.messages.appendChild(workingEl); }
+			keepWorkingLast();
+			return;
+		}
 		stopWorking();
-		const started = Date.now();
-		const el = document.createElement('span');
+		workingSince = Date.now();
+		const el = document.createElement('div');
 		el.className = 'working';
 		el.innerHTML = '<span class="working-glyph"></span><span class="working-word"></span><span class="working-meta"></span>';
-		body.appendChild(el);
+		els.messages.appendChild(el);
+		workingEl = el;
 		const glyphEl = /** @type {HTMLElement} */ (el.querySelector('.working-glyph'));
 		const wordEl = /** @type {HTMLElement} */ (el.querySelector('.working-word'));
 		const metaEl = /** @type {HTMLElement} */ (el.querySelector('.working-meta'));
 		let word = pickWorkingWord();
 		let glyph = pickGlyph();
-		let hintShown = false;
+		// Compared against the string we last wrote, not against glyphEl.innerHTML: the DOM
+		// re-serializes the SVG (attribute order, self-closing form), so reading it back
+		// never matches and the glyph was being rewritten every tick — which restarted the
+		// CSS animation each second, so the swing/hover never played through.
+		let drawn = '';
 		const render = () => {
-			const secs = Math.floor((Date.now() - started) / 1000);
-			if (glyphEl.innerHTML !== glyph) { glyphEl.innerHTML = glyph; }
+			const secs = Math.floor((Date.now() - workingSince) / 1000);
+			if (drawn !== glyph) { glyphEl.innerHTML = glyph; drawn = glyph; }
 			wordEl.textContent = `${word}…`;
-			metaEl.textContent = secs >= 8 ? ` ${secs}s` : '';
+			metaEl.textContent = secs >= 8 ? ` ${formatElapsed(secs)}` : '';
 			// Long silence is almost always the provider-side free-tier queue: say so once.
-			if (secs >= 25 && !hintShown) {
-				hintShown = true;
+			// 25s of *silence*, not of run time — mid-run this used to accuse the provider of
+			// queueing while tool output was actively scrolling past. An open approval or
+			// question card is the other false positive: there the run is blocked on the
+			// user, who is looking at the card the hint would be talking over.
+			if (secs >= 25 && !workingHintShown && !prompts.size()) {
+				workingHintShown = true;
 				const hint = document.createElement('span');
 				hint.className = 'working-hint';
 				hint.textContent = 'Still queued at the provider — free-tier models can take a minute or two when busy. Consistently slow? Try a smaller model or another provider.';
@@ -1484,8 +1655,8 @@
 		render();
 		let ticks = 0;
 		workingTimer = setInterval(() => {
-			// Bubble gone (tab switched / content arrived) — self-dispose.
-			if (!el.isConnected || (s.pending ?? '') !== '') {
+			// Strip gone (transcript re-rendered out from under it) — self-dispose.
+			if (!el.isConnected) {
 				stopWorking();
 				return;
 			}
@@ -1497,11 +1668,18 @@
 
 	/** Starts an in-flight assistant turn on a session (DOM bubble only when visible). */
 	function openStream(s) {
+		// A frame queued against the bubble this replaces would otherwise paint the new
+		// session's text into the old element (or the old text into the new one).
+		flushStreamRender();
 		s.pending = '';
 		if (s.id === activeSessionId) {
 			activeAssistantBody = appendMessageEl('assistant', '');
-			activeAssistantBody.parentElement?.classList.add('streaming');
-			startWorking(activeAssistantBody, s);
+			// 'awaiting' hides the bubble until its first token: with the strip carrying the
+			// status, an empty bubble is a grey box with a lone caret in it.
+			activeAssistantBody.parentElement?.classList.add('streaming', 'awaiting');
+			startWorking();
+			// Agent steps and Auto phases re-open a stream mid-run; that is a new wait.
+			noteWorkingProgress();
 		}
 	}
 
@@ -1523,11 +1701,70 @@
 		return cleaned.trim();
 	}
 
+	/**
+	 * Coalesced repaint of the streaming bubble.
+	 *
+	 * A token used to repaint synchronously: re-render the WHOLE accumulated answer to
+	 * markdown, reparse it through innerHTML, walk it twice for open thinking blocks, and
+	 * scroll. That is O(n²) over a response — and reasoning models stream thousands of
+	 * tokens — so a long answer progressively froze the panel and starved the message pump
+	 * the same run was using to report its progress. `s.pending` is still updated on every
+	 * token, so the model of record is unchanged; only the painting is rate-limited to one
+	 * frame.
+	 * @type {number}
+	 */
+	let streamFrame = 0;
+	/** @type {Session | null} The session whose pending text the queued frame will paint. */
+	let streamTarget = null;
+
+	function paintStream() {
+		const s = streamTarget;
+		streamTarget = null;
+		if (!s || s.id !== activeSessionId || !activeAssistantBody) { return; }
+		activeAssistantBody.parentElement?.classList.remove('awaiting');
+		setBodyMarkdown(activeAssistantBody, s.pending || '');
+		scrollToBottom();
+	}
+
+	/** Requests a repaint of `s`'s streaming bubble on the next frame (at most one queued). */
+	function scheduleStreamRender(s) {
+		streamTarget = s;
+		if (streamFrame) { return; }
+		streamFrame = requestAnimationFrame(() => { streamFrame = 0; paintStream(); });
+	}
+
+	/**
+	 * Paints any queued frame immediately. Every path that reads the bubble's DOM or
+	 * replaces it has to call this first, or the last tokens before a step/tool boundary
+	 * would be dropped from the rendered turn while still present in `s.pending`.
+	 */
+	function flushStreamRender() {
+		if (!streamFrame) { return; }
+		cancelAnimationFrame(streamFrame);
+		streamFrame = 0;
+		paintStream();
+	}
+
+	/**
+	 * Drops a queued frame without painting it. For callers that are about to rebuild the
+	 * transcript wholesale — painting into DOM that is one statement away from being
+	 * discarded is pure waste, and the rebuild renders `pending` itself.
+	 */
+	function cancelStreamRender() {
+		if (streamFrame) { cancelAnimationFrame(streamFrame); streamFrame = 0; }
+		streamTarget = null;
+	}
+
 	/** Commits a session's in-flight assistant turn into its transcript. */
 	function commitPending(s) {
-		// Only the visible tab owns the working indicator; a background tab finishing
-		// must not cancel the one running for the active tab.
-		if (s.id === activeSessionId) {
+		// The queued frame holds tokens that are in `s.pending` but not yet on screen;
+		// enhanceCodeBlocks below reads the rendered DOM, so it has to see them.
+		flushStreamRender();
+		// Only the visible tab owns the working indicator; a background tab finishing must
+		// not cancel the one running for the active tab. The `streaming` guard matters as
+		// much: this runs at every tool call and agent step too, and the strip has to
+		// outlive those — only the terminal 'done' (which clears the flag first) ends it.
+		if (s.id === activeSessionId && !s.streaming) {
 			stopWorking();
 		}
 		if (s.pending) {
@@ -1570,13 +1807,19 @@
 		}
 		pendingImages = [];
 		renderImageChips();
-		// Remember how this run was started so mid-run input knows whether to steer or queue.
-		s.runMode = (sendMode === 'agent' && !isAuto()) ? 'agent' : sendMode;
+		// Remember how this run was started so mid-run input knows whether to steer or
+		// queue. Agent runs steer, everything else queues — Auto included, since its
+		// implementer phase is an agent loop and the orchestrator forwards steering to it.
+		s.runMode = sendMode;
 
 		// In Auto mode the per-phase header creates its own bubble; otherwise pre-create one
 		// for non-agent streaming. (openStream only touches the DOM for the visible tab.)
 		if (sendMode !== 'agent' && !isAuto()) {
 			openStream(s);
+		} else if (s.id === activeSessionId) {
+			// Agent and Auto open their own bubbles later (per step / per phase), so the
+			// strip has to start here or the first — longest — wait shows nothing at all.
+			startWorking();
 		}
 		s.streaming = true;
 		renderTabs();
@@ -1997,9 +2240,8 @@
 				if (s.pending === null) { openStream(s); }
 				s.pending += msg.delta;
 				if (s.id === activeSessionId && activeAssistantBody) {
-					stopWorking();
-					setBodyMarkdown(activeAssistantBody, s.pending);
-					scrollToBottom();
+					noteWorkingProgress();
+					scheduleStreamRender(s);
 				}
 				break;
 			}
@@ -2009,6 +2251,7 @@
 				if (!s) { break; }
 				commitPending(s);
 				if (s.id === activeSessionId) {
+					noteWorkingProgress();
 					appendPhaseHeader(msg.label, msg.provider, msg.model, msg.source);
 				}
 				if (msg.streaming) { openStream(s); }
@@ -2030,6 +2273,7 @@
 					if (s.pending === null) { openStream(s); }
 					s.pending = msg.content;
 					if (s.id === activeSessionId && activeAssistantBody) {
+						activeAssistantBody.parentElement?.classList.remove('awaiting');
 						setBodyMarkdown(activeAssistantBody, s.pending);
 					}
 				}
@@ -2044,6 +2288,7 @@
 				commitPending(s);
 				// Tool blocks are rendered live only for the visible tab.
 				if (s.id === activeSessionId) {
+					noteWorkingProgress();
 					const el = appendToolEl(msg.name, msg.args);
 					toolEls.set(toolKey(s.id, msg.id || ('t' + (toolSeq++))), el);
 				}
@@ -2057,6 +2302,9 @@
 				const prefix = toolKey(s.id, '');
 				const key = msg.id ? toolKey(s.id, msg.id) : [...toolEls.keys()].find(k => k.startsWith(prefix));
 				const t = key ? toolEls.get(key) : undefined;
+				// Outside the block lookup: a tool that started while this tab was in the
+				// background has no block here, but its finishing is still progress.
+				noteWorkingProgress();
 				if (key && t) {
 					t.wrap.classList.remove('running');
 					t.wrap.classList.toggle('tool-error', !!msg.isError);
@@ -2077,6 +2325,7 @@
 				if (!s) { break; }
 				commitPending(s);
 				if (s.id === activeSessionId) {
+					noteWorkingProgress();
 					prompts.render(msg);
 				} else {
 					// Belongs to a background tab: remember it so switching there draws it,

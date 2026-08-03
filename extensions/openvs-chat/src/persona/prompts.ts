@@ -38,7 +38,7 @@ Core discipline:
 const THINKING = `Before answering or acting, reason briefly inside <thinking>…</thinking>: what is actually being asked, what you must look at, and your approach. Keep it under 150 words. The final answer goes OUTSIDE the tags — never inside. Close the tag before your answer. If your model already reasons natively (hidden chain of thought), skip the tags entirely.`;
 
 /** Agent-mode task tracking doctrine (the update_todos tool is registered in Agent mode). */
-const TASKS = `Task tracking: for any task that takes 3 or more steps, first call update_todos with the full checklist (short, outcome-shaped items). Keep exactly one item in_progress at a time, and update the list the moment an item completes — never batch updates. If the plan changes, rewrite the list.`;
+const TASKS = `Task tracking: for a task that takes 5 or more steps, first call update_todos with the full checklist (short, outcome-shaped items). Keep roughly one item in_progress at a time. update_todos costs a full round trip and does no work, so send it alongside your next real tool call rather than on its own, and fold several completed items into one update instead of one call per item. If the plan changes, rewrite the list.`;
 
 /**
  * Composes the head of the system prompt: identity, then the environment snapshot,

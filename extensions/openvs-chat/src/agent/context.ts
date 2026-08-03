@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { ChatMessage } from '../providers/types';
+import { ChatMessage, ToolSpec } from '../providers/types';
 
 /**
  * Conversation-window management. A long agent run accumulates every file it read and
@@ -36,19 +36,47 @@ export function estimateTokens(text: string): number {
 	return Math.ceil(text.length / 4);
 }
 
+/** Estimated token cost of one message, including its per-message overhead. */
+function estimateMessageTokens(m: ChatMessage): number {
+	let total = estimateTokens(m.content) + 4;
+	for (const call of m.toolCalls ?? []) {
+		total += estimateTokens(call.name) + estimateTokens(JSON.stringify(call.args)) + 4;
+	}
+	// A base64 image is bulky on the wire; count it so a chat full of screenshots
+	// doesn't sail past the budget undetected.
+	for (const img of m.images ?? []) {
+		total += estimateTokens(img.data);
+	}
+	return total;
+}
+
+/**
+ * Estimated token cost of the tool schemas, which every agent request carries alongside
+ * the conversation.
+ *
+ * Counted because they are not free and not small: the built-in set alone serializes to
+ * roughly 1.9k tokens, and a connected MCP server can add several times that with no
+ * upper bound. Budgeting against the messages alone therefore understated every agent
+ * request by a fixed amount — enough, on a 32k-window model, to push a request the budget
+ * called safe over the real limit, which costs a wasted round trip on the halve-and-retry
+ * path and delays compaction that should already have run.
+ */
+export function estimateToolsTokens(tools: ToolSpec[]): number {
+	let total = 0;
+	for (const tool of tools) {
+		// Serialized rather than measured field by field: the JSON punctuation of a nested
+		// parameter schema is most of its cost, and omitting it would repeat the original
+		// mistake at a smaller scale.
+		total += estimateTokens(JSON.stringify({ name: tool.name, description: tool.description, parameters: tool.parameters }));
+	}
+	return total;
+}
+
 /** Estimated token cost of a whole conversation, including per-message overhead. */
 export function estimateMessagesTokens(messages: ChatMessage[]): number {
 	let total = 0;
 	for (const m of messages) {
-		total += estimateTokens(m.content) + 4;
-		for (const call of m.toolCalls ?? []) {
-			total += estimateTokens(call.name) + estimateTokens(JSON.stringify(call.args)) + 4;
-		}
-		// A base64 image is bulky on the wire; count it so a chat full of screenshots
-		// doesn't sail past the budget undetected.
-		for (const img of m.images ?? []) {
-			total += estimateTokens(img.data);
-		}
+		total += estimateMessageTokens(m);
 	}
 	return total;
 }
@@ -73,6 +101,16 @@ export function trimMessages(messages: ChatMessage[], budget: number): ChatMessa
 	const firstUser = trimmed.findIndex(m => m.role === 'user');
 	const start = Math.max(firstUser + 1, trimmed.findIndex(m => m.role !== 'system'));
 
+	// Running total, adjusted by each edit rather than recomputed from scratch.
+	//
+	// Both passes below used to call `estimateMessagesTokens(trimmed)` per iteration, each
+	// walk re-measuring every message (and re-`JSON.stringify`-ing every tool call) in the
+	// conversation. That is quadratic in transcript length on a function called before
+	// EVERY agent step, so a long run spent an increasing share of each step re-counting
+	// characters it had already counted. Tracking the delta is exact — the same helper
+	// measures the message before and after — and turns both passes linear.
+	let total = estimateMessagesTokens(trimmed);
+
 	// Pass 1: shorten the biggest tool results, newest couple excluded — the model is
 	// usually still working with those.
 	const candidates = [];
@@ -83,19 +121,24 @@ export function trimMessages(messages: ChatMessage[], budget: number): ChatMessa
 	}
 	candidates.sort((a, b) => trimmed[b].content.length - trimmed[a].content.length);
 	for (const i of candidates) {
-		if (estimateMessagesTokens(trimmed) <= budget) {
+		if (total <= budget) {
 			break;
 		}
+		const before = estimateMessageTokens(trimmed[i]);
 		// Keep the head: the start of a file or command output usually identifies it.
 		trimmed[i] = { ...trimmed[i], content: `${trimmed[i].content.slice(0, 200)}\n\n${TRIM_MARKER}` };
+		total += estimateMessageTokens(trimmed[i]) - before;
 	}
 
 	// Pass 2: still too big, so drop whole middle turns oldest-first, leaving one note
 	// behind so the model can tell that history was removed rather than never happened.
-	if (estimateMessagesTokens(trimmed) > budget) {
+	if (total > budget) {
 		const floor = Math.max(start, trimmed.length - KEEP_RECENT_TURNS);
 		let cut = 0;
-		while (start + cut < floor && estimateMessagesTokens(trimmed.slice(0, start).concat(trimmed.slice(start + cut))) > budget) {
+		// `dropped` mirrors the slice the loop condition used to rebuild and re-measure.
+		let dropped = 0;
+		while (start + cut < floor && total - dropped > budget) {
+			dropped += estimateMessageTokens(trimmed[start + cut]);
 			cut++;
 		}
 		// Extend the cut past any tool results left at the boundary: keeping a `tool`

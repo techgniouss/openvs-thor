@@ -55,6 +55,14 @@ export interface Guardrails {
 	readonly maxSubagents: number;
 	readonly maxSubagentDepth: number;
 	readonly parallelResearch: boolean;
+	/**
+	 * Whether consecutive read-only tool calls in one step run concurrently. The four read
+	 * tools take no approval and change nothing, so the only thing serializing them bought
+	 * was latency — a model that batched four reads (as the agent doctrine tells it to)
+	 * waited for all four round trips end to end. Kept as a setting so a workspace on a
+	 * pathologically slow filesystem can turn it off.
+	 */
+	readonly parallelReads: boolean;
 	/** Shell `run_command` executes through; empty means the platform default. */
 	readonly shell: string;
 }
@@ -79,10 +87,15 @@ export function loadGuardrails(): Guardrails {
 		deniedCommands: compile(cfg.get<string[]>('guardrails.deniedCommands') ?? []),
 		allowedCommands: compile(cfg.get<string[]>('guardrails.allowedCommands') ?? []),
 		protectedPaths: cfg.get<string[]>('guardrails.protectedPaths') ?? [],
-		commandTimeoutMs: cfg.get<number>('agent.commandTimeoutMs') ?? 60_000,
+		// Matches the manifest default. They disagreed (60s here, 300s there), so anything
+		// reading the setting without the contribution registered — a test, a host that
+		// hasn't activated the extension — silently got a timeout five times shorter than
+		// documented, and killed builds it should have waited for.
+		commandTimeoutMs: cfg.get<number>('agent.commandTimeoutMs') ?? 300_000,
 		maxSubagents: cfg.get<number>('agent.maxSubagents') ?? 4,
 		maxSubagentDepth: cfg.get<number>('agent.maxSubagentDepth') ?? 2,
 		parallelResearch: cfg.get<boolean>('agent.parallelResearch') ?? true,
+		parallelReads: cfg.get<boolean>('agent.parallelReads') ?? true,
 		shell: cfg.get<string>('agent.shell')?.trim() ?? '',
 	};
 }

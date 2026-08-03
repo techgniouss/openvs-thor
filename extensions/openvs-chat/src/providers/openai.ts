@@ -25,6 +25,10 @@ export class OpenAIProvider extends OpenAICompatibleProvider {
 		toolModelPatterns: ['gpt-3\\.5', 'gpt-4', 'gpt-5', '^o[0-9]', 'chatgpt', 'codex'],
 		// gpt-4o/4.1/5 and the o-series are multimodal; bare gpt-4/gpt-3.5 are not.
 		visionModelPatterns: ['gpt-4o', 'gpt-4\\.1', 'gpt-4-turbo', 'gpt-5', '^o[0-9]'],
+		// OpenAI caches a repeated prompt prefix automatically past ~1k tokens — no
+		// breakpoints to send, but it means an agent run's growing conversation is not the
+		// cost the same run would be on an uncached gateway.
+		cachesPrompts: true,
 	};
 
 	override async streamChat(request: ChatRequest): Promise<StreamChatResult> {
