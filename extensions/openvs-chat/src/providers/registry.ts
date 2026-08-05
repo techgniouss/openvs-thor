@@ -6,7 +6,9 @@
 import * as vscode from 'vscode';
 import { OAuthTokenStore } from '../oauth';
 import { AnthropicProvider } from './anthropic';
+import { AntigravityProvider } from './antigravity';
 import { CustomProvider } from './custom';
+import { GeminiProvider } from './gemini';
 import { KimiProvider } from './kimi';
 import { NvidiaProvider } from './nvidia';
 import { OpenAIProvider } from './openai';
@@ -50,7 +52,7 @@ export class ProviderRegistry {
 
 	constructor(private readonly secrets: vscode.SecretStorage) {
 		this.oauth = new OAuthTokenStore(secrets);
-		for (const provider of [new NvidiaProvider(), new OpenAIProvider(), new AnthropicProvider(), new OpenRouterProvider(), new KimiProvider(), new QwenProvider(), new CustomProvider()]) {
+		for (const provider of [new NvidiaProvider(), new OpenAIProvider(), new AnthropicProvider(), new GeminiProvider(), new AntigravityProvider(), new OpenRouterProvider(), new KimiProvider(), new QwenProvider(), new CustomProvider()]) {
 			this.providers.set(provider.info.id, provider);
 		}
 	}
@@ -101,10 +103,11 @@ export class ProviderRegistry {
 		return id === 'openai' ? 'OPENAI_API_KEY'
 			: id === 'anthropic' ? 'ANTHROPIC_API_KEY'
 				: id === 'nvidia' ? 'NVIDIA_API_KEY'
-					: id === 'openrouter' ? 'OPENROUTER_API_KEY'
-						: id === 'kimi' ? 'MOONSHOT_API_KEY'
-							: id === 'qwen' ? 'DASHSCOPE_API_KEY'
-								: undefined;
+					: id === 'gemini' ? 'GEMINI_API_KEY'
+						: id === 'openrouter' ? 'OPENROUTER_API_KEY'
+							: id === 'kimi' ? 'MOONSHOT_API_KEY'
+								: id === 'qwen' ? 'DASHSCOPE_API_KEY'
+									: undefined;
 	}
 
 	/** Whether this provider's key currently comes from an environment variable (takes precedence over, and can't be removed by, the stored secret). */

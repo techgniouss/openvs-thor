@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as vscode from 'vscode';
-import { signInAnthropic, signInOpenAI, signInOpenRouter, supportsNativeSignIn } from './oauth';
+import { signInAnthropic, signInAntigravity, signInOpenAI, signInOpenRouter, supportsNativeSignIn } from './oauth';
 import { ProviderRegistry } from './providers/registry';
 
 const CALLBACK_PATH = '/auth-callback';
@@ -113,6 +113,13 @@ export class WebAuthManager implements vscode.UriHandler {
 	private async nativeSignIn(providerId: string): Promise<boolean> {
 		if (providerId === 'anthropic') {
 			const ok = await signInAnthropic(this.registry.oauth);
+			if (ok) {
+				await this.registry.adoptOAuth(providerId);
+			}
+			return ok;
+		}
+		if (providerId === 'antigravity') {
+			const ok = await signInAntigravity(this.registry.oauth);
 			if (ok) {
 				await this.registry.adoptOAuth(providerId);
 			}

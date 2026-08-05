@@ -247,6 +247,8 @@
             "openai",
             "anthropic",
             "nvidia",
+            "gemini",
+            "antigravity",
             "openrouter",
             "kimi",
             "qwen",
@@ -256,6 +258,8 @@
             "%config.provider.openai%",
             "%config.provider.anthropic%",
             "%config.provider.nvidia%",
+            "%config.provider.gemini%",
+            "%config.provider.antigravity%",
             "%config.provider.openrouter%",
             "%config.provider.kimi%",
             "%config.provider.qwen%",
@@ -308,6 +312,26 @@
           "type": "string",
           "default": "",
           "description": "%config.authUrl%"
+        },
+        "openvsChat.gemini.model": {
+          "type": "string",
+          "default": "gemini-2.5-flash",
+          "description": "%config.gemini.model%"
+        },
+        "openvsChat.gemini.baseUrl": {
+          "type": "string",
+          "default": "https://generativelanguage.googleapis.com/v1beta/openai",
+          "description": "%config.gemini.baseUrl%"
+        },
+        "openvsChat.gemini.authUrl": {
+          "type": "string",
+          "default": "",
+          "description": "%config.authUrl%"
+        },
+        "openvsChat.antigravity.model": {
+          "type": "string",
+          "default": "gemini-2.5-flash",
+          "description": "%config.antigravity.model%"
         },
         "openvsChat.openrouter.model": {
           "type": "string",

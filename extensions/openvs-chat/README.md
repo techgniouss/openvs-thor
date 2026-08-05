@@ -23,6 +23,10 @@ chat panel that lets **you** choose the model provider.
   - **Anthropic (Claude)** — `claude-3-5-sonnet`, `claude-sonnet-4`, …
   - **NVIDIA** — a generous **free tier** via [build.nvidia.com](https://build.nvidia.com/)
     with models like Llama 3.x, Nemotron, Qwen Coder and DeepSeek.
+  - **Google Gemini** — via Google's official OpenAI-compatible endpoint and a real
+    `AIza...` API key from [aistudio.google.com](https://aistudio.google.com/apikey)
+    (free tier available). Not the Gemini CLI / Antigravity OAuth login — Google retired
+    that route for third-party tools in mid-2026.
 - **Providers panel** (⚙) listing every provider with its key status, an inline key
   field, a **Get API key** link, a **Sign in with web** button, and a **Test connection**
   check that confirms a key works before you rely on it.
@@ -44,8 +48,8 @@ chat panel that lets **you** choose the model provider.
   workspace.
 - **Three ways to authenticate:**
   - **API key** — stored in the OS secret store (VS Code `SecretStorage`), never in
-    plaintext settings. Also readable from `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` or
-    `NVIDIA_API_KEY`.
+    plaintext settings. Also readable from `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+    `NVIDIA_API_KEY` or `GEMINI_API_KEY`.
   - **Subscription sign-in (no API key)** — **Sign in with Claude** logs in with your
     claude.ai account (works with a Claude Pro/Max subscription): approve access in the
     browser and paste the confirmation code back. **Sign in with ChatGPT** logs in with

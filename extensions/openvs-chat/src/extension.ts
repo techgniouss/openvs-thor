@@ -7,6 +7,7 @@ import * as vscode from 'vscode';
 import { WebAuthManager } from './auth';
 import { ChatViewProvider, InlineKind } from './chatViewProvider';
 import { McpManager } from './mcp/manager';
+import { loadEnvFile } from './oauth';
 import { ProviderRegistry } from './providers/registry';
 import { setStreamIdleTimeout } from './providers/types';
 import { SkillRegistry } from './skills';
@@ -23,6 +24,7 @@ function applyStreamIdleTimeout(): void {
 }
 
 export function activate(context: vscode.ExtensionContext): void {
+	loadEnvFile(context.extensionPath);
 	applyStreamIdleTimeout();
 	context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
 		if (e.affectsConfiguration('openvsChat.stream.idleTimeoutMs')) {
@@ -165,7 +167,7 @@ async function configureProvider(
 		prompt: `Paste your API key (stored in the OS secret store). Get one at ${provider.info.apiKeyUrl}`,
 		password: true,
 		ignoreFocusOut: true,
-		placeHolder: id === 'nvidia' ? 'nvapi-...' : id === 'anthropic' ? 'sk-ant-...' : id === 'openrouter' ? 'sk-or-v1-...' : 'sk-...',
+		placeHolder: id === 'nvidia' ? 'nvapi-...' : id === 'anthropic' ? 'sk-ant-...' : id === 'gemini' ? 'AIza...' : id === 'openrouter' ? 'sk-or-v1-...' : 'sk-...',
 	});
 	if (!key) {
 		return;
