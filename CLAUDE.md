@@ -157,8 +157,15 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   tool schemas (~1.9k tokens built-in, unbounded once MCP servers connect) are charged
   against the context budget via `estimateToolsTokens` — counting only the messages
   understated every agent request by that whole amount.
-  The shared client streams `reasoning_content` (DeepSeek-R1-style models) and uses a 150s
-  first-byte timeout for chat POSTs (free tiers queue server-side). NVIDIA's model list is
+  The shared client streams reasoning through `reasoningDelta`, which accepts every spelling
+  in use — `reasoning_content` (DeepSeek-R1-style), `reasoning` (Groq, OpenRouter) and the
+  object-wrapped form — because a turn spent entirely thinking carries no `content` and no
+  tool calls, so reading one spelling made those turns arrive as *empty replies* and the
+  agent loop abandoned the run after four. It also raises a backend's **in-band stream
+  error** (`throwStreamError`): NVIDIA NIM and other vLLM-based gateways report failures as
+  an SSE event on an HTTP 200, and skipping them turned a stated provider error into the
+  same silent "empty reply" stall. The Anthropic client has always raised these.
+  A 150s first-byte timeout is used for chat POSTs (free tiers queue server-side). NVIDIA's model list is
   filtered to chat-capable models. Keys are stored in VS Code `SecretStorage`, never in
   plaintext settings; `OPENROUTER_API_KEY` / `MOONSHOT_API_KEY` / `DASHSCOPE_API_KEY` env
   vars also work. `openai.ts` additionally routes through `chatgptBackend.ts` (the ChatGPT
@@ -179,9 +186,68 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   caps how many times the model is asked (Full Auto extends itself to 2× that, nothing
   else does), and `openvsChat.agent.maxRunMinutes` caps how long the asking may take —
   on a queued free tier one step can stall for minutes without the step count moving.
-  Sub-agents inherit the parent's *remaining* time rather than a fresh budget. Each
-  top-level run closes with a note giving its elapsed time and peak prompt size;
-  `openvsChat.agent.traceTiming` adds the same per step. Within a step, adjacent
+  Sub-agents inherit the parent's *remaining* time rather than a fresh budget.
+  A third bound is the backend's own **per-request token allowance**, which is unrelated to
+  the model's context window and invisible to every catalog: Groq's free tier serves
+  `qwen/qwen3.6-27b` with a 128k window and an 8k allowance, and counts the reserved
+  `max_tokens` against it — so the default 8192 reservation alone exceeds the limit before
+  any prompt is added, and no amount of trimming can rescue it. `providers/rateLimits.ts`
+  reads that allowance off `x-ratelimit-*` / `anthropic-ratelimit-*` response headers (both
+  spellings, three reset formats) into a per-model `RateLimitTracker` held on the provider
+  singleton, and `agentRunner.adoptRequestCeiling` re-derives *both* budgets from it — reply
+  reservation and conversation — before the request that would have broken it. It may only
+  ever **tighten**: the allowance is tokens-per-request, not a window, so letting a roomy one
+  raise the budget would trade a rate-limit rejection for a context-length one. When no
+  header is offered the same ceiling is still learned from the HTTP 413 body
+  (`parseTokenLimit`), one wasted request later. `apiFetch` also takes a `pace` hook: when a
+  reading says the request cannot fit what is left of the current window, it waits out the
+  refill instead of spending a request to be refused — Groq counts *failed* requests against
+  the daily budget. All its backoff sleeps are abortable, so Stop is instant. Each
+  top-level run closes with a ledger: elapsed time, *cumulative* estimated input tokens
+  over the requests it took (compaction's own summarizer calls included), and the peak
+  single prompt. Cumulative, because a step re-sends the whole conversation — the total is
+  what grows with a long run, and a peak alone can't tell two steps from forty.
+  `openvsChat.agent.traceTiming` adds per-step timing. Two distinct passes keep that total
+  down, and they answer different questions. `trimMessages` is a *correctness* guard —
+  it fires only when a request would not fit. `pruneToolOutput` is an *economy* pass: it
+  elides tool output the model no longer needs sent regardless of budget (a read whose
+  identical call recurs later, a read of a file a later `write_file` replaced wholesale —
+  `edit_file` deliberately does not count, since a targeted edit leaves the old dump mostly
+  accurate and eliding it would force a costlier re-read — and anything older than the kept
+  turns). Measured on a synthetic 30-step run: 2455k → 1048k input tokens. Both passes work
+  on a **copy**; the run's own transcript is never rewritten, so compaction and the
+  truncation-carry splice still see full history. Pruning is skipped entirely when
+  `cachesPrompts` is set — there, re-sending an old dump costs a fraction of its first
+  price while eliding it rewrites the middle and throws the cached prefix away, the same
+  trade `CACHED_COMPACT_TRIGGER` makes. Compaction is likewise judged on the *pruned* view,
+  or a run would pay for a summarizer call to fix a size it no longer sends.
+  **Anything that elides tool output must un-remember the corresponding read**
+  (`forgetElidedReads`): the repeat-read breaker tells the model "its result is still above
+  in this conversation", and if that result has been elided the model can neither see the
+  content nor fetch it, and burns the step budget being refused. This applies to trimming
+  too, which has always elided output — the deadlock predates pruning.
+  `trimMessages` now exhausts **every** lever before giving up on its budget, including
+  eliding the recent tool output it otherwise protects: one fresh `read_file` is 24k chars,
+  so against a small budget that single result can exceed the whole allowance, and returning
+  it anyway produced a request the caller then sent and the provider refused. It still
+  cannot shrink the system prompt or the task itself, so a budget below those is returned
+  over — the callers' floors keep the budget out of that region. The compaction summarizer is bounded the
+  same way (`compactMessages`'s `maxInputTokens`) — unbounded it sent the entire conversation
+  up to the tail, making it the *largest* request a run made, so on a tight allowance it
+  failed twice and compaction disabled itself for the rest of the run. It is trimmed in two
+  stages, before flattening (so bulky tool output can be told from narration) and after (because
+  flattening adds a `[tool result] ` prefix per turn, and a bound measured before that is not
+  the bound the request is judged by). Compaction also stops after two runs that leave the
+  request still over the threshold: below a certain budget a summary plus one protected file
+  read already exceeds it, so every further attempt buys a summarizer request and no relief.
+  Tool *output* is sized to the budget too, via `ToolLimits`: `read_file`'s default 24k-char
+  page is ~6k tokens, larger than the whole conversation budget on an 8k allowance, so the
+  result was elided by trimming before the model could use a line of it. Reads are paged and
+  name the offset to continue from, so a smaller page costs a call, not information.
+  Both budget clamps also apply to the **plain streaming path** (`configuredContextTokens`
+  and `effectiveMaxTokens` in `chatViewProvider.ts`) — a model without tool support, or Edit
+  mode, has no agent loop to learn a ceiling in, so it has to be right on the first request.
+  Within a step, adjacent
   read-only tool calls run concurrently (`openvsChat.agent.parallelReads`) — the guards
   are evaluated in order before anything is dispatched, so batching can't be used to slip
   past the repeat-read breaker.
@@ -201,14 +267,34 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   degrades performance rather than breaking search.
 - `src/auto/` — **Auto** role-routing mode: `router.ts` picks/validates per-role models
   (planning / implementation / review) from `openvsChat.auto.*` settings, honoring pinned
-  models exactly and only falling back for auto-selected ones. Its `INFERENCE_CANDIDATES`
-  list names *preferred* models from a few providers — it is not the list Auto supports;
-  when none of them can run, `sweepCandidates` falls back to whatever the user actually
-  holds a credential for, which is what keeps Auto usable for someone whose only key is a
-  free provider. The sweep costs a credential read per provider, so it is walked only after
-  the preferred list comes up empty, never concatenated onto it. `orchestrator.ts` runs the
+  models exactly and only falling back for auto-selected ones. Inference is built
+  **from what the user actually holds a credential for** (`inferredPool`), never from a
+  fixed table of vendor model ids: that table preferred paid frontier models nobody asked
+  to spend on, and named exact ids an account may not be entitled to, so a run 404'd on its
+  first request. Each credentialed provider contributes *several* models — the user's own
+  selected one first, then that provider's suggestions — because representing a provider by
+  one model disqualified the whole provider whenever that model failed the role's
+  requirements. Candidates are then filtered by hard requirements (tool capability for
+  `code`, vision when the request carries images, existence in the fetched catalog when
+  there is one, and `NOT_AUTO_SELECTED_MODELS` — premium-billed models Auto must not choose
+  on the user's behalf, though they stay pinnable) and ranked by `score`: the user's own
+  pick outranks role affinity, which outranks the provider's own ordering. The chain is
+  capped **per provider** as well as overall — five models behind one revoked key is not a
+  fallback from anything. Credential reads
+  are memoized per resolution pass (`CredentialMemo`), since this runs on the settings
+  panel's render path and at the head of every run. `orchestrator.ts` runs the
   plan → implement → review pipeline (or a per-step decomposition when
-  `openvsChat.auto.decompose` is set).
+  `openvsChat.auto.decompose` is set). Its **text phases are budgeted like every other
+  request** — `streamBudgeted` + `requestBudgets`, the same pair the plain streaming path
+  uses. Unbudgeted, the planner sent the conversation raw with the full configured
+  reservation, so on a backend with a small per-request allowance an Auto run died in the
+  planner, before the implementer — the one phase that learns a ceiling for itself — ever
+  ran. Every Auto run closes with an `autoSummary` naming the model each role *actually*
+  used — recorded into the session transcript with a `kind` (so it survives a tab switch,
+  a reload and History, and is never sent back to a model as conversation) rather than
+  merely drawn: after a runtime fallback the phase header no longer names the model that answered,
+  and `test-auto-router.mjs` is what keeps the routing itself honest (nothing else exercises
+  the real router — `test-agent-loop.mjs` drives the orchestrator against a stub).
 - `src/mcp/` — Model Context Protocol client (`client.ts`) and multi-server lifecycle
   manager (`manager.ts`); merges global (`openvsChat.mcp.servers`) and per-project
   (`.openvs/mcp.json` / `.vscode/mcp.json`) server configs; project overrides global; stdio

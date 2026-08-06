@@ -656,12 +656,34 @@ body.settings-window #settingsPanel {
 	background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
 }
 .provider-row { display: flex; gap: 6px; margin-bottom: 6px; }
-.provider-row .key-input {
+.provider-row .key-input, .provider-row .account-id-input, .provider-row .base-url-input {
 	flex: 1 1 auto;
 	background: var(--vscode-input-background); color: var(--vscode-input-foreground);
 	border: 1px solid var(--vscode-input-border, transparent); border-radius: 4px; padding: 4px 6px;
 }
-.provider-row .save-key, .edit-apply button {
+.provider-row .save-key, .provider-row .save-account-id, .provider-row .save-base-url, .edit-apply button {
+	background: var(--vscode-button-background); color: var(--vscode-button-foreground);
+	border: none; border-radius: 4px; padding: 4px 10px; cursor: pointer;
+}
+.provider-advanced { margin-top: 4px; }
+.provider-advanced summary {
+	font-size: 0.8em; color: var(--vscode-descriptionForeground); cursor: pointer;
+}
+.provider-advanced .provider-row { margin-top: 6px; margin-bottom: 0; }
+
+.general-settings { margin-bottom: 8px; }
+.general-settings .field-label {
+	display: block; font-size: 0.8em; color: var(--vscode-descriptionForeground); margin: 8px 0 4px;
+}
+.general-settings .settings-textarea, .general-settings .settings-number {
+	width: 100%; box-sizing: border-box;
+	background: var(--vscode-input-background); color: var(--vscode-input-foreground);
+	border: 1px solid var(--vscode-input-border, transparent); border-radius: 4px; padding: 4px 6px;
+	font-family: inherit;
+}
+.general-settings .settings-number { width: 120px; }
+.general-settings .settings-row { display: flex; gap: 6px; margin-top: 6px; }
+.general-settings .settings-row button {
 	background: var(--vscode-button-background); color: var(--vscode-button-foreground);
 	border: none; border-radius: 4px; padding: 4px 10px; cursor: pointer;
 }
@@ -847,6 +869,34 @@ details.thinking > summary:hover { color: var(--vscode-foreground); }
 	margin-left: auto;
 	font-size: 0.85em; padding: 1px 6px; border-radius: 8px;
 	background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
+}
+
+/* Closing "which models ran" line of an Auto run. */
+.auto-summary {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 4px 10px;
+	margin: 10px 0 2px;
+	padding-top: 8px;
+	font-size: 0.8em;
+	color: var(--vscode-descriptionForeground);
+	border-top: 1px dashed var(--vscode-panel-border, rgba(127,127,127,0.3));
+}
+.auto-summary .summary-label { font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; }
+.auto-summary .summary-item { display: inline-flex; align-items: baseline; gap: 5px; }
+.auto-summary .summary-item code {
+	font-family: var(--vscode-editor-font-family, monospace);
+	background: none;
+	padding: 0;
+}
+.auto-summary .summary-item i {
+	font-style: normal;
+	font-size: 0.85em;
+	padding: 1px 6px;
+	border-radius: 8px;
+	background: var(--vscode-badge-background);
+	color: var(--vscode-badge-foreground);
 }
 
 .role-row {

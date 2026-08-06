@@ -32,7 +32,8 @@
 	];
 
 	/**
-	 * @typedef {{ role: 'user'|'assistant', content: string, images?: {mimeType:string,data:string}[], kind?: 'info'|'error' }} Msg
+	 * @typedef {{ role: string, label?: string, provider?: string, model?: string, source?: string }} AutoPhase
+	 * @typedef {{ role: 'user'|'assistant', content: string, images?: {mimeType:string,data:string}[], kind?: 'info'|'error'|'auto', phases?: AutoPhase[] }} Msg
 	 * @typedef {{ content: string, status: 'pending'|'in_progress'|'completed' }} Todo
 	 * @typedef {{ id: string, title: string, messages: Msg[], streaming: boolean, pending: string|null, queue: string[], todos?: Todo[], runId?: string, runMode?: string, compactSummary?: string, compactedUpTo?: number }} Session
 	 */
@@ -48,10 +49,12 @@
 	let providers = [];
 	let selectedProvider = '';
 	let mode = 'ask';
-	/** @type {{ roles: any[], reviewEnabled: boolean }} */
+	/** @type {{ roles: any[], reviewEnabled: boolean, decompose?: boolean }} */
 	let autoConfig = { roles: [], reviewEnabled: true };
 	/** Current agent approval level (synced from `openvsChat.guardrails.approval`). */
 	let approval = 'auto-edits';
+	/** Mirrors `openvsChat.systemPrompt` / `maxTokens` / `rules` / `agent.max*`, synced on every 'config'. */
+	let generalConfig = { systemPrompt: '', maxTokens: 8192, rules: '', maxSteps: 100, maxRunMinutes: 30 };
 	/** @type {{ label: string, content: string } | null} */
 	let currentContext = null;
 	/** The DOM bubble of the active session's in-flight assistant turn (model of record is `session.pending`). */
@@ -129,6 +132,17 @@
 		closeSettings: $('closeSettings'),
 		providerList: $('providerList'),
 		autoRoutingList: $('autoRoutingList'),
+		systemPromptInput: /** @type {HTMLTextAreaElement} */ ($('systemPromptInput')),
+		saveSystemPrompt: $('saveSystemPrompt'),
+		maxTokensInput: /** @type {HTMLInputElement} */ ($('maxTokensInput')),
+		saveMaxTokens: $('saveMaxTokens'),
+		rulesInput: /** @type {HTMLTextAreaElement} */ ($('rulesInput')),
+		saveRules: $('saveRules'),
+		maxStepsInput: /** @type {HTMLInputElement} */ ($('maxStepsInput')),
+		saveMaxSteps: $('saveMaxSteps'),
+		maxRunMinutesInput: /** @type {HTMLInputElement} */ ($('maxRunMinutesInput')),
+		saveMaxRunMinutes: $('saveMaxRunMinutes'),
+		enableDecompose: /** @type {HTMLInputElement} */ ($('enableDecompose')),
 		enableReview: /** @type {HTMLInputElement} */ ($('enableReview')),
 		messages: $('messages'),
 		contextChip: $('contextChip'),
@@ -509,8 +523,15 @@
 			return;
 		}
 		for (const m of s.messages) {
+			// The Auto run's model summary is a transcript entry like any other, so it survives
+			// a tab switch and a reload — the record of which models ran is the whole point of
+			// it, and a DOM node appended once does not survive either.
+			if (m.kind === 'auto' && m.phases?.length) {
+				appendAutoSummary(m.phases);
+				continue;
+			}
 			const body = appendMessageEl(m.role, m.content, m.images);
-			if (m.kind) { body.parentElement?.classList.add(m.kind); }
+			if (m.kind) { body.parentElement?.classList.add(m.kind === 'auto' ? 'info' : m.kind); }
 		}
 		// Re-attach the in-flight assistant bubble when switching back to a streaming tab.
 		if (s.pending !== null) {
@@ -990,6 +1011,17 @@
 	 */
 	const fetchedModels = {};
 
+	/** Model ids to offer for a provider: the live-fetched catalog wins once it exists,
+	 * falling back to the small hardcoded `suggestedModels` list before anything has been
+	 * fetched. Shared by the main model select and the Auto-Routing role datalists so both
+	 * show the same (real) catalog instead of the latter being stuck on 1-2 suggestions. */
+	function providerModelIds(providerId) {
+		const live = fetchedModels[providerId];
+		if (live && live.length) { return live.map(e => e.id); }
+		const p = providers.find(x => x.id === providerId);
+		return (p && p.suggestedModels) || [];
+	}
+
 	/** Accepts entries or bare id strings (older host builds) and normalizes to entries. */
 	function normalizeModelEntries(models) {
 		return (models || [])
@@ -1068,6 +1100,24 @@
 	}
 
 	function renderSettings() {
+		// Skip the field the user is actively typing in — a config refresh triggered by an
+		// unrelated action (saving a key, signing in) would otherwise clobber it mid-edit,
+		// same hazard the Auto-Routing role inputs have.
+		if (els.systemPromptInput && document.activeElement !== els.systemPromptInput) {
+			els.systemPromptInput.value = generalConfig.systemPrompt;
+		}
+		if (els.maxTokensInput && document.activeElement !== els.maxTokensInput) {
+			els.maxTokensInput.value = String(generalConfig.maxTokens);
+		}
+		if (els.rulesInput && document.activeElement !== els.rulesInput) {
+			els.rulesInput.value = generalConfig.rules;
+		}
+		if (els.maxStepsInput && document.activeElement !== els.maxStepsInput) {
+			els.maxStepsInput.value = String(generalConfig.maxSteps);
+		}
+		if (els.maxRunMinutesInput && document.activeElement !== els.maxRunMinutesInput) {
+			els.maxRunMinutesInput.value = String(generalConfig.maxRunMinutes);
+		}
 		els.providerList.innerHTML = '';
 		for (const p of providers) {
 			const card = document.createElement('div');
@@ -1088,6 +1138,13 @@
 					: p.id === 'openrouter'
 						? 'One-click login at openrouter.ai (Google/GitHub/email) — an API key is created for you automatically'
 						: (p.authUrl ? 'Sign in with your configured web login' : 'Opens the provider’s sign-in page in a browser, then paste the key back here');
+			// Cloudflare Workers AI needs the account id too — a token alone can't
+			// authenticate, since the id goes in the request URL, not a header.
+			const hasAccountId = p.cloudflareAccountId !== undefined;
+			// Most providers never need this — it's a collapsed <details> so 11 provider
+			// cards don't each grow a row nobody but the "point this at my own gateway /
+			// local Ollama" user wants open by default.
+			const hasBaseUrl = p.baseUrlOverride !== undefined;
 			card.innerHTML = `
 				<div class="provider-title"><strong>${escapeHtml(p.label)}</strong> ${status}
 					${p.supportsTools ? '<span class="tag">agent</span>' : ''}</div>
@@ -1095,18 +1152,46 @@
 					<input type="password" class="key-input" placeholder="${p.requiresApiKey ? 'Paste API key…' : 'Paste API key… (optional)'}" />
 					<button class="save-key">Save</button>
 				</div>
+				${hasAccountId ? `
+				<div class="provider-row">
+					<input type="text" class="account-id-input" placeholder="Cloudflare account id…"
+						value="${escapeHtml(p.cloudflareAccountId || '')}" />
+					<button class="save-account-id">Save</button>
+				</div>` : ''}
 				<div class="provider-actions">
 					<button class="sign-in" title="${signInTitle}">${signInLabel}</button>
 					${p.apiKeyUrl ? '<a class="get-key" href="#">Get API key</a>' : ''}
 					${p.hasApiKey ? '<a class="test-key" href="#">Test connection</a>' : ''}
 					${(p.hasApiKey && !p.hasEnvKey) ? `<a class="clear-key" href="#">${p.authKind === 'oauth' ? 'Sign out' : 'Clear key'}</a>` : ''}
 					${p.hasEnvKey ? '<span class="muted" title="Set via environment variable; unset it (and restart) to remove.">from environment</span>' : ''}
-				</div>`;
+				</div>
+				${hasBaseUrl ? `
+				<details class="provider-advanced">
+					<summary>Base URL</summary>
+					<div class="provider-row">
+						<input type="text" class="base-url-input"
+							placeholder="${p.id === 'custom' ? 'http://localhost:11434/v1' : 'Default endpoint'}"
+							value="${escapeHtml(p.baseUrlOverride || '')}" />
+						<button class="save-base-url">Save</button>
+					</div>
+				</details>` : ''}`;
 			const keyInput = /** @type {HTMLInputElement} */ (card.querySelector('.key-input'));
 			card.querySelector('.save-key')?.addEventListener('click', () => {
 				vscode.postMessage({ type: 'saveKey', provider: p.id, key: keyInput.value });
 				keyInput.value = '';
 			});
+			if (hasAccountId) {
+				const accountIdInput = /** @type {HTMLInputElement} */ (card.querySelector('.account-id-input'));
+				card.querySelector('.save-account-id')?.addEventListener('click', () => {
+					vscode.postMessage({ type: 'setCloudflareAccountId', text: accountIdInput.value.trim() });
+				});
+			}
+			if (hasBaseUrl) {
+				const baseUrlInput = /** @type {HTMLInputElement} */ (card.querySelector('.base-url-input'));
+				card.querySelector('.save-base-url')?.addEventListener('click', () => {
+					vscode.postMessage({ type: 'setBaseUrl', provider: p.id, text: baseUrlInput.value.trim() });
+				});
+			}
 			card.querySelector('.get-key')?.addEventListener('click', (e) => {
 				e.preventDefault(); vscode.postMessage({ type: 'openExternal', url: p.apiKeyUrl });
 			});
@@ -1222,26 +1307,45 @@
 			const datalistEl = /** @type {HTMLElement} */ (row.querySelector('datalist'));
 			const fillDatalist = (providerId) => {
 				datalistEl.innerHTML = '';
-				const p = providers.find(x => x.id === providerId);
-				for (const m of (p && p.suggestedModels) || []) {
+				for (const m of providerModelIds(providerId)) {
 					const o = document.createElement('option'); o.value = m; datalistEl.appendChild(o);
 				}
 			};
+			const ensureLiveModels = (providerId) => {
+				if (!providerId || fetchedModels[providerId]) { return; }
+				// Skip providers with no credentials: listModels would just reject and, since
+				// nothing gets cached on failure, re-fires on every settings re-render (every
+				// setRole/setKey/postConfig round trip) — spamming the same error toast.
+				const p = providers.find(x => x.id === providerId);
+				if (p && p.requiresApiKey && !p.hasApiKey) { return; }
+				vscode.postMessage({ type: 'listModels', provider: providerId });
+			};
 			fillDatalist(provSel.value);
+			ensureLiveModels(provSel.value);
 			provSel.addEventListener('change', () => {
 				fillDatalist(provSel.value);
+				ensureLiveModels(provSel.value);
 				if (!provSel.value) {
 					modelInput.value = '';
 					vscode.postMessage({ type: 'setRole', role: r.role, provider: '', model: '' });
 					return;
 				}
-				if (!modelInput.value.trim()) {
-					const p = providers.find(x => x.id === provSel.value);
-					modelInput.value = (p && p.suggestedModels && p.suggestedModels[0]) || '';
+				// The model box carries whatever the *previous* provider left in it. Keeping it
+				// pinned the role to a pair that cannot exist — pick NVIDIA (which fills in
+				// `meta/llama-3.3-70b-instruct`), then switch to Anthropic, and the role was
+				// saved as `anthropic:meta/llama-3.3-70b-instruct`, which 404s on the first
+				// request of every Auto run and, being *pinned*, is never substituted. Only a
+				// model this provider actually offers survives the switch.
+				const offered = providerModelIds(provSel.value);
+				if (!modelInput.value.trim() || !offered.includes(modelInput.value.trim())) {
+					modelInput.value = offered[0] || '';
 				}
-				if (modelInput.value.trim()) {
-					vscode.postMessage({ type: 'setRole', role: r.role, provider: provSel.value, model: modelInput.value.trim() });
-				}
+				// A provider with nothing to offer leaves the pin incomplete; clearing it back to
+				// auto-select is the honest state, since leaving the *old* pair persisted would
+				// keep routing this role to the provider the user just switched away from.
+				vscode.postMessage(modelInput.value.trim()
+					? { type: 'setRole', role: r.role, provider: provSel.value, model: modelInput.value.trim() }
+					: { type: 'setRole', role: r.role, provider: '', model: '' });
 			});
 			modelInput.addEventListener('change', () => {
 				if (provSel.value && modelInput.value.trim()) {
@@ -1253,6 +1357,7 @@
 			els.autoRoutingList.appendChild(row);
 		}
 		if (els.enableReview) { els.enableReview.checked = !!autoConfig.reviewEnabled; }
+		if (els.enableDecompose) { els.enableDecompose.checked = !!autoConfig.decompose; }
 	}
 
 	// ---- History panel ----------------------------------------------------------
@@ -1982,6 +2087,35 @@
 		scrollToBottom();
 	}
 
+	/**
+	 * Closing "which models ran" line for an Auto run. Auto chooses the models, and the
+	 * per-phase headers are scrolled away by the time the run ends — and after a fallback
+	 * they no longer name the model that actually answered. `phases` is what really ran.
+	 */
+	function appendAutoSummary(phases) {
+		if (!Array.isArray(phases) || !phases.length) { return; }
+		const el = document.createElement('div');
+		el.className = 'auto-summary';
+		const label = document.createElement('span');
+		label.className = 'summary-label';
+		label.textContent = 'Models used';
+		el.appendChild(label);
+		for (const phase of phases) {
+			const item = document.createElement('span');
+			item.className = 'summary-item';
+			const role = document.createElement('b');
+			role.textContent = phase.label || phase.role || '';
+			const model = document.createElement('code');
+			model.textContent = `${phase.provider || ''} · ${phase.model || ''}`;
+			const tag = document.createElement('i');
+			tag.textContent = phase.source === 'configured' ? 'pinned' : 'auto';
+			item.append(role, model, tag);
+			el.appendChild(item);
+		}
+		els.messages.appendChild(el);
+		scrollToBottom();
+	}
+
 	function autoSize() {
 		els.input.style.height = 'auto';
 		els.input.style.height = Math.min(els.input.scrollHeight, 200) + 'px';
@@ -2009,6 +2143,44 @@
 	});
 	els.enableReview?.addEventListener('change', () => {
 		vscode.postMessage({ type: 'setReviewEnabled', reviewEnabled: els.enableReview.checked });
+	});
+	els.enableDecompose?.addEventListener('change', () => {
+		vscode.postMessage({ type: 'setDecompose', decompose: els.enableDecompose.checked });
+	});
+	els.saveSystemPrompt?.addEventListener('click', () => {
+		generalConfig.systemPrompt = els.systemPromptInput.value;
+		vscode.postMessage({ type: 'setSystemPrompt', text: els.systemPromptInput.value });
+	});
+	els.saveMaxTokens?.addEventListener('click', () => {
+		const n = parseInt(els.maxTokensInput.value, 10);
+		if (!Number.isFinite(n) || n <= 0) {
+			showNotice('Max reply tokens must be a positive number.', true);
+			return;
+		}
+		generalConfig.maxTokens = n;
+		vscode.postMessage({ type: 'setMaxTokens', maxTokens: n });
+	});
+	els.saveRules?.addEventListener('click', () => {
+		generalConfig.rules = els.rulesInput.value;
+		vscode.postMessage({ type: 'setRules', text: els.rulesInput.value });
+	});
+	els.saveMaxSteps?.addEventListener('click', () => {
+		const n = parseInt(els.maxStepsInput.value, 10);
+		if (!Number.isFinite(n) || n <= 0) {
+			showNotice('Max agent steps must be a positive number.', true);
+			return;
+		}
+		generalConfig.maxSteps = n;
+		vscode.postMessage({ type: 'setMaxSteps', maxSteps: n });
+	});
+	els.saveMaxRunMinutes?.addEventListener('click', () => {
+		const n = parseInt(els.maxRunMinutesInput.value, 10);
+		if (!Number.isFinite(n) || n <= 0) {
+			showNotice('Max agent run time must be a positive number.', true);
+			return;
+		}
+		generalConfig.maxRunMinutes = n;
+		vscode.postMessage({ type: 'setMaxRunMinutes', maxRunMinutes: n });
 	});
 	els.modelSelect.addEventListener('change', () => {
 		updateModeAvailability();
@@ -2190,7 +2362,7 @@
 	 */
 	const CHAT_ONLY_MESSAGES = [
 		'token', 'agentStepStart', 'agentStepEnd', 'toolStart', 'toolEnd',
-		'done', 'newChat', 'inline', 'autoPhase', 'editProposal', 'compacted',
+		'done', 'newChat', 'inline', 'autoPhase', 'autoSummary', 'editProposal', 'compacted',
 		'approvalRequest', 'askRequest', 'promptCancel',
 	];
 
@@ -2205,6 +2377,11 @@
 					approval = msg.approval;
 					if (els.approvalSelect) { els.approvalSelect.value = approval; }
 				}
+				if (typeof msg.systemPrompt === 'string') { generalConfig.systemPrompt = msg.systemPrompt; }
+				if (typeof msg.maxTokens === 'number') { generalConfig.maxTokens = msg.maxTokens; }
+				if (typeof msg.rules === 'string') { generalConfig.rules = msg.rules; }
+				if (typeof msg.maxSteps === 'number') { generalConfig.maxSteps = msg.maxSteps; }
+				if (typeof msg.maxRunMinutes === 'number') { generalConfig.maxRunMinutes = msg.maxRunMinutes; }
 				// Keep a valid selection: honour the persisted choice (incl. Auto) when it still exists.
 				const valid = selectedProvider === AUTO_PROVIDER || providers.some(p => p.id === selectedProvider);
 				if (!valid) {
@@ -2233,6 +2410,21 @@
 					// The live catalog may reveal the current model can't do tools.
 					if (mode === 'agent' && !isAuto()) { ensureAgentModel(); }
 				}
+				// Refresh any already-rendered Auto-Routing role datalist for this provider in
+				// place — not a full renderAutoRouting(), which would blow away an in-progress
+				// edit in the model text box.
+				if (els.autoRoutingList) {
+					for (const row of els.autoRoutingList.querySelectorAll('.role-row')) {
+						const provSel = /** @type {HTMLSelectElement | null} */ (row.querySelector('.role-provider'));
+						const datalistEl = row.querySelector('datalist');
+						if (provSel && datalistEl && provSel.value === msg.provider) {
+							datalistEl.innerHTML = '';
+							for (const m of providerModelIds(msg.provider)) {
+								const o = document.createElement('option'); o.value = m; datalistEl.appendChild(o);
+							}
+						}
+					}
+				}
 				break;
 			case 'token': {
 				const s = sessionFor(msg);
@@ -2255,6 +2447,22 @@
 					appendPhaseHeader(msg.label, msg.provider, msg.model, msg.source);
 				}
 				if (msg.streaming) { openStream(s); }
+				break;
+			}
+			case 'autoSummary': {
+				// Posted once per Auto run, just before 'done'. Recorded in the transcript
+				// (with a `kind`, so it is never sent back to a model as conversation) rather
+				// than only drawn: a background tab renders nothing at all, and the drawn node
+				// is thrown away by the next renderAll.
+				const s = sessionFor(msg);
+				if (!s || !Array.isArray(msg.phases) || !msg.phases.length) { break; }
+				commitPending(s);
+				const text = 'Models used — ' + msg.phases
+					.map(p => `${p.label || p.role}: ${p.provider} · ${p.model} (${p.source === 'configured' ? 'pinned' : 'auto'})`)
+					.join('; ');
+				s.messages.push({ role: 'assistant', content: text, kind: 'auto', phases: msg.phases });
+				saveState();
+				if (s.id === activeSessionId) { appendAutoSummary(msg.phases); }
 				break;
 			}
 			case 'agentStepStart': {
@@ -2412,7 +2620,13 @@
 				break;
 			case 'error': {
 				addNotice(sessionFor(msg), msg.message, true);
-				if (msg.needsKey) { els.settingsPanel.classList.remove('hidden'); renderSettings(); }
+				// A missing key needs Settings, but not stuffed into the cramped sidebar
+				// overlay over top of the chat — open it the same way the ⚙ button does,
+				// as its own roomy editor tab. (Already the case if this webview IS that tab.)
+				if (msg.needsKey) {
+					if (SETTINGS_ONLY) { els.settingsPanel.classList.remove('hidden'); renderSettings(); }
+					else { vscode.postMessage({ type: 'requestOpenSettings' }); }
+				}
 				break;
 			}
 			case 'done': {

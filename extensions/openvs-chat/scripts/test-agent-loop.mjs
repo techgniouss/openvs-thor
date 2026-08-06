@@ -1091,17 +1091,23 @@ const autoRouter = {
 	},
 };
 
+/** The request the planning phase issued, for the budget assertions in 26e. */
+let lastPlanRequest;
+
 /**
  * Drives one Auto run and returns the prompt the reviewer was actually sent. `agentSteps`
  * are replayed to the implementer; the plan and review phases stream a fixed string.
  */
-async function runAuto(agentSteps, { maxSteps = 20 } = {}) {
+async function runAuto(agentSteps, { maxSteps = 20, history = [{ role: 'user', content: 'do it' }], limitTokens } = {}) {
 	let reviewPrompt = '';
 	let streamPhase = 0; // 0 = plan, 1 = review (the implementer uses runAgentStep)
 	const provider = {
 		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
 		async listModels() { return []; },
+		// A backend that has stated a per-request token allowance in its response headers.
+		rateLimit: () => (limitTokens ? { limitTokens } : undefined),
 		async streamChat(request) {
+			if (streamPhase === 0) { lastPlanRequest = request; }
 			if (streamPhase === 1) { reviewPrompt = request.messages.at(-1).content; }
 			streamPhase++;
 			request.onToken('1. do the thing');
@@ -1117,7 +1123,7 @@ async function runAuto(agentSteps, { maxSteps = 20 } = {}) {
 	};
 	const noop = () => { };
 	await new AutoOrchestrator(registry, autoRouter, approver, maxSteps).run(
-		{ history: [{ role: 'user', content: 'do it' }], baseSystemPrompt: 'base', signal: new AbortController().signal },
+		{ history, baseSystemPrompt: 'base', signal: new AbortController().signal },
 		{
 			phase: noop, token: noop, agentStepStart: noop, agentStepEnd: noop,
 			onToolStart: noop, onToolEnd: noop, note: noop,
@@ -1194,6 +1200,51 @@ async function runAuto(agentSteps, { maxSteps = 20 } = {}) {
 {
 	const prompt = await runAuto([{ content: 'all done', toolCalls: [] }, { content: 'all done', toolCalls: [] }]);
 	assert.ok(!/did NOT run to completion/.test(prompt), 'a completed implementation is not flagged as partial');
+}
+
+// 26e. The plan and review phases are budgeted like every other request. They used to send
+// the conversation untrimmed with the full configured reservation, which on a backend that
+// states a small per-request allowance meant the *planner* was refused — so an Auto run
+// died before reaching the implementer, the one phase that can learn a ceiling for itself.
+{
+	const history = Array.from({ length: 40 }, (_, i) => ({
+		role: i % 2 ? 'assistant' : 'user',
+		content: `turn ${i}: ${'x'.repeat(2000)}`,
+	}));
+	await runAuto([{ content: 'all done', toolCalls: [] }], { history, limitTokens: 2000 });
+	const sent = lastPlanRequest.messages.map(m => m.content).join('\n');
+	assert.deepStrictEqual(
+		[
+			lastPlanRequest.maxTokens < 1000,
+			/earlier message\(s\) removed/.test(sent),
+			sent.length < history.reduce((n, m) => n + m.content.length, 0),
+		],
+		[true, true, true],
+		'the planning request is trimmed to, and reserves within, the stated allowance',
+	);
+}
+
+// 26f. A *pinned* role whose model the provider rejects ends the run — pins are never
+// substituted — but the message has to name the pin. The raw provider body for this case is
+// Anthropic answering `model: meta/llama-3.3-70b-instruct`, which reads like the product
+// picked a nonsense pair rather than like a setting that needs fixing.
+{
+	const { describePinnedModelError } = await import(new URL('../out/auto/orchestrator.js', import.meta.url));
+	const pinned = {
+		role: 'plan', roleLabel: 'Planning', providerId: 'anthropic', providerLabel: 'Anthropic (Claude)',
+		model: 'meta/llama-3.3-70b-instruct', source: 'configured', ready: true,
+	};
+	const message = describePinnedModelError(pinned, new Error('Anthropic (Claude): request failed (HTTP 404). model: meta/llama-3.3-70b-instruct')).message;
+	assert.deepStrictEqual(
+		[
+			message.includes('pinned for planning'),
+			message.includes('Anthropic (Claude) "meta/llama-3.3-70b-instruct"'),
+			message.includes('Auto routing'),
+			message.includes('HTTP 404'),
+		],
+		[true, true, true, true],
+		'the failure names the role, the pair, where to fix it, and keeps the provider detail',
+	);
 }
 
 // 27. Adjacent read-only calls in one step run concurrently. The agent doctrine tells the
@@ -1303,13 +1354,27 @@ async function runAuto(agentSteps, { maxSteps = 20 } = {}) {
 	assert.strictEqual(result.reason, 'done', 'no ceiling means no time-based stop');
 }
 
-// 28c. Every top-level run closes with what it cost. A slow run is almost always a large
-// prompt being re-sent each step, and that number is otherwise invisible to the user.
+// 28c. Every top-level run closes with what it cost — cumulative input tokens over the
+// requests it took, not just the peak. An agent step re-sends the whole conversation, so
+// the total is the number that actually grows, and it is otherwise invisible to the user.
 {
-	const provider = fakeProvider([{ content: 'done', toolCalls: [] }]);
+	const provider = fakeProvider([
+		{ content: '', toolCalls: [{ id: 'c1', name: 'list_files', args: { path: '.' } }] },
+		{ content: 'done', toolCalls: [] },
+	]);
 	const cb = noopCallbacks();
 	await new AgentRunner(provider, approver, 5).run([{ role: 'user', content: 'go' }], params, cb);
-	assert.ok(cb.notes.some(n => /Run finished in .*largest prompt sent/.test(n)), 'the run reports its cost');
+	const ledger = cb.notes.find(n => /^Run finished in /.test(n));
+	assert.ok(ledger, 'the run closes with a ledger line');
+	const [, total, requests, peak] = /~([\d.]+)k estimated input tokens over (\d+) request\(s\), tool schemas included; largest single conversation ~([\d.]+)k/.exec(ledger) ?? [];
+	// Every request is counted, including the completion nudge's — the ledger reports what
+	// the run actually sent, not how many steps it thinks it took.
+	assert.ok(Number(requests) >= 2, `more than one request is counted (got ${requests})`);
+	assert.ok(Number(total) > Number(peak),
+		`the total exceeds the peak once a run makes more than one request (total ${total}k, peak ${peak}k)`);
+	// …and a small run is not told to force earlier compaction. On a few-thousand-token
+	// conversation that advice costs a summarizer request and saves nothing.
+	assert.ok(!/maxContextTokens/.test(ledger), `the tuning hint is withheld on a small run: ${ledger}`);
 }
 
 // 29. How eagerly a run compacts is read off the provider. Compacting early is a cost
@@ -1418,6 +1483,216 @@ async function runAuto(agentSteps, { maxSteps = 20 } = {}) {
 	assert.ok(seen[1].tokens + seen[1].maxTokens <= 8000,
 		`prompt plus reply reservation fits the stated ceiling (got ${seen[1].tokens} + ${seen[1].maxTokens})`);
 	assert.ok(callbacks.notes.some(n => /8000/.test(n)), 'the user is told what the cap is');
+}
+
+// 32. Eliding a read's output must also un-remember it, or the run deadlocks: the prompt
+// carries a marker where the file dump was, while the repeat-read breaker answers the
+// obvious re-read with "its result is still above in this conversation". It is not there.
+// The model can neither see the content nor fetch it, and burns the step budget being told
+// off. This is the interaction that makes proactive pruning safe to have at all.
+{
+	const saved = workspaceFiles;
+	// `a.ts` is big enough to be worth eliding; the filler files exist only so the model can
+	// keep making *read* calls — any write or command would expire the read cache outright
+	// and the guard under test would never arm.
+	workspaceFiles = { 'a.ts': `export const a = 1;\n${'// pad\n'.repeat(400)}` };
+	for (let i = 0; i < 8; i++) {
+		workspaceFiles[`f${i}.ts`] = `export const f${i} = ${i};\n`;
+	}
+	let asked = 0;
+	const provider = {
+		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [], cachesPrompts: false },
+		async listModels() { return []; },
+		async runAgentStep(request) {
+			asked++;
+			// Read a.ts first, then unrelated files long enough to push that first dump past
+			// the kept-turns boundary, then ask for a.ts again — the exact shape that used to
+			// deadlock: elided from the prompt, refused by the breaker.
+			if (asked === 1 || asked === 9) {
+				return { content: '', toolCalls: [{ id: `c${asked}`, name: 'read_file', args: { path: 'a.ts' } }] };
+			}
+			if (asked < 9) {
+				return { content: '', toolCalls: [{ id: `c${asked}`, name: 'read_file', args: { path: `f${asked}.ts` } }] };
+			}
+			return { content: 'done', toolCalls: [] };
+		},
+	};
+	const results = [];
+	const cb = { ...noopCallbacks(), onToolEnd: (call, result) => results.push({ call, result }) };
+	await new AgentRunner(provider, approver, 15).run([{ role: 'user', content: 'go' }], params, cb);
+	workspaceFiles = saved;
+
+	const reread = results.at(-1);
+	assert.strictEqual(reread.call.args.path, 'a.ts', 'the last call is the re-read under test');
+	assert.ok(!/still above in this conversation/.test(reread.result),
+		'a read whose earlier output was elided is served, not refused with a pointer to output that is gone');
+	assert.ok(/export const a = 1/.test(reread.result), 'and it is served the real file');
+}
+
+// 33. Pruning is skipped entirely on a backend that caches its prompt prefix: re-sending an
+// old dump there costs a fraction of its first price, while eliding it rewrites the middle
+// and throws the cached prefix away. Same trade the compaction trigger already makes.
+{
+	const build = caches => {
+		const seen = [];
+		const provider = {
+			info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [], cachesPrompts: caches },
+			async listModels() { return []; },
+			async runAgentStep(request) { seen.push(request.messages); return { content: 'done', toolCalls: [] }; },
+		};
+		return { provider, seen };
+	};
+	// A transcript with one file read twice: the earlier copy is dead weight either way.
+	const seed = [{ role: 'system', content: 'sys' }, { role: 'user', content: 'go' }];
+	for (const id of ['c1', 'c2']) {
+		seed.push({ role: 'assistant', content: '', toolCalls: [{ id, name: 'read_file', args: { path: 'a.ts' } }] });
+		seed.push({ role: 'tool', toolCallId: id, content: 'A'.repeat(4_000) });
+	}
+	const sizes = [];
+	for (const caches of [false, true]) {
+		const { provider, seen } = build(caches);
+		// A budget far above the transcript, so nothing here is trimming — only pruning.
+		await new AgentRunner(provider, approver, 3, { maxContextTokens: 1_000_000 })
+			.run([...seed], params, noopCallbacks());
+		sizes.push(m.estimateMessagesTokens(seen[0]));
+	}
+	assert.ok(sizes[0] < sizes[1],
+		`the uncached run prunes the dead read; the caching one keeps its prefix intact (${sizes[0]} vs ${sizes[1]} tokens)`);
+}
+
+// 34. A ceiling the backend states in its response headers is applied BEFORE the request
+// that would have broken it. The previous phase could only recover from the rejection; this
+// one means a run that starts inside the allowance never grows out of it — and the whole
+// 413 round trip, which on Groq also costs a request against the daily budget, never happens.
+{
+	const seen = [];
+	const provider = {
+		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+		async listModels() { return []; },
+		// Reported from the first response onward, exactly as `x-ratelimit-limit-tokens` is.
+		rateLimit: () => ({ limitTokens: 8_000, at: 0 }),
+		async runAgentStep(request) {
+			seen.push({ maxTokens: request.maxTokens, tokens: m.estimateMessagesTokens(request.messages) });
+			// Refuse anything over the allowance, as the real backend would. If the ceiling
+			// were not applied up front this fixture would throw on the very first step.
+			if (seen.at(-1).tokens + request.maxTokens > 8_000) {
+				throw new Error('Fake: request too large (HTTP 413). Limit 8000.');
+			}
+			return seen.length > 3 ? { content: 'done', toolCalls: [] } : { content: '', toolCalls: [{ id: `c${seen.length}`, name: 'list_files', args: { path: '.' } }] };
+		},
+	};
+	const seed = [{ role: 'system', content: 'SYS' }, { role: 'user', content: 'go' }];
+	for (let i = 0; i < 40; i++) {
+		seed.push({ role: 'assistant', content: '', toolCalls: [{ id: `s${i}`, name: 'read_file', args: { path: `f${i}.ts` } }] });
+		seed.push({ role: 'tool', content: 'y'.repeat(4_000), toolCallId: `s${i}` });
+	}
+	const cb = noopCallbacks();
+	const result = await new AgentRunner(provider, approver, 8, { maxContextTokens: 120_000 })
+		.run(seed, { ...params, maxTokens: 8192 }, cb);
+	assert.deepStrictEqual(result, { reason: 'done' }, 'the run completes');
+	assert.ok(seen.every(s => s.tokens + s.maxTokens <= 8_000),
+		`every request fits the stated allowance, first included (${seen.map(s => s.tokens + s.maxTokens).join(', ')})`);
+	assert.strictEqual(cb.notes.filter(n => /allows ~8000 tokens per request/.test(n)).length, 1,
+		'the ceiling is reported once, not re-announced on every step');
+}
+
+// 35. A *generous* stated allowance must change nothing. This is a tokens-per-request
+// limit, not a context window: a backend reporting 300k against a 128k-window model would,
+// if allowed to raise the budget, trade a rate-limit rejection for a context-length one —
+// and would quietly cap nobody's replies who didn't need capping.
+{
+	const seen = [];
+	const provider = {
+		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+		async listModels() { return []; },
+		rateLimit: () => ({ limitTokens: 300_000, at: 0 }),
+		async runAgentStep(request) { seen.push(request); return { content: 'done', toolCalls: [] }; },
+	};
+	const cb = noopCallbacks();
+	await new AgentRunner(provider, approver, 3, { maxContextTokens: 120_000 })
+		.run([{ role: 'user', content: 'go' }], { ...params, maxTokens: 8192 }, cb);
+	assert.strictEqual(seen[0].maxTokens, 8192, 'a roomy allowance leaves the configured reply size alone');
+	assert.ok(!cb.notes.some(n => /tokens per request/.test(n)), 'and says nothing, because nothing was constrained');
+}
+
+// 36. MCP tool schemas ride on every request and are unbounded. On a backend with a small
+// per-request allowance they can exceed the whole budget by themselves — at which point
+// every request is refused, the ceiling logic shrinks a conversation that was never the
+// problem, and nothing names the cause. They are dropped, once, with an explanation.
+{
+	const fatTool = i => ({
+		name: `mcp_tool_${i}`,
+		description: 'A verbose MCP tool description. '.repeat(40),
+		parameters: { type: 'object', properties: { q: { type: 'string', description: 'x'.repeat(500) } } },
+	});
+	const mcp = { tools: () => Array.from({ length: 12 }, (_, i) => fatTool(i)), call: async () => ({ content: '', isError: false }) };
+	const seen = [];
+	const provider = {
+		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+		async listModels() { return []; },
+		rateLimit: () => ({ limitTokens: 8_000, at: 0 }),
+		async runAgentStep(request) { seen.push(request.tools.map(t => t.name)); return { content: 'done', toolCalls: [] }; },
+	};
+	const cb = noopCallbacks();
+	await new AgentRunner(provider, approver, 3, { mcp, maxContextTokens: 120_000 })
+		.run([{ role: 'user', content: 'go' }], { ...params, maxTokens: 8192 }, cb);
+	assert.ok(!seen[0].some(n => n.startsWith('mcp_tool_')), 'the oversized MCP schemas never reach the wire');
+	assert.ok(seen[0].includes('read_file'), 'the built-in tools are kept, so the run can still work');
+	assert.ok(cb.notes.some(n => /MCP servers' tool definitions/.test(n)), 'and the user is told what was dropped and why');
+}
+
+// 36b. On a model that can afford them, the same MCP tools are left alone — this guard
+// exists to catch "no room at all", not to second-guess a working setup.
+{
+	const mcp = { tools: () => [{ name: 'mcp_ok', description: 'small', parameters: { type: 'object', properties: {} } }], call: async () => ({ content: '', isError: false }) };
+	const seen = [];
+	const provider = {
+		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+		async listModels() { return []; },
+		async runAgentStep(request) { seen.push(request.tools.map(t => t.name)); return { content: 'done', toolCalls: [] }; },
+	};
+	const cb = noopCallbacks();
+	await new AgentRunner(provider, approver, 3, { mcp, maxContextTokens: 120_000 })
+		.run([{ role: 'user', content: 'go' }], params, cb);
+	assert.ok(seen[0].includes('mcp_ok'), 'an affordable MCP tool set is passed through untouched');
+	assert.ok(!cb.notes.some(n => /MCP servers' tool definitions/.test(n)), 'and nothing is said about it');
+}
+
+// 37. A read must fit the budget it will be carried in. `read_file`'s default 24k-char page
+// is ~6k tokens — larger than the ENTIRE conversation budget on a backend whose per-request
+// allowance is 8k, so the result was elided by trimming before the model could use a line of
+// it: the agent reads a file and effectively sees nothing. Reads are paged, so a smaller
+// page costs a call, not information.
+{
+	const saved = workspaceFiles;
+	workspaceFiles = { 'big.ts': Array.from({ length: 4_000 }, (_, i) => `const line${i} = ${i};`).join('\n') };
+	const read = async ceiling => {
+		let asked = 0;
+		const provider = {
+			info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+			async listModels() { return []; },
+			rateLimit: () => (ceiling ? { limitTokens: ceiling, at: 0 } : undefined),
+			async runAgentStep() {
+				return ++asked === 1
+					? { content: '', toolCalls: [{ id: 'c1', name: 'read_file', args: { path: 'big.ts' } }] }
+					: { content: 'done', toolCalls: [] };
+			},
+		};
+		const results = [];
+		await new AgentRunner(provider, approver, 4, { maxContextTokens: 120_000 })
+			.run([{ role: 'user', content: 'go' }], { ...params, maxTokens: 8192 },
+				{ ...noopCallbacks(), onToolEnd: (_c, r) => results.push(r) });
+		return results[0];
+	};
+	const roomy = await read(undefined);
+	const tight = await read(8_000);
+	workspaceFiles = saved;
+
+	assert.ok(m.estimateTokens(roomy) > 4_000, `an unconstrained model still gets the full page (${m.estimateTokens(roomy)} tokens)`);
+	// 8k allowance → ~5.4k budget → ~4.2k conversation → a read may take half of that.
+	assert.ok(m.estimateTokens(tight) < 2_600,
+		`a tight allowance gets a page sized to it (${m.estimateTokens(tight)} tokens)`);
+	assert.ok(/offset=\d+ to continue/.test(tight), 'and is told how to read the rest, so nothing is lost');
 }
 
 console.log('test-agent-loop: all assertions passed');

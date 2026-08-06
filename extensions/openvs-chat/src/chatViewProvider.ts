@@ -5,13 +5,13 @@
 
 import * as vscode from 'vscode';
 import { AgentRunner, RunResult } from './agent/agentRunner';
-import { CACHED_COMPACT_TRIGGER, COMPACT_MARKER, COMPACT_TRIGGER, compactMessages, shouldCompact } from './agent/compaction';
-import { trimMessages } from './agent/context';
-import { contextBudgetFor, contextWindowFor } from './agent/contextWindow';
+import { streamBudgeted } from './agent/budgetedStream';
+import { CACHED_COMPACT_TRIGGER, COMPACT_MARKER, COMPACT_TRIGGER, SUMMARY_MAX_TOKENS, compactMessages, shouldCompact } from './agent/compaction';
+import { contextWindowFor, requestBudgets } from './agent/contextWindow';
 import { APPROVAL_POLICIES, parseApprovalPolicy } from './agent/guardrails';
 import { ApprovalRequest, ApprovalResult, ToolApprover, UserQuestion } from './agent/tools';
-import { AutoOrchestrator } from './auto/orchestrator';
-import { AUTO_ROLES, AutoRole, RoleRouter } from './auto/router';
+import { AutoOrchestrator, describePinnedModelError, isModelError } from './auto/orchestrator';
+import { AUTO_ROLES, AutoRole, RoleAssignment, RoleRouter } from './auto/router';
 import { WebAuthManager } from './auth';
 import { McpManager } from './mcp/manager';
 import { supportsNativeSignIn } from './oauth';
@@ -19,7 +19,7 @@ import { buildEnvContext } from './persona/envContext';
 import { modeDoctrine, personaBase } from './persona/prompts';
 import { ThinkingStreamParser, formatThinking, stripHistoryThinking, stripThinking } from './persona/thinking';
 import { ProviderRegistry } from './providers/registry';
-import { ChatMessage, ChatProvider, ModelEntry, entrySupportsTools, isAbortError, modelSupportsVision, streamChatWithContinuation } from './providers/types';
+import { ChatMessage, ChatProvider, ModelEntry, entrySupportsTools, isAbortError, modelSupportsVision } from './providers/types';
 import { RulesProvider } from './rules';
 import { SkillRegistry } from './skills';
 import { CHAT_APP_HTML } from './webviewHtml';
@@ -98,6 +98,10 @@ interface WebviewToHost {
 	command?: string;
 	text?: string;
 	approval?: string;
+	maxTokens?: number;
+	maxSteps?: number;
+	maxRunMinutes?: number;
+	decompose?: boolean;
 	/** Which chat tab this message belongs to; enables parallel conversations. */
 	sessionId?: string;
 	/** Identifies one run within a tab, so a superseded run's messages can be ignored. */
@@ -595,6 +599,58 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 					await this.registry.setModel(message.provider, message.model);
 				}
 				break;
+			case 'setCloudflareAccountId':
+				if (typeof message.text === 'string') {
+					await this.registry.setCloudflareAccountId(message.text);
+					// The account id is baked into the base URL (see getBaseUrl), so a stale
+					// cached catalog fetched under the old id would keep offering it.
+					this.invalidateModelCache('cloudflare');
+					await this.postConfig();
+				}
+				break;
+			case 'setBaseUrl':
+				if (message.provider && typeof message.text === 'string') {
+					await this.registry.setBaseUrl(message.provider, message.text);
+					// A different endpoint can serve a different model catalog entirely.
+					this.invalidateModelCache(message.provider);
+					await this.postConfig();
+				}
+				break;
+			case 'setSystemPrompt':
+				if (typeof message.text === 'string') {
+					await vscode.workspace.getConfiguration('openvsChat').update(
+						'systemPrompt', message.text, vscode.ConfigurationTarget.Global);
+				}
+				break;
+			case 'setMaxTokens':
+				if (typeof message.maxTokens === 'number' && Number.isFinite(message.maxTokens) && message.maxTokens > 0) {
+					await vscode.workspace.getConfiguration('openvsChat').update(
+						'maxTokens', Math.floor(message.maxTokens), vscode.ConfigurationTarget.Global);
+				}
+				break;
+			case 'setRules':
+				if (typeof message.text === 'string') {
+					await vscode.workspace.getConfiguration('openvsChat').update(
+						'rules', message.text, vscode.ConfigurationTarget.Global);
+				}
+				break;
+			case 'setMaxSteps':
+				if (typeof message.maxSteps === 'number' && Number.isFinite(message.maxSteps) && message.maxSteps > 0) {
+					await vscode.workspace.getConfiguration('openvsChat').update(
+						'agent.maxSteps', Math.floor(message.maxSteps), vscode.ConfigurationTarget.Global);
+				}
+				break;
+			case 'setMaxRunMinutes':
+				if (typeof message.maxRunMinutes === 'number' && Number.isFinite(message.maxRunMinutes) && message.maxRunMinutes > 0) {
+					await vscode.workspace.getConfiguration('openvsChat').update(
+						'agent.maxRunMinutes', Math.floor(message.maxRunMinutes), vscode.ConfigurationTarget.Global);
+				}
+				break;
+			case 'setDecompose':
+				await vscode.workspace.getConfiguration('openvsChat').update(
+					'auto.decompose', !!message.decompose, vscode.ConfigurationTarget.Global);
+				await this.postConfig();
+				break;
 			case 'listModels':
 				await this.handleListModels(message.provider);
 				break;
@@ -937,7 +993,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			model,
 			apiKey: apiKey ?? '',
 			baseUrl: this.registry.getBaseUrl(providerId),
-			maxTokens: this.effectiveMaxTokens(mode, !!message.inline),
+			maxTokens: this.effectiveMaxTokens(mode, !!message.inline, providerId, model),
 		};
 
 		// A re-send in the same tab supersedes that tab's previous request; other tabs run on.
@@ -1039,6 +1095,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		const controller = new AbortController();
 		this.activeRequests.set(sessionId, controller);
 
+		// What each role *actually* ran on, for the closing summary. Recorded per phase rather
+		// than from the pre-flight resolution because a role can fall back mid-run: the model
+		// announced when a phase opened is not always the one that answered.
+		const used = new Map<AutoRole, RoleAssignment>();
+		const announce = (role: AutoRole, a: RoleAssignment, streaming: boolean) => {
+			used.set(role, a);
+			post({
+				type: 'autoPhase', role, label: a.roleLabel,
+				provider: a.providerLabel, model: a.model, source: a.source, streaming,
+			});
+		};
+
 		try {
 			const context = await this.resolveContext(mode, message.context);
 			const contextText = context?.content;
@@ -1066,10 +1134,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 						phase: (role, a, streaming) => {
 							stepThinking?.flush();
 							stepThinking = streaming ? new ThinkingStreamParser(text => post({ type: 'token', delta: text })) : undefined;
-							post({
-								type: 'autoPhase', role, label: a.roleLabel,
-								provider: a.providerLabel, model: a.model, source: a.source, streaming,
-							});
+							announce(role, a, streaming);
 						},
 						token: delta => stepThinking ? stepThinking.push(delta) : post({ type: 'token', delta }),
 						agentStepStart: () => {
@@ -1088,36 +1153,47 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			} else {
 				// Ask/Plan → planning/reasoning model; inline Edit → implementation model.
 				const role: AutoRole = mode === 'edit' ? 'code' : 'plan';
-				const a = await this.router.resolveRole(role);
-				if (!a.ready) {
-					fail(`Auto can't run ${a.roleLabel} — ${a.problem}`);
-					return;
-				}
-				const provider = this.registry.getProvider(a.providerId);
-				if (!provider) {
-					fail(`Provider "${a.providerId}" is unavailable.`);
-					return;
-				}
-				if (history.at(-1)?.images?.length && !modelSupportsVision(provider.info, a.model)) {
-					fail(`The Auto-routed "${a.roleLabel}" model "${a.model}" doesn't support image input. Remove the attached image(s), pin a vision-capable model for this role, or switch off Auto.`);
-					return;
-				}
-				post({
-					type: 'autoPhase', role, label: a.roleLabel,
-					provider: a.providerLabel, model: a.model, source: a.source, streaming: true,
-				});
+				// Vision is a routing constraint, not a late failure: an attached image steers
+				// Auto to a model that can read it instead of erroring out on the one it picked.
+				const needs = { vision: !!history.at(-1)?.images?.length };
 				const messages: ChatMessage[] = [{ role: 'system', content: this.buildSystemPrompt(mode, await this.baseSystem(), !!message.inline) }];
 				if (contextText) {
 					messages.push({ role: 'user', content: `Context for the request:\n\n${contextText}` });
 				}
 				messages.push(...history);
-				await this.runStreaming(provider, messages, {
-					model: a.model,
-					apiKey: (await this.registry.getApiKey(a.providerId)) ?? '',
-					baseUrl: this.registry.getBaseUrl(a.providerId),
-					maxTokens: this.effectiveMaxTokens(mode, !!message.inline),
-					signal: controller.signal,
-				}, mode, post);
+				// Candidates, not a single pick: an inferred model that this account can't
+				// serve must fall back here exactly as it does inside the Agent pipeline,
+				// or the same routing decision succeeds in one mode and hard-fails in another.
+				const candidates = await this.router.resolveRoleCandidates(role, needs);
+				for (let i = 0; i < candidates.length; i++) {
+					const a = candidates[i];
+					if (!a.ready) {
+						fail(`Auto can't run ${a.roleLabel} — ${a.problem}`);
+						return;
+					}
+					const provider = this.registry.getProvider(a.providerId);
+					if (!provider) {
+						fail(`Provider "${a.providerId}" is unavailable.`);
+						return;
+					}
+					announce(role, a, true);
+					try {
+						await this.runStreaming(provider, messages, {
+							model: a.model,
+							apiKey: (await this.registry.getApiKey(a.providerId)) ?? '',
+							baseUrl: this.registry.getBaseUrl(a.providerId),
+							maxTokens: this.effectiveMaxTokens(mode, !!message.inline, a.providerId, a.model),
+							signal: controller.signal,
+						}, mode, post);
+						break;
+					} catch (err) {
+						const next = candidates[i + 1];
+						if (controller.signal.aborted || !isModelError(err) || a.source !== 'inferred' || !next?.ready) {
+							throw isModelError(err) && a.source === 'configured' ? describePinnedModelError(a, err) : err;
+						}
+						post({ type: 'info', message: `${a.model} unavailable — trying ${next.model}.` });
+					}
+				}
 			}
 		} catch (err) {
 			if (!isAbortError(err)) {
@@ -1127,6 +1203,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			if (this.activeRequests.get(sessionId) === controller) {
 				this.activeRequests.delete(sessionId);
 				this.steerQueues.delete(sessionId);
+			}
+			// Auto picks the models, so the run has to say which ones it picked — the per-phase
+			// headers scroll away, and after a fallback they no longer agree with each other.
+			const phases = AUTO_ROLES.flatMap(role => {
+				const a = used.get(role);
+				return a ? [{ role, label: a.roleLabel, provider: a.providerLabel, model: a.model, source: a.source }] : [];
+			});
+			if (phases.length) {
+				post({ type: 'autoSummary', phases });
 			}
 			post({ type: 'done' });
 		}
@@ -1145,10 +1230,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		let full = '';
 		let truncated = false;
 		try {
-			({ text: full, truncated } = await streamChatWithContinuation(provider, {
-				// A long chat would otherwise grow until the provider rejects it outright.
-				messages: trimMessages(messages, this.configuredContextTokens(params.model, params.maxTokens, provider.info.id)),
+			// Trims to the budget and, if the backend still refuses the request as too big,
+			// retries once inside the ceiling it named. Shared with the Auto pipeline's text
+			// phases so the two cannot drift.
+			({ text: full, truncated } = await streamBudgeted(provider, {
+				messages,
 				...params,
+				contextBudget: this.configuredContextTokens(params.model, params.maxTokens, provider.info.id),
 				onToken: delta => thinking.push(delta),
 				onNotice: text => post({ type: 'info', message: text }),
 			}));
@@ -1327,11 +1415,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	 * Estimated-token ceiling for the conversation sent to `model`, above which old
 	 * tool output is trimmed. Derived from the model's context window unless the user
 	 * pinned an explicit openvsChat.agent.maxContextTokens.
+	 *
+	 * Then clamped by any per-request token allowance the backend has stated in its response
+	 * headers, because the window is the wrong number wherever the two disagree: Groq's free
+	 * tier serves a 128k-window model with an 8k allowance, so a window-derived budget
+	 * overshoots by an order of magnitude and every request is refused. The agent loop learns
+	 * this for itself, but the plain streaming path — the one a model without tool support
+	 * takes, and Edit mode — has no loop to learn in, so it has to be right up front.
 	 */
 	private configuredContextTokens(model: string, maxOutputTokens: number, providerId?: string): number {
+		return this.budgetsFor(model, maxOutputTokens, providerId).contextBudget;
+	}
+
+	/**
+	 * The reply reservation and conversation budget for one request, from the one shared
+	 * formula. Both halves are charged against the same stated allowance, so deriving them
+	 * apart is how a request ends up fitting neither.
+	 */
+	private budgetsFor(model: string, maxOutputTokens: number, providerId?: string): { maxTokens: number; contextBudget: number } {
 		const configured = vscode.workspace.getConfiguration('openvsChat').get<number>('agent.maxContextTokens');
-		return contextBudgetFor(model, maxOutputTokens, typeof configured === 'number' ? configured : 0,
-			providerId ? this.modelCache.get(providerId) : undefined);
+		return requestBudgets({
+			model,
+			maxOutputTokens,
+			override: typeof configured === 'number' ? configured : 0,
+			entries: providerId ? this.modelCache.get(providerId) : undefined,
+			stated: providerId ? this.registry.getProvider(providerId)?.rateLimit?.(model)?.limitTokens : undefined,
+		});
 	}
 
 	/**
@@ -1388,7 +1497,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				onToken: delta => { text += delta; },
 			});
 			return stripThinking(text);
-		}, keepHead);
+			// Bounded by the same budget the conversation itself is trimmed to, less the
+			// summary. Unbounded, this was the largest request the chat ever sent — and the
+			// one most likely to be refused, on the providers that most need compacting.
+		}, keepHead, Math.max(1_000, trimBudget - SUMMARY_MAX_TOKENS));
 		if (!res) {
 			return messages;
 		}
@@ -1404,12 +1516,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	 * (it doesn't force the model to use it), so raising it here is free insurance against the
 	 * model's response getting cut off mid-file.
 	 */
-	private effectiveMaxTokens(mode: ChatMode, inline: boolean): number {
+	private effectiveMaxTokens(mode: ChatMode, inline: boolean, providerId?: string, model?: string): number {
 		const configured = this.registry.getMaxTokens();
-		if (mode === 'edit' && !inline) {
-			return Math.max(configured, 8192);
-		}
-		return configured;
+		const wanted = mode === 'edit' && !inline ? Math.max(configured, 8192) : configured;
+		// A backend that states a per-request token allowance charges the *reservation*
+		// against it, not just the prompt: on Groq's 8k free tier the default 8192 exceeds
+		// the whole allowance before a single character of conversation is added, so no
+		// amount of trimming can rescue the request. `budgetsFor` splits the allowance
+		// between the two halves so what is left still fits a conversation.
+		return model ? this.budgetsFor(model, wanted, providerId).maxTokens : wanted;
 	}
 
 	private buildSystemPrompt(mode: ChatMode, base: string, inline = false, readTools = false): string {
@@ -1527,12 +1642,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	private async postConfig(): Promise<void> {
 		const providers = await this.registry.resolveAll();
 		const roles = await this.router.resolveAll();
+		const cfg = vscode.workspace.getConfiguration('openvsChat');
 		this.post({
 			type: 'config',
 			providers,
 			selectedProvider: this.registry.getDefaultProviderId(),
-			auto: { roles, reviewEnabled: this.router.isReviewEnabled() },
-			approval: parseApprovalPolicy(vscode.workspace.getConfiguration('openvsChat').get<string>('guardrails.approval')),
+			auto: { roles, reviewEnabled: this.router.isReviewEnabled(), decompose: this.router.isDecompose() },
+			approval: parseApprovalPolicy(cfg.get<string>('guardrails.approval')),
+			systemPrompt: this.registry.getSystemPrompt(),
+			maxTokens: this.registry.getMaxTokens(),
+			rules: cfg.get<string>('rules') ?? '',
+			maxSteps: cfg.get<number>('agent.maxSteps') ?? 100,
+			maxRunMinutes: cfg.get<number>('agent.maxRunMinutes') ?? 30,
 		});
 		await this.postSkills();
 		this.pushAvailableModels(providers);

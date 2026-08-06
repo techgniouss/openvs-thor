@@ -132,6 +132,46 @@ const hostHandles = new Set(captures(host, /^\s*case '([a-zA-Z]+)':/gm));
 	assert.ok(host.includes('message.promptId'), 'the host correlates the reply');
 }
 
+// 5a. The Auto run's closing "models used" line is the only place the *actual* model of
+// each phase survives: the per-phase headers scroll away, and after a runtime fallback they
+// name a model that did not answer. Its payload is untyped on both sides, so a renamed
+// field would silently render a row of blanks instead of failing.
+{
+	assert.ok(host.includes("type: 'autoSummary'"), 'the host posts the closing summary');
+	assert.match(main, /case 'autoSummary':[\s\S]{0,900}appendAutoSummary\(msg\.phases\)/,
+		'the webview draws it from msg.phases');
+	// Recorded in the transcript, not just drawn: a run that ends in a background tab draws
+	// nothing, and the next renderAll discards a node that was only appended.
+	assert.match(main, /case 'autoSummary':[\s\S]{0,900}s\.messages\.push\(\{[^}]*kind: 'auto'/,
+		'the summary is kept in the session transcript');
+	assert.match(main, /m\.kind === 'auto'[\s\S]{0,120}appendAutoSummary\(m\.phases\)/,
+		'and re-rendered from it');
+	// `kind` is what keeps notices out of the history sent to the model; the summary is one.
+	assert.match(main, /function sendableMessages[\s\S]{0,200}filter\(m => !m\.kind/,
+		'entries carrying a kind are never sent back as conversation');
+	for (const field of ['label', 'provider', 'model', 'source']) {
+		assert.ok(main.includes(`phase.${field}`), `the summary row renders "${field}"`);
+	}
+	// Summaries are chat traffic: rendered into the detached Settings tab they would attach
+	// to a session that tab does not have.
+	assert.ok(/const CHAT_ONLY_MESSAGES = \[[\s\S]*?'autoSummary'[\s\S]*?\];/.test(main),
+		'autoSummary must not reach the Settings tab');
+}
+
+// 5c. Switching a role's provider must not keep the previous provider's model in the box.
+// It did, and the pair was persisted verbatim: choosing NVIDIA fills in
+// `meta/llama-3.3-70b-instruct`, switching to Anthropic then pinned
+// `anthropic:meta/llama-3.3-70b-instruct` — a pair that cannot exist, 404s on the first
+// request of every Auto run, and (being pinned) is never substituted.
+{
+	const handler = /provSel\.addEventListener\('change'[\s\S]*?\n\t\t\t\}\);/.exec(main);
+	assert.ok(handler, 'the role-provider change handler is still there');
+	assert.match(handler[0], /offered\.includes\(modelInput\.value\.trim\(\)\)/,
+		'a model the new provider does not offer is replaced, not carried over');
+	assert.match(handler[0], /provider: '', model: ''/,
+		'and a provider with nothing to offer clears the pin instead of leaving the old pair');
+}
+
 // 5b. The card module reads exactly the request fields the host sends. Behaviour is
 // covered by test-prompt-cards.mjs; what that test can't see is the host's half.
 {

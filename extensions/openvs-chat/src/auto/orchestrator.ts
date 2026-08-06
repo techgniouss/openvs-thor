@@ -4,13 +4,14 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { AgentCallbacks, AgentRunner, RunResult } from '../agent/agentRunner';
-import { contextBudgetFor, contextWindowFor } from '../agent/contextWindow';
+import { streamBudgeted } from '../agent/budgetedStream';
+import { contextBudgetFor, contextWindowFor, requestBudgets } from '../agent/contextWindow';
 import { ToolApprover, asString, commandTextOf, normalizeToolCall } from '../agent/tools';
 import { McpToolset } from '../mcp/manager';
 import { TodoItem } from '../persona/todos';
 import { ProviderRegistry } from '../providers/registry';
-import { ChatMessage, ModelEntry, ToolCall, streamChatWithContinuation } from '../providers/types';
-import { AutoRole, RoleAssignment, RoleRouter } from './router';
+import { ChatMessage, ChatProvider, ModelEntry, ToolCall } from '../providers/types';
+import { AutoRole, CredentialMemo, RoleAssignment, RoleRouter } from './router';
 
 /** Events the orchestrator emits as it moves through the plan → code → review phases. */
 export interface AutoCallbacks {
@@ -105,6 +106,19 @@ export class AutoOrchestrator {
 		return { maxRunMs: this.remainingRunMs(), traceTiming: this.traceTiming };
 	}
 
+	/**
+	 * Reply reservation and conversation budget for a text phase, clamped by any per-request
+	 * allowance the backend has already stated in its response headers.
+	 */
+	private textBudgets(provider: ChatProvider, assignment: RoleAssignment, maxTokens: number): { maxTokens: number; contextBudget: number } {
+		return requestBudgets({
+			model: assignment.model,
+			maxOutputTokens: maxTokens,
+			entries: this.catalog?.(assignment.providerId),
+			stated: provider.rateLimit?.(assignment.model)?.limitTokens,
+		});
+	}
+
 	/** Context-window and trim budget for a role's model, catalog-aware where possible. */
 	private budgetFor(assignment: RoleAssignment, maxTokens: number): { contextWindow: number; maxContextTokens: number } {
 		const entries = this.catalog?.(assignment.providerId);
@@ -116,10 +130,17 @@ export class AutoOrchestrator {
 
 	async run(params: AutoRunParams, cb: AutoCallbacks): Promise<void> {
 		this.startedAt = Date.now();
-		const planCandidates = await this.router.resolveRoleCandidates('plan');
-		const codeCandidates = await this.router.resolveRoleCandidates('code');
+		// One credential sweep for all three roles rather than one per role.
+		const memo: CredentialMemo = new Map();
+		// The planner and the implementer are both handed the conversation, so if it carries
+		// image attachments they must be able to read them; the reviewer is given a text-only
+		// brief and is not constrained. Routing on this beats discovering it as a provider 400
+		// several phases in, and it means an image simply steers Auto to a model that can see.
+		const needs = { vision: params.history.some(m => !!m.images?.length) };
+		const planCandidates = await this.router.resolveRoleCandidates('plan', needs, memo);
+		const codeCandidates = await this.router.resolveRoleCandidates('code', needs, memo);
 		const reviewEnabled = this.router.isReviewEnabled();
-		let reviewCandidates = reviewEnabled ? await this.router.resolveRoleCandidates('review') : [];
+		let reviewCandidates = reviewEnabled ? await this.router.resolveRoleCandidates('review', {}, memo) : [];
 
 		// Pre-flight. Plan and code are required; a broken *configured* role hard-stops.
 		requireReady(planCandidates[0]);
@@ -218,7 +239,7 @@ export class AutoOrchestrator {
 					lastError = err;
 					continue;
 				}
-				throw err;
+				throw a.source === 'configured' && isModelError(err) ? describePinnedModelError(a, err) : err;
 			}
 		}
 		throw lastError instanceof Error ? lastError : new Error(`No model available for ${role}.`);
@@ -235,12 +256,17 @@ export class AutoOrchestrator {
 		if (!provider) {
 			throw new Error(`${assignment.roleLabel} provider "${assignment.providerId}" is unavailable.`);
 		}
-		const { text, truncated } = await streamChatWithContinuation(provider, {
+		// Sized exactly as the plain streaming path sizes a request. These phases used to send
+		// the conversation untrimmed with the full configured reservation, so on a backend with
+		// a small per-request allowance the planner was refused before the implementer — which
+		// does learn its ceiling — ever got to run.
+		const budgets = this.textBudgets(provider, assignment, maxTokens);
+		const { text, truncated } = await streamBudgeted(provider, {
 			messages,
 			model: assignment.model,
 			apiKey: await this.apiKey(assignment.providerId),
 			baseUrl: this.registry.getBaseUrl(assignment.providerId),
-			maxTokens,
+			...budgets,
 			signal,
 			onToken: delta => cb.token(delta),
 			onNotice: text => cb.note(text),
@@ -311,7 +337,7 @@ export class AutoOrchestrator {
 					lastError = err;
 					continue;
 				}
-				throw err;
+				throw a.source === 'configured' && isModelError(err) ? describePinnedModelError(a, err) : err;
 			}
 		}
 		throw lastError instanceof Error ? lastError : new Error('No implementation model available.');
@@ -424,8 +450,29 @@ function requireReady(a: RoleAssignment): void {
 	}
 }
 
-/** Heuristic: did a failure come from an invalid/unknown model id (vs. a real runtime error)? */
-function isModelError(err: unknown): boolean {
+/**
+ * Re-frames a model-not-found failure on a **pinned** role.
+ *
+ * A pin is never substituted, so this ends the run — and the raw provider body ("model:
+ * meta/llama-3.3-70b-instruct" from Anthropic) says nothing about *why* a run the user
+ * never configured that way is asking Anthropic for an NVIDIA model. Naming the role and
+ * the pair points at the setting that is actually wrong.
+ */
+export function describePinnedModelError(a: RoleAssignment, err: unknown): Error {
+	const detail = err instanceof Error ? err.message : String(err);
+	return new Error(
+		`The model pinned for ${a.roleLabel.toLowerCase()} — ${a.providerLabel} "${a.model}" — was rejected by the provider. ` +
+		`Check that this model belongs to ${a.providerLabel} (⚙ Providers → Auto routing), or set the role back to Auto-select. ${detail}`,
+	);
+}
+
+/**
+ * Heuristic: did a failure come from an invalid/unknown model id (vs. a real runtime error)?
+ * Exported because the single-model Auto paths (Ask/Plan/Edit) fall back on exactly the same
+ * signal as the pipeline does — one rule, so the two modes can't disagree about what is
+ * recoverable.
+ */
+export function isModelError(err: unknown): boolean {
 	const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
 	return msg.includes('404')
 		|| msg.includes('not found')

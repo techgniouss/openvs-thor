@@ -90,3 +90,72 @@ export function contextBudgetFor(model: string, maxOutputTokens: number, overrid
 	}
 	return Math.max(MIN_BUDGET, Math.floor(contextWindowFor(model, entries) * WINDOW_SHARE) - maxOutputTokens);
 }
+
+/** Fraction of a stated ceiling actually spent, since our token count is an estimate. */
+const STATED_LIMIT_SHARE = 0.9;
+/** Share of that left for the model's reply, and the floor under it. */
+const STATED_OUTPUT_SHARE = 0.25;
+const MIN_OUTPUT_TOKENS = 512;
+/** Floor for a conversation budget derived from a stated ceiling. */
+const MIN_STATED_CONTEXT_TOKENS = 1_000;
+
+/** How a per-request token ceiling divides between the reply and the conversation. */
+export interface CeilingBudgets {
+	/** Tokens to reserve for the reply — never above what the user configured. */
+	readonly reply: number;
+	/** Tokens left for the conversation once that reservation is taken. */
+	readonly conversation: number;
+}
+
+/**
+ * Splits a backend's stated per-request token allowance into the two budgets that are
+ * charged against it.
+ *
+ * Both halves move together, which is why this is one function and not two: the allowance
+ * covers the prompt *and* the reserved output, so on Groq's 8k free tier the default 8192
+ * reservation exceeds it before a single character of conversation is added, and trimming
+ * the conversation alone can never rescue the request.
+ *
+ * Shared by the agent loop and the plain streaming path. They had drifted into three
+ * near-identical formulas — one using the raw limit where another used the discounted one —
+ * which is the kind of difference that shows up as "it works in Agent mode but not in Ask".
+ */
+export function budgetsForCeiling(limit: number, configuredOutput: number): CeilingBudgets {
+	const usable = Math.floor(limit * STATED_LIMIT_SHARE);
+	const reply = Math.max(MIN_OUTPUT_TOKENS, Math.min(configuredOutput, Math.floor(usable * STATED_OUTPUT_SHARE)));
+	return { reply, conversation: Math.max(MIN_STATED_CONTEXT_TOKENS, usable - reply) };
+}
+
+/** Everything needed to size one request to a model. */
+export interface RequestBudgetInput {
+	readonly model: string;
+	/** What the user configured for the reply (already adjusted for the mode, if it is). */
+	readonly maxOutputTokens: number;
+	/** `openvsChat.agent.maxContextTokens`, when the user pinned one. */
+	readonly override?: number;
+	/** The provider's fetched catalog, when loaded. */
+	readonly entries?: ModelEntry[];
+	/** The backend's stated per-request token allowance, from response headers or a 413. */
+	readonly stated?: number;
+}
+
+/**
+ * The two budgets one request is sized by: how much reply to reserve, and how much
+ * conversation may be sent.
+ *
+ * Every dispatch path needs both, and they must be derived together from the same
+ * numbers — a reply reservation taken from the raw allowance while the conversation
+ * budget is taken from the discounted one produces a request that fits neither. This is
+ * the single place the two are computed, so the agent loop, the plain streaming path and
+ * the Auto pipeline's text phases cannot disagree about what fits.
+ */
+export function requestBudgets(input: RequestBudgetInput): { maxTokens: number; contextBudget: number } {
+	const windowBudget = contextBudgetFor(input.model, input.maxOutputTokens, input.override, input.entries);
+	if (!input.stated || input.stated <= 0) {
+		return { maxTokens: input.maxOutputTokens, contextBudget: windowBudget };
+	}
+	const { reply, conversation } = budgetsForCeiling(input.stated, input.maxOutputTokens);
+	// The window still binds when it is the smaller of the two: an allowance is per request,
+	// not a window, so a roomy allowance must never widen a small model's budget.
+	return { maxTokens: reply, contextBudget: Math.min(conversation, windowBudget) };
+}

@@ -280,4 +280,80 @@ const sentIds = (bodies, n) => bodies[n].messages.flatMap(
 	);
 }
 
+// 10. A turn that is nothing but chain-of-thought still reaches the agent loop as content.
+// There is no standard field for it — DeepSeek-style backends send `reasoning_content`,
+// Groq and OpenRouter send `reasoning`, and some gateways wrap it in an object. Reading one
+// spelling made a thinking turn (gpt-oss, Nemotron, GLM produce them routinely) arrive
+// EMPTY, so the loop nudged, got another, and after four gave up mid-task on a model that
+// was working correctly.
+{
+	const thinkingOnly = field => () => {
+		const body = new ReadableStream({
+			start(controller) {
+				const event = JSON.stringify({ choices: [{ delta: { [field]: 'weighing the options' }, finish_reason: 'stop' }] });
+				controller.enqueue(new TextEncoder().encode(`data: ${event}\n\n`));
+				controller.close();
+			},
+		});
+		return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+	};
+	const nested = () => {
+		const body = new ReadableStream({
+			start(controller) {
+				const event = JSON.stringify({ choices: [{ delta: { reasoning: { content: 'weighing the options' } }, finish_reason: 'stop' }] });
+				controller.enqueue(new TextEncoder().encode(`data: ${event}\n\n`));
+				controller.close();
+			},
+		});
+		return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+	};
+	const steps = [];
+	for (const respond of [thinkingOnly('reasoning_content'), thinkingOnly('reasoning'), nested]) {
+		stubFetch([respond]);
+		steps.push(await new OpenRouterProvider().runAgentStep({ ...request(), model: 'openai/gpt-oss-120b' }));
+	}
+	assert.deepStrictEqual(
+		steps.map(s => s.content),
+		['weighing the options', 'weighing the options', 'weighing the options'],
+		'every spelling of a reasoning delta survives as the step\'s content',
+	);
+}
+
+// 11. A backend that reports a failure *inside* an HTTP 200 stream must surface it. NVIDIA
+// NIM and other vLLM-based gateways do exactly that, and every such event was skipped here
+// because it matches no `choices` shape — so the request finished with no content, and the
+// agent loop reported "the model returned an empty reply" four times and gave up while the
+// provider's actual reason sat unread in the stream. Anthropic has always raised these.
+{
+	const errorStream = payload => () => {
+		const body = new ReadableStream({
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`));
+				controller.close();
+			},
+		});
+		return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+	};
+	const failures = [];
+	for (const payload of [
+		{ error: { message: 'Internal server error' } },
+		{ object: 'error', message: 'model is loading' },
+		{ error: 'plain string form' },
+	]) {
+		stubFetch([errorStream(payload)]);
+		await new NvidiaProvider().runAgentStep(request()).then(
+			step => failures.push(`resolved with ${JSON.stringify(step.content)}`),
+			err => failures.push(err.message));
+	}
+	assert.deepStrictEqual(
+		failures,
+		[
+			'NVIDIA (free models): Internal server error',
+			'NVIDIA (free models): model is loading',
+			'NVIDIA (free models): plain string form',
+		],
+		'an in-band stream error is raised with what the provider said, not swallowed into an empty reply',
+	);
+}
+
 console.log('test-provider-messages.mjs: all assertions passed');

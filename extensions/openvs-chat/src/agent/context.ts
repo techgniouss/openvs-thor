@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { ChatMessage, ToolSpec } from '../providers/types';
+import { ChatMessage, ToolCall, ToolSpec } from '../providers/types';
 
 /**
  * Conversation-window management. A long agent run accumulates every file it read and
@@ -153,10 +153,215 @@ export function trimMessages(messages: ChatMessage[], budget: number): ChatMessa
 			});
 		}
 	}
+	// Pass 3: the recent tool output this function normally protects is, at this point, the
+	// only thing left over budget — one fresh file read is 24k characters, so on a small
+	// budget it can exceed the whole allowance by itself. Protecting it meant returning a
+	// conversation that does NOT fit the budget the caller asked for, which the caller then
+	// sent and the provider refused. A shortened result the model can ask for again beats a
+	// request that is rejected outright, so the protection yields rather than the budget.
+	if (total > budget) {
+		for (let i = start; i < trimmed.length; i++) {
+			if (total <= budget) {
+				break;
+			}
+			if (trimmed[i].role !== 'tool' || trimmed[i].content.length < MIN_TRIMMABLE) {
+				continue;
+			}
+			const before = estimateMessageTokens(trimmed[i]);
+			trimmed[i] = { ...trimmed[i], content: `${trimmed[i].content.slice(0, 200)}\n\n${TRIM_MARKER}` };
+			total += estimateMessageTokens(trimmed[i]) - before;
+		}
+	}
 	// Final safety net: drop any tool result whose originating assistant tool_call did not
 	// survive the trim (e.g. it fell just inside the protected recent tail). An orphaned
 	// tool message makes providers reject the whole request with HTTP 400.
 	return dropOrphanToolResults(trimmed);
+}
+
+/** Left where a tool result was elided because later output replaced it outright. */
+export const SUPERSEDED_MARKER = '[superseded by later output in this conversation]';
+
+/** Left where an old tool result was elided to keep each step's prompt small. */
+export const DECAY_MARKER = '[older tool output elided to keep each step small — read it again if you need it]';
+
+/** Options for {@link pruneToolOutput}, so this module stays free of the tool layer. */
+export interface PruneOptions {
+	/** Names of the tools that only read; their results are what may be elided. */
+	readTools: readonly string[];
+	/** The tool that replaces a file wholesale, making every earlier read of it dead. */
+	wholeFileWriteTool: string;
+	/** Results are kept verbatim until this many assistant turns have followed them. */
+	keepRecentTurns?: number;
+	/** Results shorter than this cost more in markers than they save. */
+	minChars?: number;
+}
+
+/**
+ * Elides tool output that the model no longer needs sent, *regardless of budget*.
+ *
+ * {@link trimMessages} is a correctness guard: it fires only once a request would not fit.
+ * That leaves a large-window model re-sending a hundred thousand tokens of dead file dumps
+ * on every step, at full price, because they technically fit — an agent step re-sends the
+ * whole conversation, so a single 6k-token file read is paid for again on every remaining
+ * step of the run. Fitting and being worth sending are different questions, and only the
+ * first one was being asked.
+ *
+ * Three rules, all of which leave the model strictly no worse informed:
+ *
+ * 1. A read whose *identical* call appears again later — the earlier copy is dominated by
+ *    the later one, which is still in the transcript verbatim.
+ * 2. A read of a path that a later `write_file` replaced wholesale. The new content is in
+ *    that call's own arguments, so nothing is lost. `edit_file` deliberately does **not**
+ *    count: a targeted replacement leaves the old dump mostly accurate, and eliding it
+ *    would force a re-read that costs more than the elision saved.
+ * 3. Anything older than `keepRecentTurns` assistant turns, which is the working-set
+ *    boundary the trimming pass already uses.
+ *
+ * Callers **must** feed the result through {@link elidedToolCallIds} and forget the
+ * corresponding reads — see `AgentRunner.forgetElidedReads`. A read whose content no longer
+ * reaches the model but which the repeat-read breaker still calls "already read" is a
+ * deadlock: the model cannot see the content and is refused the call that would show it.
+ */
+export function pruneToolOutput(messages: ChatMessage[], options: PruneOptions): ChatMessage[] {
+	const minChars = options.minChars ?? MIN_TRIMMABLE;
+	const keepRecent = options.keepRecentTurns ?? KEEP_RECENT_TURNS;
+	const reads = new Set(options.readTools);
+
+	/** Every tool call in the transcript, by the id its result carries. */
+	const callOf = new Map<string, ToolCall>();
+	for (const m of messages) {
+		for (const call of m.toolCalls ?? []) {
+			callOf.set(call.id, call);
+		}
+	}
+
+	// Last index at which each identical read, and each wholesale write, appears. Both are
+	// "what is the newest thing that makes an older message redundant", so one pass fills
+	// them and a second compares each message against them.
+	const lastRead = new Map<string, number>();
+	const lastWrite = new Map<string, number>();
+	for (let i = 0; i < messages.length; i++) {
+		const call = toolCallFor(messages[i], callOf);
+		if (!call) {
+			continue;
+		}
+		if (reads.has(call.name)) {
+			lastRead.set(callSignature(call), i);
+		} else if (call.name === options.wholeFileWriteTool) {
+			const path = pathKey(call);
+			if (path) {
+				lastWrite.set(path, i);
+			}
+		}
+	}
+
+	// The boundary is expressed in assistant turns rather than messages because a step can
+	// append any number of tool results; counting messages would protect a different amount
+	// of history depending on how many calls the last steps happened to make.
+	const ageBoundary = assistantTurnBoundary(messages, keepRecent);
+
+	let changed = false;
+	const out = messages.map((m, i) => {
+		const call = toolCallFor(m, callOf);
+		if (!call || m.content.length < minChars) {
+			return m;
+		}
+		const marker = elisionReason(call, i, { reads, lastRead, lastWrite, ageBoundary });
+		if (!marker) {
+			return m;
+		}
+		changed = true;
+		// The head is kept for the same reason trimming keeps it: the first line of a file
+		// dump or a command's output is usually what identifies it, and a model that can see
+		// *what* was elided asks for the right thing back.
+		return { ...m, content: `${m.content.slice(0, 200)}\n\n${marker}` };
+	});
+	return changed ? out : messages;
+}
+
+/** Why `call`'s result at `index` need not be sent, or undefined when it must be. */
+function elisionReason(
+	call: ToolCall,
+	index: number,
+	ctx: {
+		reads: Set<string>;
+		lastRead: Map<string, number>;
+		lastWrite: Map<string, number>;
+		ageBoundary: number;
+	},
+): string | undefined {
+	if (ctx.reads.has(call.name)) {
+		const newerRead = ctx.lastRead.get(callSignature(call));
+		if (newerRead !== undefined && newerRead > index) {
+			return SUPERSEDED_MARKER;
+		}
+		const path = pathKey(call);
+		const newerWrite = path ? ctx.lastWrite.get(path) : undefined;
+		if (newerWrite !== undefined && newerWrite > index) {
+			return SUPERSEDED_MARKER;
+		}
+	}
+	return index < ctx.ageBoundary ? DECAY_MARKER : undefined;
+}
+
+/** The call that produced `m`, when `m` is a tool result whose call is in the transcript. */
+function toolCallFor(m: ChatMessage, callOf: Map<string, ToolCall>): ToolCall | undefined {
+	return m.role === 'tool' && m.toolCallId ? callOf.get(m.toolCallId) : undefined;
+}
+
+/** Identity of a call for "the same call ran again" purposes: name plus sorted arguments. */
+function callSignature(call: ToolCall): string {
+	const args = Object.keys(call.args).sort().map(k => `${k}=${JSON.stringify(call.args[k])}`).join(',');
+	return `${call.name}(${args})`;
+}
+
+/**
+ * A call's `path` argument, normalized enough to compare two spellings of one file.
+ *
+ * Deliberately crude — this module cannot reach the editor's real path resolution without
+ * taking a dependency on `vscode`. A normalization miss simply fails to elide, which is the
+ * safe direction: the cost is tokens, never a message the model needed and didn't get.
+ */
+function pathKey(call: ToolCall): string | undefined {
+	const path = call.args.path;
+	return typeof path === 'string' && path ? path.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase() : undefined;
+}
+
+/** Index of the `keepRecent`-th assistant turn counted back from the end, or 0. */
+function assistantTurnBoundary(messages: ChatMessage[], keepRecent: number): number {
+	let seen = 0;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		if (messages[i].role === 'assistant' && ++seen >= keepRecent) {
+			return i;
+		}
+	}
+	return 0;
+}
+
+/**
+ * Tool-call ids whose result reached the model differently in `after` than in `before` —
+ * shortened, replaced by a marker, or dropped from the conversation altogether.
+ *
+ * Compared by id and content rather than by position because every pass that shrinks a
+ * conversation may also splice it, and an index is meaningless afterwards. Whether the
+ * content was elided proactively, trimmed to fit, or dropped wholesale doesn't matter to
+ * the caller: in all three cases the model can no longer read it, which is the only fact
+ * the repeat-read breaker needs.
+ */
+export function elidedToolCallIds(before: ChatMessage[], after: ChatMessage[]): string[] {
+	const sent = new Map<string, string>();
+	for (const m of after) {
+		if (m.role === 'tool' && m.toolCallId) {
+			sent.set(m.toolCallId, m.content);
+		}
+	}
+	const out: string[] = [];
+	for (const m of before) {
+		if (m.role === 'tool' && m.toolCallId && sent.get(m.toolCallId) !== m.content) {
+			out.push(m.toolCallId);
+		}
+	}
+	return out;
 }
 
 /** Removes `tool` messages whose matching assistant tool_call id is not present earlier. */

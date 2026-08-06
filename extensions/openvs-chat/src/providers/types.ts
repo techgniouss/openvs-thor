@@ -3,6 +3,8 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { RateLimitSnapshot } from './rateLimits';
+
 export type ChatRole = 'system' | 'user' | 'assistant' | 'tool';
 
 /** A single tool/function call requested by the model. */
@@ -446,6 +448,12 @@ export interface ChatProvider {
 	listModels(apiKey: string, baseUrl: string, signal: AbortSignal): Promise<ModelEntry[]>;
 	/** Run one agent step with tools. Only meaningful when `info.supportsTools` is true. */
 	runAgentStep?(request: AgentRequest): Promise<AgentStep>;
+	/**
+	 * The last thing this backend said about its token allowance for `model`, read off
+	 * response headers. Optional: a backend that reports nothing simply has no opinion, and
+	 * callers fall back to learning a ceiling from the rejection when one arrives.
+	 */
+	rateLimit?(model: string): RateLimitSnapshot | undefined;
 }
 
 /**
@@ -589,7 +597,7 @@ export interface RetryInfo {
 	readonly attempt: number;
 	/** How long the client will wait before the retry, in ms. */
 	readonly delayMs: number;
-	readonly reason: 'rate-limit' | 'server' | 'network' | 'timeout';
+	readonly reason: 'rate-limit' | 'server' | 'network' | 'timeout' | 'pacing';
 	/** HTTP status that triggered the retry, when the failure was an HTTP response. */
 	readonly status?: number;
 }
@@ -605,6 +613,18 @@ export interface ApiFetchOptions {
 	 * feedback to the user. Never called for a caller-initiated abort.
 	 */
 	readonly onRetry?: (info: RetryInfo) => void;
+	/**
+	 * Called with every response received, retried ones included. Providers use it to read
+	 * the rate-limit headers a backend states its own allowances in — see
+	 * {@link RateLimitTracker}. Must not consume the body.
+	 */
+	readonly onResponse?: (response: Response) => void;
+	/**
+	 * How long to wait before sending, given the request's estimated size in tokens.
+	 * Returning 0 sends immediately. Lets a caller sit out a token window it knows the
+	 * request cannot fit, instead of spending a request to be told so.
+	 */
+	readonly pace?: (estimatedTokens: number) => number;
 }
 
 /**
@@ -617,6 +637,11 @@ export const STREAM_FETCH_OPTS = { timeoutMs: 150_000, retries: 1 } as const;
 /** Wording for the "retrying in Ns…" notice shown while {@link apiFetch} backs off. */
 export function retryNotice(label: string, info: RetryInfo): string {
 	const secs = Math.max(1, Math.ceil(info.delayMs / 1000));
+	// Pacing happens BEFORE a request, not after a failure, so it must not say "retrying" —
+	// nothing has gone wrong, and telling the user otherwise would misreport a healthy run.
+	if (info.reason === 'pacing') {
+		return `${label}'s token allowance refills in ${secs}s — waiting rather than spending a request to be refused…`;
+	}
 	const why = info.reason === 'rate-limit' ? `Rate limited by ${label}`
 		: info.reason === 'timeout' ? `${label} is slow to start`
 			: `Transient ${label} error`;
@@ -654,7 +679,43 @@ function backoffMs(attempt: number, response?: Response): number {
  */
 const RATE_LIMIT_RETRIES = 4;
 
-const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+/**
+ * Sleeps, but wakes immediately if the caller aborts.
+ *
+ * A plain timer meant Stop did nothing until the wait elapsed — up to 30s for a rate-limit
+ * backoff, and now also for a pacing wait. The user pressed the one button that is supposed
+ * to be instant, so the wait has to be interruptible rather than merely checked afterwards.
+ */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+	if (!signal) {
+		return new Promise<void>(resolve => setTimeout(resolve, ms));
+	}
+	// Checked here, not only by the caller before the call: `abort` fires once, so a signal
+	// that aborted between the caller's check and this listener would never notify us and
+	// the wait would run to completion — the exact case (a Stop landing mid-backoff) this
+	// exists to handle.
+	if (signal.aborted) {
+		return Promise.resolve();
+	}
+	return new Promise<void>(resolve => {
+		const done = () => {
+			clearTimeout(timer);
+			signal.removeEventListener('abort', done);
+			resolve();
+		};
+		const timer = setTimeout(done, ms);
+		signal.addEventListener('abort', done, { once: true });
+	});
+}
+
+/**
+ * Rough token size of a request body, for pacing only. The same 4-chars-per-token estimate
+ * the context budget uses; a serialized JSON body is mostly the conversation, so it tracks
+ * closely enough to decide whether a request can fit what a window has left.
+ */
+function estimateBodyTokens(body: RequestInit['body']): number {
+	return typeof body === 'string' ? Math.ceil(body.length / 4) : 0;
+}
 
 /**
  * `fetch` with a connection timeout and automatic retry/backoff. The timeout applies to
@@ -682,6 +743,22 @@ export async function apiFetch(
 		if (signal.aborted) {
 			throw new DOMException('Aborted', 'AbortError');
 		}
+		// Sit out a token window this request is known not to fit, before spending a request
+		// to be told so. Estimated from the serialized body because that is the only measure
+		// available this far down — the conversation's own token count never reaches here.
+		//
+		// First attempt only. Every retry path below already waited a delay chosen for the
+		// failure it saw — a 429's own `Retry-After`, most precisely — and pacing on top of
+		// that would sleep twice for one refill, up to a minute, while the user watches a
+		// run that has not stalled do nothing.
+		const paceMs = networkAttempts + rateLimitAttempts === 0 ? opts?.pace?.(estimateBodyTokens(init.body)) ?? 0 : 0;
+		if (paceMs > 0) {
+			opts?.onRetry?.({ attempt: 0, delayMs: paceMs, reason: 'pacing' });
+			await sleep(paceMs, signal);
+			if (signal.aborted) {
+				throw new DOMException('Aborted', 'AbortError');
+			}
+		}
 		const controller = new AbortController();
 		const unlink = linkAbort(signal, controller);
 		let timedOut = false;
@@ -690,18 +767,21 @@ export async function apiFetch(
 			const response = await fetch(url, { ...init, signal: controller.signal });
 			clearTimeout(timer);
 			unlink();
+			// Before any status branching, so a 429's headers — the most informative ones a
+			// backend sends — are recorded rather than lost to the retry path.
+			opts?.onResponse?.(response);
 			if (response.status === 429 && rateLimitAttempts < rateLimitRetries) {
 				const delayMs = backoffMs(rateLimitAttempts, response);
 				opts?.onRetry?.({ attempt: rateLimitAttempts, delayMs, reason: 'rate-limit', status: 429 });
 				rateLimitAttempts++;
-				await sleep(delayMs);
+				await sleep(delayMs, signal);
 				continue;
 			}
 			if (response.status >= 500 && networkAttempts < retries) {
 				const delayMs = backoffMs(networkAttempts, response);
 				opts?.onRetry?.({ attempt: networkAttempts, delayMs, reason: 'server', status: response.status });
 				networkAttempts++;
-				await sleep(delayMs);
+				await sleep(delayMs, signal);
 				continue;
 			}
 			return response;
@@ -718,7 +798,7 @@ export async function apiFetch(
 				const delayMs = backoffMs(networkAttempts);
 				opts?.onRetry?.({ attempt: networkAttempts, delayMs, reason: timedOut ? 'timeout' : 'network' });
 				networkAttempts++;
-				await sleep(delayMs);
+				await sleep(delayMs, signal);
 				continue;
 			}
 			throw lastError;

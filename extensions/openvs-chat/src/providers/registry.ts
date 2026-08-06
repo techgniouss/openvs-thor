@@ -40,6 +40,14 @@ const ENV_VARS: Record<string, string | undefined> = {
 	cloudflare: 'CLOUDFLARE_API_TOKEN',
 };
 
+/**
+ * Providers with no `<id>.baseUrl` setting in package.json, so the panel's base-URL field
+ * has nothing to read or write. Antigravity is the OAuth-spoofing backend that never fully
+ * worked and now bans real accounts (see AntigravityProvider) — it ignores the `baseUrl`
+ * it's handed and talks to a hardcoded endpoint.
+ */
+const NO_BASE_URL_SETTING = new Set(['antigravity']);
+
 /** Per-provider runtime configuration resolved from settings + secret storage. */
 export interface ResolvedProviderConfig {
 	readonly id: string;
@@ -61,6 +69,20 @@ export interface ResolvedProviderConfig {
 	readonly authUrl: string;
 	/** How the current credential was obtained: web sign-in, an API key, or nothing. */
 	readonly authKind: 'oauth' | 'key' | 'none';
+	/**
+	 * Cloudflare Workers AI only: the account id `getBaseUrl` substitutes into the URL
+	 * (a token alone can't authenticate — see `CLOUDFLARE_ACCOUNT_PLACEHOLDER`). Undefined
+	 * for every other provider; the settings panel only renders the field when this is set.
+	 */
+	readonly cloudflareAccountId?: string;
+	/**
+	 * Raw `<id>.baseUrl` setting value, unlike {@link baseUrl} which is what requests
+	 * actually use (trailing slash stripped, Cloudflare's `{account_id}` substituted). This
+	 * is what the panel's base-URL field edits — substituting the placeholder into it and
+	 * saving that back would bake today's account id in and break the substitution for the
+	 * next one. Undefined for providers with no such setting (see `NO_BASE_URL_SETTING`).
+	 */
+	readonly baseUrlOverride?: string;
 }
 
 /**
@@ -188,6 +210,23 @@ export class ProviderRegistry {
 			`${id}.model`, model, vscode.ConfigurationTarget.Global);
 	}
 
+	/** Persists the Cloudflare account id — see `cloudflareAccountId` on {@link ResolvedProviderConfig}. */
+	async setCloudflareAccountId(accountId: string): Promise<void> {
+		await vscode.workspace.getConfiguration('openvsChat').update(
+			'cloudflare.accountId', accountId.trim(), vscode.ConfigurationTarget.Global);
+	}
+
+	/**
+	 * Persists a provider's base URL override, or clears it back to the package.json
+	 * default when the field is emptied — an explicit empty string would otherwise win
+	 * over that default rather than falling back to it.
+	 */
+	async setBaseUrl(id: string, value: string): Promise<void> {
+		const trimmed = value.trim();
+		await vscode.workspace.getConfiguration('openvsChat').update(
+			`${id}.baseUrl`, trimmed || undefined, vscode.ConfigurationTarget.Global);
+	}
+
 	/** Fetches the live model list for a provider using its stored key (if it needs one). */
 	async listModels(id: string, signal: AbortSignal): Promise<ModelEntry[]> {
 		const provider = this.providers.get(id);
@@ -226,6 +265,12 @@ export class ProviderRegistry {
 			visionModelPatterns: provider.info.visionModelPatterns,
 			authUrl: this.getAuthUrl(id),
 			authKind: await this.getAuthKind(id),
+			cloudflareAccountId: id === 'cloudflare'
+				? (vscode.workspace.getConfiguration('openvsChat').get<string>('cloudflare.accountId')?.trim() ?? '')
+				: undefined,
+			baseUrlOverride: NO_BASE_URL_SETTING.has(id)
+				? undefined
+				: (vscode.workspace.getConfiguration('openvsChat').get<string>(`${id}.baseUrl`)?.trim() ?? ''),
 		};
 	}
 
