@@ -1384,4 +1384,40 @@ async function runAuto(agentSteps, { maxSteps = 20 } = {}) {
 		'messages plus tool schemas fit the budget, rather than messages alone');
 }
 
+// 31. A backend that names a per-request token ceiling has both budgets re-derived from
+// it, not just the conversation. Groq's free tier refuses a request whose prompt *plus*
+// reserved reply exceeds the ceiling (HTTP 413), so trimming alone can never get under it
+// when `max_tokens` on its own already exceeds the limit.
+{
+	const seen = [];
+	const provider = {
+		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+		async listModels() { return []; },
+		async runAgentStep(request) {
+			seen.push({ maxTokens: request.maxTokens, tokens: m.estimateMessagesTokens(request.messages) });
+			if (seen.length === 1) {
+				throw new Error('Fake: request too large (HTTP 413). Request too large for model `q` on tokens per minute (TPM): Limit 8000, Requested 13155, please reduce your message size and try again.');
+			}
+			return { content: 'done', toolCalls: [] };
+		},
+	};
+	const runner = new AgentRunner(provider, approver, 3, { maxContextTokens: 120_000 });
+	const callbacks = noopCallbacks();
+	const seed = [{ role: 'system', content: 'SYS' }, { role: 'user', content: 'go' }];
+	for (let i = 0; i < 40; i++) {
+		seed.push({ role: 'assistant', content: '', toolCalls: [{ id: `c${i}`, name: 'read_file', args: { path: `f${i}.ts` } }] });
+		seed.push({ role: 'tool', content: 'y'.repeat(4_000), toolCallId: `c${i}` });
+	}
+	const result = await runner.run(seed, { ...params, maxTokens: 8192 }, callbacks);
+	assert.deepStrictEqual(result, { reason: 'done' }, 'the run survives the ceiling instead of ending on it');
+	assert.strictEqual(seen[0].maxTokens, 8192, 'the first attempt asks for the configured reply size');
+	// The ceiling is kept for the rest of the run, not just for the retry — every later
+	// step re-sends the same conversation and would earn the same rejection.
+	assert.ok(seen.length > 1 && seen.slice(1).every(s => s.maxTokens > 0 && s.maxTokens < 8192),
+		`every attempt after the rejection asks for less (got ${seen.map(s => s.maxTokens).join(', ')})`);
+	assert.ok(seen[1].tokens + seen[1].maxTokens <= 8000,
+		`prompt plus reply reservation fits the stated ceiling (got ${seen[1].tokens} + ${seen[1].maxTokens})`);
+	assert.ok(callbacks.notes.some(n => /8000/.test(n)), 'the user is told what the cap is');
+}
+
 console.log('test-agent-loop: all assertions passed');

@@ -101,12 +101,14 @@ assert.strictEqual(m.estimateTokens(big(4000)), 1000);
 }
 
 // isContextLengthError recognizes how each backend words the rejection.
+const GROQ_413 = 'Groq (free tier): request failed (HTTP 413). Request too large for model `qwen/qwen3.6-27b` in organization `org_01k` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Requested 13155, please reduce your message size and try again.';
 for (const msg of [
 	'This model\'s maximum context length is 128000 tokens',
 	'Error code: 400 - context_length_exceeded',
 	'input exceeds the context window',
 	'Request too large: too many tokens',
 	'prompt tokens exceed the limit',
+	GROQ_413,
 ]) {
 	assert.ok(m.isContextLengthError(msg), `should detect: ${msg}`);
 }
@@ -114,9 +116,21 @@ for (const msg of [
 	'authentication failed (HTTP 401)',
 	'rate limited (HTTP 429)',
 	'The provider did not start responding within 150s',
+	// A 429 for the *same* TPM ceiling must stay a wait-and-retry: shrinking the
+	// conversation doesn't refill a per-minute quota, and the transport already backs off.
+	'Groq (free tier): rate limited (HTTP 429). Rate limit reached for model `qwen/qwen3.6-27b` on tokens per minute (TPM): Limit 8000, Used 7900, Requested 900. Please try again in 6s.',
 ]) {
 	assert.ok(!m.isContextLengthError(msg), `should not detect: ${msg}`);
 }
+
+// parseTokenLimit pulls the ceiling out of the rejection, so the retry lands under it in
+// one hop instead of halving a 120k budget down toward 8k over several dead requests.
+assert.strictEqual(m.parseTokenLimit(GROQ_413), 8000);
+assert.strictEqual(m.parseTokenLimit('This model\'s maximum context length is 128000 tokens, however you requested 130000'), 128000);
+assert.strictEqual(m.parseTokenLimit('exceeded the limit of 32,000 tokens'), 32000);
+// No number, or one too small to be a token budget, leaves the caller to halve blindly.
+assert.strictEqual(m.parseTokenLimit('input exceeds the context window'), undefined);
+assert.strictEqual(m.parseTokenLimit('Rate limit reached, retry limit 3 exceeded'), undefined);
 
 // The incremental token accounting inside trimMessages must agree exactly with a full
 // recount. Both passes track a running total instead of re-measuring the whole transcript

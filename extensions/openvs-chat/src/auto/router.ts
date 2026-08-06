@@ -50,8 +50,24 @@ export interface RoleAssignment {
 }
 
 /**
+ * Providers left out of the {@link RoleRouter.sweepCandidates} fallback.
+ *
+ * `custom` points at a local endpoint that may well not be running, and `antigravity`'s
+ * credential is restricted by Google's terms to Google's own client — neither is something
+ * to select on a user's behalf. Both remain available when pinned explicitly.
+ */
+const NOT_AUTO_INFERRED = new Set(['custom', 'antigravity']);
+
+/**
  * Ranked inference candidates per role. The first candidate whose provider has a key
  * (and, for `code`, is tool-capable) wins. These are deliberately ordered "best first".
+ *
+ * Deliberately short: it names the models worth *preferring* when several providers are
+ * configured. It is not the list of providers Auto supports — when none of these can run,
+ * {@link RoleRouter.sweepCandidates} falls back to whatever the user actually has a
+ * credential for, which is what keeps Auto working for someone whose only key is a free
+ * provider (Groq, Mistral, Cloudflare, Gemini, OpenRouter, …) rather than telling them no
+ * provider can serve the role.
  */
 const INFERENCE_CANDIDATES: Record<AutoRole, Array<{ providerId: string; model: string }>> = {
 	// Planning benefits from strong reasoning; tools are not needed here. Widely-available
@@ -161,8 +177,63 @@ export class RoleRouter {
 				ready.push(assignment);
 			}
 		}
+		// Only when the preferred models can't run at all — the sweep costs a credential read
+		// per provider, and it exists to rescue the "none of the above" case, not to pad a
+		// list that already has usable entries.
+		if (!ready.length) {
+			for (const candidate of await this.sweepCandidates()) {
+				const assignment = await this.evaluate(role, candidate.providerId, candidate.model, 'inferred');
+				if (assignment.ready) {
+					ready.push(assignment);
+				}
+			}
+		}
 		// Fall back to the not-ready placeholder so callers get a clear problem to report.
 		return ready.length ? ready : [await this.infer(role)];
+	}
+
+	/** The first candidate that can actually run, or undefined if none can. */
+	private async firstReady(
+		role: AutoRole,
+		candidates: ReadonlyArray<{ providerId: string; model: string }>,
+	): Promise<RoleAssignment | undefined> {
+		for (const candidate of candidates) {
+			const assignment = await this.evaluate(role, candidate.providerId, candidate.model, 'inferred');
+			if (assignment.ready) {
+				return assignment;
+			}
+		}
+		return undefined;
+	}
+
+	/**
+	 * Every provider the user actually holds a credential for, paired with its current
+	 * model — the configured one, or that provider's first suggestion.
+	 *
+	 * This is the backstop behind {@link INFERENCE_CANDIDATES}, which names specific models
+	 * from three providers only. Without it, Auto mode is unusable for anyone whose only key
+	 * is for one of the other providers: every role resolves to "no configured provider can
+	 * serve this", while plain Ask/Agent works fine with the very same key. Deriving the
+	 * model from the registry rather than hardcoding one per provider also means a provider
+	 * added later is covered without touching this file.
+	 */
+	private async sweepCandidates(): Promise<Array<{ providerId: string; model: string }>> {
+		const out: Array<{ providerId: string; model: string }> = [];
+		for (const providerId of this.registry.ids) {
+			if (NOT_AUTO_INFERRED.has(providerId)) {
+				continue;
+			}
+			// Required even for providers that don't strictly need a key: an endpoint nobody
+			// configured is not a sensible thing to route a run to unprompted.
+			if (!await this.registry.hasCredentials(providerId)) {
+				continue;
+			}
+			const model = this.registry.getModel(providerId);
+			if (model) {
+				out.push({ providerId, model });
+			}
+		}
+		return out;
 	}
 
 	/** Resolves every role (for the settings UI and pre-flight checks). */
@@ -207,29 +278,23 @@ export class RoleRouter {
 		return { role, roleLabel, providerId, providerLabel, model, source, ready: true };
 	}
 
-	/** Picks the best available model for a role from the ranked candidate list. */
+	/**
+	 * Picks the best available model for a role from the ranked candidate list, falling back
+	 * to whatever the user has a credential for.
+	 *
+	 * The two lists are walked in sequence rather than concatenated: the sweep costs a
+	 * credential read per provider, and building it up front would charge every caller for it
+	 * even when the very first preferred candidate wins — which is the common case, and this
+	 * runs on the settings panel's render path.
+	 */
 	private async infer(role: AutoRole): Promise<RoleAssignment> {
-		for (const candidate of INFERENCE_CANDIDATES[role]) {
-			const provider = this.registry.getProvider(candidate.providerId);
-			if (!provider) {
-				continue;
-			}
-			if (role === 'code' && !this.toolCapable(candidate.providerId, provider.info, candidate.model)) {
-				continue;
-			}
-			const hasKey = await this.registry.hasCredentials(candidate.providerId);
-			if (provider.info.requiresApiKey && !hasKey) {
-				continue;
-			}
-			return {
-				role,
-				roleLabel: ROLE_LABELS[role],
-				providerId: candidate.providerId,
-				providerLabel: provider.info.label,
-				model: candidate.model,
-				source: 'inferred',
-				ready: true,
-			};
+		const preferred = await this.firstReady(role, INFERENCE_CANDIDATES[role]);
+		if (preferred) {
+			return preferred;
+		}
+		const swept = await this.firstReady(role, await this.sweepCandidates());
+		if (swept) {
+			return swept;
 		}
 		return {
 			role,

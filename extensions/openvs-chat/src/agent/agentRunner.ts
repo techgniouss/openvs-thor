@@ -10,7 +10,7 @@ import { TodoItem, UPDATE_TODOS_TOOL, parseTodoUpdate } from '../persona/todos';
 import { extractTextToolCalls } from '../providers/toolCalls';
 import { AgentStep, CONTINUE_PROMPT, ChatProvider, ChatMessage, ToolCall, ToolSpec, endsInRepeatLoop, isAbortError, isTransientProviderError } from '../providers/types';
 import { CACHED_COMPACT_TRIGGER, COMPACT_TRIGGER, canCompact, compactMessages, compactionThreshold, shouldCompact } from './compaction';
-import { estimateMessagesTokens, estimateToolsTokens, isContextLengthError, trimMessages } from './context';
+import { estimateMessagesTokens, estimateToolsTokens, isContextLengthError, parseTokenLimit, trimMessages } from './context';
 import { Guardrails, autoApproves, loadGuardrails, resolveWorkspacePath } from './guardrails';
 import { AGENT_TOOLS, ASK_USER_TOOL, AskOption, MAX_ASK_OPTIONS, READ_ONLY_TOOL_NAMES, SPAWN_SUBAGENT_TOOL, ToolApprover, VerifyCommand, asBoolean, asString, commandTextOf, detectVerificationCommands, executeTool, isVerificationCommand } from './tools';
 
@@ -74,6 +74,28 @@ const DEFAULT_CONTEXT_TOKENS = 120_000;
 
 /** Floor for the adaptive budget, so repeated shrinking can't starve the conversation. */
 const MIN_CONTEXT_TOKENS = 8_000;
+
+/**
+ * Floor once a backend has stated its own per-request ceiling. The normal floor is an
+ * assumption about what a conversation needs; a stated ceiling is a fact about what the
+ * backend will accept, and holding 8k against a stated 8k guarantees every later step is
+ * rejected too. Below this there is no room for even one file, so the run should fail
+ * loudly rather than crawl.
+ */
+const MIN_STATED_CONTEXT_TOKENS = 1_000;
+
+/**
+ * Share of a stated per-request ceiling left for the model's reply, and the floor under it.
+ *
+ * The ceiling covers prompt *and* reserved output: Groq counted a 5k prompt plus the
+ * default 8192 `max_tokens` as 13,155 against a limit of 8,000, so trimming the
+ * conversation alone can never get under it — the reply reservation has to come down too.
+ */
+const STATED_OUTPUT_SHARE = 0.25;
+const MIN_OUTPUT_TOKENS = 512;
+
+/** Fraction of a stated ceiling actually spent, since our token count is an estimate. */
+const STATED_LIMIT_SHARE = 0.9;
 
 /**
  * Consecutive summarizer failures tolerated before compaction is abandoned for the run.
@@ -249,6 +271,13 @@ interface AgentOptions {
 	steering?: () => string[];
 	/** Estimated-token ceiling for the conversation sent each step. 0 disables trimming. */
 	maxContextTokens?: number;
+	/**
+	 * Upper bound on the reply reservation, below whatever the user configured. Set only by
+	 * a parent that has already learned a backend's per-request ceiling the hard way — a
+	 * sub-agent inheriting the shrunken conversation budget but not the shrunken reply
+	 * reservation would re-earn the same rejection on its first step.
+	 */
+	maxOutputTokens?: number;
 	/** Model context window in tokens; enables auto-compaction at 70% of it. 0/absent disables compaction. */
 	contextWindow?: number;
 	/**
@@ -345,6 +374,10 @@ export class AgentRunner {
 	private verifyCommands?: Promise<VerifyCommand[]>;
 	/** Memoized estimate of what the tool schemas add to every request. */
 	private toolTokens?: number;
+	/** Reply ceiling adopted after a backend named a per-request token limit; unset until then. */
+	private outputCap?: number;
+	/** Floor under the adaptive budget; lowered once a backend names a ceiling of its own. */
+	private contextFloor = MIN_CONTEXT_TOKENS;
 
 	constructor(
 		private readonly provider: ChatProvider,
@@ -359,6 +392,12 @@ export class AgentRunner {
 		this.mcp = opts?.mcp;
 		this.steering = opts?.steering;
 		this.contextBudget = opts?.maxContextTokens ?? DEFAULT_CONTEXT_TOKENS;
+		this.outputCap = opts?.maxOutputTokens;
+		if (this.outputCap) {
+			// The inherited budget was derived from a stated ceiling; the normal floor would
+			// silently raise it back over that ceiling before the first request.
+			this.contextFloor = MIN_STATED_CONTEXT_TOKENS;
+		}
 		this.contextWindow = opts?.contextWindow ?? 0;
 		this.keepHead = opts?.keepHead;
 		this.retryDelaysMs = opts?.retryDelaysMs?.length ? opts.retryDelaysMs : STEP_RETRY_DELAYS_MS;
@@ -836,8 +875,12 @@ export class AgentRunner {
 
 	/**
 	 * Asks the model for one step, keeping the conversation inside the context budget.
-	 * If the provider still rejects it as too long, the budget is halved and the step is
+	 * If the provider still rejects it as too big, the budget is cut and the step is
 	 * retried once — a run should shed old file dumps rather than die on a 400.
+	 *
+	 * How far it is cut depends on what the rejection said. A ceiling the backend named
+	 * outright is adopted verbatim (see {@link adoptRequestCeiling}); otherwise the budget
+	 * is halved, which is the best guess available when the backend only says "too long".
 	 */
 	private async step(
 		messages: ChatMessage[],
@@ -850,12 +893,12 @@ export class AgentRunner {
 		const ask = (budget: number) => this.provider.runAgentStep!({
 			// Measured after trimming, so the figure is what the provider was actually asked
 			// to read rather than what the run is holding.
-			messages: this.measured(trimMessages(messages, Math.max(MIN_CONTEXT_TOKENS, budget - this.toolOverhead()))),
+			messages: this.measured(trimMessages(messages, Math.max(this.contextFloor, budget - this.toolOverhead()))),
 			tools: this.tools(),
 			model: params.model,
 			apiKey: params.apiKey,
 			baseUrl: params.baseUrl,
-			maxTokens: params.maxTokens,
+			maxTokens: Math.min(params.maxTokens, this.outputCap ?? params.maxTokens),
 			signal: params.signal,
 			onToken: delta => callbacks.onToken(delta),
 			onNotice: text => callbacks.onNote(text),
@@ -867,11 +910,33 @@ export class AgentRunner {
 				throw err;
 			}
 			// The estimate was optimistic for this model; keep the smaller budget for the
-			// rest of the run so every later step stays inside the real window.
-			this.contextBudget = Math.max(MIN_CONTEXT_TOKENS, Math.floor(this.contextBudget / 2));
-			callbacks.onNote(`The conversation outgrew the model's context window — trimming older tool output and retrying.`);
+			// rest of the run so every later step stays inside the real limit.
+			const stated = parseTokenLimit(err.message);
+			if (stated) {
+				this.adoptRequestCeiling(stated, params.maxTokens);
+				callbacks.onNote(`The provider caps a request at ${stated} tokens — reducing the reply limit to ${this.outputCap} and trimming older tool output, then retrying.`);
+			} else {
+				this.contextBudget = Math.max(this.contextFloor, Math.floor(this.contextBudget / 2));
+				callbacks.onNote(`The conversation outgrew the model's context window — trimming older tool output and retrying.`);
+			}
 			return this.recoverTextToolCalls(await ask(this.contextBudget));
 		}
+	}
+
+	/**
+	 * Re-derives the run's budgets from a per-request token ceiling the backend named.
+	 *
+	 * Both halves of the request are charged against that one number, so both have to move:
+	 * the reply reservation is cut to a share of the ceiling (never *up* — a stated ceiling
+	 * is not a licence to ask for more output than the user configured), and the conversation
+	 * gets what is left. Kept for the rest of the run, since the ceiling is a property of the
+	 * account and model rather than of this one step.
+	 */
+	private adoptRequestCeiling(limit: number, configuredOutput: number): void {
+		const usable = Math.floor(limit * STATED_LIMIT_SHARE);
+		this.outputCap = Math.max(MIN_OUTPUT_TOKENS, Math.min(configuredOutput, Math.floor(usable * STATED_OUTPUT_SHARE)));
+		this.contextFloor = MIN_STATED_CONTEXT_TOKENS;
+		this.contextBudget = Math.max(this.contextFloor, usable - this.outputCap);
 	}
 
 	/**
@@ -1219,6 +1284,7 @@ export class AgentRunner {
 			// the default budget until the provider rejects the request outright. Its seed is
 			// [system, goal] — both must survive compaction, hence keepHead 2.
 			maxContextTokens: this.contextBudget,
+			maxOutputTokens: this.outputCap,
 			contextWindow: this.contextWindow,
 			keepHead: 2,
 			// The delegate gets what is *left* of the parent's wall clock, not a fresh

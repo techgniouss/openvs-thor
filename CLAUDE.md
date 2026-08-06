@@ -50,6 +50,14 @@ active development unless told otherwise; everything else is upstream VS Code.
   types in both directions, prompt field names, script load order). `media/main.js` is one
   large IIFE that can't be imported, so this is what stands in for it — if you add a
   message type or an element id, that test catches the half you forgot.
+- `test-model-axes.mjs` asserts that every model a provider *suggests* is actually usable
+  on all three per-model axes, each of which is a hand-maintained regex table in a
+  different file: `toolModelPatterns` (Agent mode), `visionModelPatterns` (image
+  attachments), and `contextWindow.ts` (the conversation budget). All three fail *silently*
+  — a miss doesn't error, it quietly removes Agent mode, or blocks images, or drops the
+  budget to the 32k default so compaction fires from the first few file reads. Nothing else
+  checks the tables against the model lists they describe, and both are edited whenever a
+  provider is added or a vendor renames a model.
 - `test-prompt-cards.mjs` runs the real approval/question cards (`media/prompts.js`)
   against a small DOM stand-in. That module is deliberately written with
   createElement/textContent and direct child references — **no `innerHTML`, no
@@ -102,8 +110,9 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   completion) or **steers** the live agent run (injected as a user turn before the next
   loop step via `steerQueues`).
 - `src/providers/` — one file per model backend (`openai.ts`, `anthropic.ts`, `nvidia.ts`,
-  `openrouter.ts`, `kimi.ts` (Moonshot), `qwen.ts` (DashScope), `custom.ts` (any
-  OpenAI-compatible endpoint — Ollama/LM Studio/vLLM/etc., no key required),
+  `openrouter.ts`, `groq.ts`, `mistral.ts`, `cloudflare.ts` (Workers AI), `kimi.ts`
+  (Moonshot), `qwen.ts` (DashScope), `custom.ts` (any OpenAI-compatible endpoint —
+  Ollama/LM Studio/vLLM/etc., no key required),
   `openaiCompatible.ts`) implementing the shared `ChatProvider` interface (`types.ts`),
   with `toolCalls.ts` holding the model-agnostic robustness layer: it repairs the malformed
   tool-call JSON weaker models emit (fences, Python literals, trailing commas, truncation)
@@ -115,6 +124,19 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   keeps this honest and fails if a tool gains no case,
   looked up via `registry.ts`. NVIDIA and most other gateways reuse the OpenAI-compatible
   client — add a new backend by pointing a `baseUrl` setting at it, or by copying `kimi.ts`.
+  Two backends need more than a base URL. Mistral validates every tool-call id against
+  `^[a-zA-Z0-9]{9}$` and 400s the whole request otherwise, which our synthesized ids
+  (`text_call_0` from prose recovery, `call_<index>` when a backend omits one) and any id
+  carried over from a provider switch mid-conversation all fail. `toolCalls.shortToolCallId`
+  rewrites them deterministically and `OpenAICompatibleProvider.toolCallId` applies it to
+  the assistant turn and its tool result from one place, so the two can't disagree — keyed
+  off the **model**, not the provider, because the same Mistral weights are served under a
+  `mistralai/` prefix by OpenRouter, NVIDIA and Cloudflare too (the Mistral provider itself
+  overrides it to always apply, since there the constraint is the API's, not the model's).
+  Cloudflare Workers AI splits its credential in two: the token is a header, the *account
+  id* is in the URL path, so it comes from `openvsChat.cloudflare.accountId` and
+  `registry.getBaseUrl` substitutes it; its catalog also lives off the OpenAI-compatible
+  surface, at `…/ai/models/search`.
   A backend that refuses `content` and `tool_calls` on one assistant message (NVIDIA) gets
   the narration as its own assistant turn ahead of the tool calls rather than losing it —
   without that record the model re-derives its plan, and re-reads the same files, on every
@@ -179,7 +201,12 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   degrades performance rather than breaking search.
 - `src/auto/` — **Auto** role-routing mode: `router.ts` picks/validates per-role models
   (planning / implementation / review) from `openvsChat.auto.*` settings, honoring pinned
-  models exactly and only falling back for auto-selected ones; `orchestrator.ts` runs the
+  models exactly and only falling back for auto-selected ones. Its `INFERENCE_CANDIDATES`
+  list names *preferred* models from a few providers — it is not the list Auto supports;
+  when none of them can run, `sweepCandidates` falls back to whatever the user actually
+  holds a credential for, which is what keeps Auto usable for someone whose only key is a
+  free provider. The sweep costs a credential read per provider, so it is walked only after
+  the preferred list comes up empty, never concatenated onto it. `orchestrator.ts` runs the
   plan → implement → review pipeline (or a per-step decomposition when
   `openvsChat.auto.decompose` is set).
 - `src/mcp/` — Model Context Protocol client (`client.ts`) and multi-server lifecycle

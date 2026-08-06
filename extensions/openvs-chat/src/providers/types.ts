@@ -809,6 +809,12 @@ export async function describeHttpError(provider: string, response: Response): P
 	if (response.status === 401 || response.status === 403) {
 		return `${provider}: authentication failed (HTTP ${response.status}). Check that your API key is valid. ${detail}`;
 	}
+	if (response.status === 413) {
+		// The wording matters: `isContextLengthError` keys off "request too large", which is
+		// what lets the agent loop adopt the stated ceiling and retry instead of ending the
+		// run. A backend that sends an empty 413 body must still say it here.
+		return `${provider}: request too large (HTTP 413) — it exceeded the per-request or per-minute token allowance for this model. ${detail}`.trim();
+	}
 	if (response.status === 429) {
 		const retryAfter = response.headers.get('retry-after');
 		const seconds = retryAfter ? Number(retryAfter) : NaN;

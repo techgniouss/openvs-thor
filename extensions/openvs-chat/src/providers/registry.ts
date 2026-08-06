@@ -7,9 +7,12 @@ import * as vscode from 'vscode';
 import { OAuthTokenStore } from '../oauth';
 import { AnthropicProvider } from './anthropic';
 import { AntigravityProvider } from './antigravity';
+import { CLOUDFLARE_ACCOUNT_PLACEHOLDER, CloudflareProvider } from './cloudflare';
 import { CustomProvider } from './custom';
 import { GeminiProvider } from './gemini';
+import { GroqProvider } from './groq';
 import { KimiProvider } from './kimi';
+import { MistralProvider } from './mistral';
 import { NvidiaProvider } from './nvidia';
 import { OpenAIProvider } from './openai';
 import { OpenRouterProvider } from './openrouter';
@@ -17,6 +20,25 @@ import { QwenProvider } from './qwen';
 import { ChatProvider, ModelEntry } from './types';
 
 const SECRET_PREFIX = 'openvsChat.apiKey.';
+
+/**
+ * Environment variables that can supply a provider's key, as a convenient escape hatch for
+ * power users and CI. Each name is the one that provider's own SDK already reads, so an
+ * environment set up for the vendor's CLI works here unchanged. Providers absent from this
+ * map are configured through the panel only.
+ */
+const ENV_VARS: Record<string, string | undefined> = {
+	openai: 'OPENAI_API_KEY',
+	anthropic: 'ANTHROPIC_API_KEY',
+	nvidia: 'NVIDIA_API_KEY',
+	gemini: 'GEMINI_API_KEY',
+	openrouter: 'OPENROUTER_API_KEY',
+	kimi: 'MOONSHOT_API_KEY',
+	qwen: 'DASHSCOPE_API_KEY',
+	groq: 'GROQ_API_KEY',
+	mistral: 'MISTRAL_API_KEY',
+	cloudflare: 'CLOUDFLARE_API_TOKEN',
+};
 
 /** Per-provider runtime configuration resolved from settings + secret storage. */
 export interface ResolvedProviderConfig {
@@ -52,7 +74,7 @@ export class ProviderRegistry {
 
 	constructor(private readonly secrets: vscode.SecretStorage) {
 		this.oauth = new OAuthTokenStore(secrets);
-		for (const provider of [new NvidiaProvider(), new OpenAIProvider(), new AnthropicProvider(), new GeminiProvider(), new AntigravityProvider(), new OpenRouterProvider(), new KimiProvider(), new QwenProvider(), new CustomProvider()]) {
+		for (const provider of [new NvidiaProvider(), new OpenAIProvider(), new AnthropicProvider(), new GeminiProvider(), new AntigravityProvider(), new OpenRouterProvider(), new GroqProvider(), new MistralProvider(), new CloudflareProvider(), new KimiProvider(), new QwenProvider(), new CustomProvider()]) {
 			this.providers.set(provider.info.id, provider);
 		}
 	}
@@ -81,8 +103,16 @@ export class ProviderRegistry {
 
 	getBaseUrl(id: string): string {
 		const cfg = vscode.workspace.getConfiguration('openvsChat');
-		const configured = cfg.get<string>(`${id}.baseUrl`);
-		return (configured?.trim() || '').replace(/\/+$/, '');
+		const configured = (cfg.get<string>(`${id}.baseUrl`)?.trim() || '').replace(/\/+$/, '');
+		if (id === 'cloudflare') {
+			// Cloudflare is the one backend whose credential is split between a header and the
+			// URL path, so the account id is substituted here — the single place the base URL is
+			// resolved — rather than being threaded through every provider call. Left in place
+			// when unset so the provider can raise a message that names the setting.
+			const accountId = cfg.get<string>('cloudflare.accountId')?.trim();
+			return accountId ? configured.replace(CLOUDFLARE_ACCOUNT_PLACEHOLDER, accountId) : configured;
+		}
+		return configured;
 	}
 
 	getAuthUrl(id: string): string {
@@ -100,14 +130,7 @@ export class ProviderRegistry {
 
 	/** The environment variable that can supply this provider's key, if any. */
 	private envVarName(id: string): string | undefined {
-		return id === 'openai' ? 'OPENAI_API_KEY'
-			: id === 'anthropic' ? 'ANTHROPIC_API_KEY'
-				: id === 'nvidia' ? 'NVIDIA_API_KEY'
-					: id === 'gemini' ? 'GEMINI_API_KEY'
-						: id === 'openrouter' ? 'OPENROUTER_API_KEY'
-							: id === 'kimi' ? 'MOONSHOT_API_KEY'
-								: id === 'qwen' ? 'DASHSCOPE_API_KEY'
-									: undefined;
+		return ENV_VARS[id];
 	}
 
 	/** Whether this provider's key currently comes from an environment variable (takes precedence over, and can't be removed by, the stored secret). */

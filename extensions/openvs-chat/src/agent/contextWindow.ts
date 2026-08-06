@@ -37,14 +37,24 @@ const WINDOWS: Array<[RegExp, number]> = [
 	[/llama/i, 8_000],
 	[/gemini/i, 1_000_000],
 	[/grok/i, 128_000],
+	// GLM-5.2 is documented at 1M, but gateways routinely serve the family with a smaller
+	// window than the model card claims, and overshooting costs a 400 and a halving retry on
+	// every request until it settles. 200k is GLM-5.1's window — comfortably large, safely
+	// under 5.2's — and a fetched catalog raises it to the truth where the host reports one.
+	[/glm-5/i, 200_000],
 	[/glm-4|glm-z/i, 128_000],
 	[/minimax/i, 192_000],
 	[/command-a|command-r/i, 128_000],
 	[/nemotron/i, 128_000],
+	// Gemma 4 broke the family's small-window pattern outright: 256k, against 8k for 2 and 3.
+	[/gemma-?4/i, 256_000],
 	[/gemma-?3|gemma-?2/i, 8_000],
 	[/phi-?[34]/i, 128_000],
-	[/mistral-large|mixtral-8x22b|ministral|magistral|devstral|codestral/i, 128_000],
+	[/mistral-large|mistral-medium|mistral-small|mixtral-8x22b|ministral|magistral|devstral|codestral/i, 128_000],
 	[/mistral|mixtral/i, 32_000],
+	// Groq's agentic systems; the underlying Llama checkpoints are matched above, but the
+	// `groq/compound` ids carry no model family in the name to match on.
+	[/compound/i, 128_000],
 ];
 
 /**

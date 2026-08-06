@@ -27,6 +27,22 @@ chat panel that lets **you** choose the model provider.
     `AIza...` API key from [aistudio.google.com](https://aistudio.google.com/apikey)
     (free tier available). Not the Gemini CLI / Antigravity OAuth login — Google retired
     that route for third-party tools in mid-2026.
+  - **Groq** — a real **free tier** (no credit card, no expiring credits) at
+    [console.groq.com](https://console.groq.com/keys), serving Llama 3.x, GPT-OSS and Qwen
+    at very high speed. Limited by requests *and tokens* per minute, per organization —
+    excellent for Ask/Plan, tight for long Agent runs.
+  - **Mistral** — the free *Experiment* tier of
+    [La Plateforme](https://console.mistral.ai/api-keys), which reaches every Mistral model
+    in exchange for opting in to having your data used for training. The roomiest free
+    token allowance here.
+  - **Cloudflare Workers AI** — a free allocation of 10,000 Neurons **per day** that
+    renews daily. Needs your Cloudflare **account ID** as well as an API token, because
+    Workers AI puts the account ID in the request URL
+    (`openvsChat.cloudflare.accountId`).
+  - **OpenRouter** — one key, hundreds of models including `:free` variants, with
+    one-click web sign-in.
+  - **Kimi (Moonshot)**, **Qwen (Alibaba Model Studio)**, and **Custom** — any
+    OpenAI-compatible endpoint (Ollama, LM Studio, vLLM, …), no key required.
 - **Providers panel** (⚙) listing every provider with its key status, an inline key
   field, a **Get API key** link, a **Sign in with web** button, and a **Test connection**
   check that confirms a key works before you rely on it.
@@ -308,9 +324,10 @@ endpoint/headers.
 
 | Setting | Description |
 | --- | --- |
-| `openvsChat.defaultProvider` | Provider selected by default (`openai`, `anthropic`, `nvidia`). |
+| `openvsChat.defaultProvider` | Provider selected by default (`openai`, `anthropic`, `nvidia`, `gemini`, `openrouter`, `groq`, `mistral`, `cloudflare`, `kimi`, `qwen`, `custom`). |
 | `openvsChat.<provider>.model` | Default model per provider. |
 | `openvsChat.<provider>.baseUrl` | API base URL (override for proxies / compatible endpoints). |
+| `openvsChat.cloudflare.accountId` | Cloudflare account ID — **required** for Workers AI, which puts it in the request URL. |
 | `openvsChat.auto.planModel` | Auto-mode planning model as `provider:model` (empty = auto-select). |
 | `openvsChat.auto.codeModel` | Auto-mode implementation model as `provider:model` (must be tool-capable; empty = auto-select). |
 | `openvsChat.auto.reviewModel` | Auto-mode review model as `provider:model` (empty = auto-select). |

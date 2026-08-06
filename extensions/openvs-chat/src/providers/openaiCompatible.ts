@@ -8,7 +8,7 @@ import {
 	ModelEntry, ProviderInfo, RetryInfo, STREAM_FETCH_OPTS, StreamChatResult, ToolCall, apiFetch,
 	describeHttpError, normalizeFinishReason, readSSE, retryNotice,
 } from './types';
-import { parseToolArgs } from './toolCalls';
+import { normalizeToolCallId, parseToolArgs } from './toolCalls';
 import { CLOSE_MARK, OPEN_MARK } from '../persona/thinking';
 
 /**
@@ -68,6 +68,20 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 	 */
 	protected allowsContentWithToolCalls(): boolean {
 		return true;
+	}
+
+	/**
+	 * Rewrites a tool-call id on its way to the wire, applied to the assistant turn's
+	 * `tool_calls[].id` and the matching `tool` turn's `tool_call_id` from one place so the
+	 * two can never disagree.
+	 *
+	 * Keyed off the *model* by default rather than the provider, because the constraint that
+	 * forces this — Mistral's `^[a-zA-Z0-9]{9}$` — follows the Mistral family across every
+	 * gateway that serves it (OpenRouter, NVIDIA, Cloudflare, a `custom` endpoint), not just
+	 * Mistral's own API. See {@link normalizeToolCallId}.
+	 */
+	protected toolCallId(id: string, model: string): string {
+		return normalizeToolCallId(id, model);
 	}
 
 	/**
@@ -160,7 +174,7 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 			{ ...this.authHeaders(request.apiKey), 'Accept': 'text/event-stream' },
 			mode => JSON.stringify({
 				model: request.model,
-				messages: serializeMessages(request.messages, mode, this.wantsCacheBreakpoints(request.model)),
+				messages: serializeMessages(request.messages, mode, this.wantsCacheBreakpoints(request.model), id => this.toolCallId(id, request.model)),
 				[this.tokenLimitField(request.model)]: request.maxTokens,
 				stream: true,
 				...this.extraBody(),
@@ -232,7 +246,7 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 			{ ...this.authHeaders(request.apiKey), 'Accept': 'text/event-stream' },
 			mode => JSON.stringify({
 				model: request.model,
-				messages: serializeMessages(request.messages, mode, this.wantsCacheBreakpoints(request.model)),
+				messages: serializeMessages(request.messages, mode, this.wantsCacheBreakpoints(request.model), id => this.toolCallId(id, request.model)),
 				[this.tokenLimitField(request.model)]: request.maxTokens,
 				tools: request.tools.map(t => ({
 					type: 'function',
@@ -310,7 +324,12 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 }
 
 /** Serializes the conversation into the OpenAI Chat Completions wire format. */
-function serializeMessages(messages: ChatMessage[], mode: NarrationMode, breakpoints = false): Record<string, unknown>[] {
+function serializeMessages(
+	messages: ChatMessage[],
+	mode: NarrationMode,
+	breakpoints = false,
+	toolCallId: (id: string) => string = id => id,
+): Record<string, unknown>[] {
 	const out: Record<string, unknown>[] = [];
 	for (const m of messages) {
 		// `split` puts the narration in its own turn ahead of the tool calls. The model's
@@ -319,7 +338,7 @@ function serializeMessages(messages: ChatMessage[], mode: NarrationMode, breakpo
 		if (mode === 'split' && m.role === 'assistant' && m.toolCalls?.length && m.content.trim()) {
 			out.push({ role: 'assistant', content: m.content });
 		}
-		out.push(serializeMessage(m, mode === 'inline'));
+		out.push(serializeMessage(m, mode === 'inline', toolCallId));
 	}
 	return breakpoints ? withCacheBreakpoints(out) : out;
 }
@@ -361,20 +380,27 @@ function withCacheBreakpoints(messages: Record<string, unknown>[]): Record<strin
 }
 
 /** Serializes an internal message into the OpenAI Chat Completions wire format. */
-function serializeMessage(m: ChatMessage, contentWithToolCalls: boolean): Record<string, unknown> {
+function serializeMessage(
+	m: ChatMessage,
+	contentWithToolCalls: boolean,
+	toolCallId: (id: string) => string,
+): Record<string, unknown> {
 	if (m.role === 'assistant' && m.toolCalls?.length) {
 		return {
 			role: 'assistant',
 			content: contentWithToolCalls ? (m.content || null) : null,
 			tool_calls: m.toolCalls.map(tc => ({
-				id: tc.id,
+				id: toolCallId(tc.id),
 				type: 'function',
 				function: { name: tc.name, arguments: JSON.stringify(tc.args) },
 			})),
 		};
 	}
 	if (m.role === 'tool') {
-		return { role: 'tool', tool_call_id: m.toolCallId, content: m.content };
+		// Left undefined (and so omitted by JSON.stringify) when the turn carries no id, as
+		// before — rewriting an absent id into an empty string would be a new, invalid field.
+		const id = m.toolCallId === undefined ? undefined : toolCallId(m.toolCallId);
+		return { role: 'tool', tool_call_id: id, content: m.content };
 	}
 	if (m.images?.length) {
 		const parts: Record<string, unknown>[] = [];

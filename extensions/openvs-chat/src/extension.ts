@@ -151,6 +151,22 @@ async function selectProvider(registry: ProviderRegistry, view: ChatViewProvider
 	await view.refreshConfig();
 }
 
+/**
+ * Placeholder shown in the API-key input box, per provider. A recognizable prefix is the
+ * quickest way for someone to tell they are about to paste the wrong vendor's key; the
+ * providers whose credentials carry no prefix say what is wanted in words instead, rather
+ * than inheriting a misleading `sk-...`.
+ */
+const KEY_PLACEHOLDERS: Record<string, string | undefined> = {
+	nvidia: 'nvapi-...',
+	anthropic: 'sk-ant-...',
+	gemini: 'AIza...',
+	openrouter: 'sk-or-v1-...',
+	groq: 'gsk_...',
+	mistral: 'Your Mistral API key',
+	cloudflare: 'Cloudflare API token with the Workers AI permission',
+};
+
 async function configureProvider(
 	registry: ProviderRegistry, view: ChatViewProvider, presetId?: string,
 ): Promise<void> {
@@ -167,7 +183,7 @@ async function configureProvider(
 		prompt: `Paste your API key (stored in the OS secret store). Get one at ${provider.info.apiKeyUrl}`,
 		password: true,
 		ignoreFocusOut: true,
-		placeHolder: id === 'nvidia' ? 'nvapi-...' : id === 'anthropic' ? 'sk-ant-...' : id === 'gemini' ? 'AIza...' : id === 'openrouter' ? 'sk-or-v1-...' : 'sk-...',
+		placeHolder: KEY_PLACEHOLDERS[id] ?? 'sk-...',
 	});
 	if (!key) {
 		return;

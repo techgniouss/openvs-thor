@@ -176,8 +176,18 @@ export function dropOrphanToolResults(messages: ChatMessage[]): ChatMessage[] {
 }
 
 /**
- * Whether a failed request was rejected for exceeding the model's context window, as
- * opposed to any other 400. Providers word this differently but all mention the window.
+ * Whether a failed request was rejected for being too big, as opposed to any other 400.
+ *
+ * Two different ceilings produce this, and the caller's response to both is the same —
+ * send less. The model's context window is the obvious one. The other is a per-request
+ * token allowance imposed by the *gateway* rather than the model: Groq's free tier answers
+ * HTTP 413 "Request too large … on tokens per minute (TPM): Limit 8000" for a model whose
+ * window is 128k, so a budget derived from the window alone overshoots by an order of
+ * magnitude on every single step.
+ *
+ * The 413 phrasings are matched on their own words ("request too large", "reduce your
+ * message size") and not on "tokens per minute", which also appears in the HTTP 429 body
+ * for the same limit — and a 429 must stay a wait-and-retry rather than becoming a shrink.
  */
 export function isContextLengthError(message: string): boolean {
 	const m = message.toLowerCase();
@@ -186,5 +196,43 @@ export function isContextLengthError(message: string): boolean {
 		|| m.includes('context window')
 		|| m.includes('maximum context')
 		|| m.includes('too many tokens')
+		|| m.includes('request too large')
+		|| m.includes('reduce your message size')
 		|| (m.includes('token') && m.includes('exceed'));
+}
+
+/** Smallest stated ceiling believed to be a real token budget. */
+const MIN_STATED_LIMIT = 1_000;
+
+/**
+ * Patterns a backend uses to state, in the rejection itself, how many tokens one request
+ * may carry. First hit wins, so the explicit "Limit N" of a gateway allowance is preferred
+ * over the model's own window when a message happens to quote both.
+ */
+const STATED_LIMITS: RegExp[] = [
+	/\blimit(?:\s+(?:of|is))?[\s:]+([\d,]{3,9})\b/i,
+	/maximum context length is\s+([\d,]{3,9})\b/i,
+];
+
+/**
+ * The per-request token ceiling a rejection names, when it names one.
+ *
+ * Worth parsing rather than just halving the budget: halving is blind, and a ceiling two
+ * orders of magnitude below the assumed one (8k stated against a 120k budget) survives
+ * several halvings, so the run dies having burned a retry on each. The stated number takes
+ * the budget to something that fits in a single step.
+ *
+ * Deliberately conservative — anything under {@link MIN_STATED_LIMIT} is treated as a
+ * misparse (a request id, a version, a "limit 3" on something that isn't tokens) rather
+ * than as an unusable budget.
+ */
+export function parseTokenLimit(message: string): number | undefined {
+	for (const pattern of STATED_LIMITS) {
+		const match = pattern.exec(message);
+		const value = match ? Number(match[1].replace(/,/g, '')) : NaN;
+		if (Number.isFinite(value) && value >= MIN_STATED_LIMIT) {
+			return value;
+		}
+	}
+	return undefined;
 }
