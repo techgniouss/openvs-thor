@@ -25,6 +25,35 @@ export const CHAT_APP_HTML = `
 			<div id="providerList"></div>
 			<p class="hint">Keys are stored in the OS secret store. Anthropic and OpenAI support signing in with your <strong>Claude</strong> or <strong>ChatGPT</strong> subscription account, and <strong>OpenRouter</strong> offers a one-click browser sign-in that creates a key for you — no pasting needed. You can also set <code>OPENAI_API_KEY</code>, <code>ANTHROPIC_API_KEY</code>, <code>NVIDIA_API_KEY</code>, <code>OPENROUTER_API_KEY</code>, <code>MOONSHOT_API_KEY</code> or <code>DASHSCOPE_API_KEY</code>, or configure a web sign-in URL via <code>openvsChat.&lt;provider&gt;.authUrl</code>.</p>
 
+			<div class="settings-header"><h2>General</h2></div>
+			<p class="hint">Custom instructions sent with every conversation, and the reply length cap requested from the model. A backend's own per-request allowance may cap replies further regardless of this setting.</p>
+			<div class="general-settings">
+				<label class="field-label" for="systemPromptInput">System prompt</label>
+				<textarea id="systemPromptInput" rows="3" class="settings-textarea"
+					placeholder="You are a helpful AI coding assistant…"></textarea>
+				<div class="settings-row"><button id="saveSystemPrompt" class="mini-button">Save</button></div>
+				<label class="field-label" for="maxTokensInput">Max reply tokens</label>
+				<div class="settings-row">
+					<input id="maxTokensInput" type="number" min="1" step="1" class="settings-number" />
+					<button id="saveMaxTokens" class="mini-button">Save</button>
+				</div>
+				<label class="field-label" for="rulesInput">Rules</label>
+				<p class="hint">Always-on steering combined with any rule files found in the workspace (<code>AGENTS.md</code>, <code>.openvs/rules.md</code>, …) — soft guidance the model can weigh, unlike the hard guardrails below.</p>
+				<textarea id="rulesInput" rows="3" class="settings-textarea"
+					placeholder="e.g. Always write tests first. Prefer named exports."></textarea>
+				<div class="settings-row"><button id="saveRules" class="mini-button">Save</button></div>
+				<label class="field-label" for="maxStepsInput">Max agent steps</label>
+				<div class="settings-row">
+					<input id="maxStepsInput" type="number" min="1" step="1" class="settings-number" />
+					<button id="saveMaxSteps" class="mini-button">Save</button>
+				</div>
+				<label class="field-label" for="maxRunMinutesInput">Max agent run time (minutes)</label>
+				<div class="settings-row">
+					<input id="maxRunMinutesInput" type="number" min="1" step="1" class="settings-number" />
+					<button id="saveMaxRunMinutes" class="mini-button">Save</button>
+				</div>
+			</div>
+
 			<div class="settings-header"><h2>Agent permissions</h2></div>
 			<p class="hint">Controls when Agent mode pauses for your approval. <strong>Always Ask</strong> confirms every write and command; <strong>Default</strong> auto-approves file edits but asks before running commands; <strong>Full Auto</strong> never asks (the hard guardrails — protected paths, denied commands, workspace confinement — still apply). Reading, listing and searching never ask.</p>
 			<div id="approvalList"></div>
@@ -49,6 +78,8 @@ export const CHAT_APP_HTML = `
 			<p class="hint">When the provider is set to <strong>🤖 Auto</strong>, each phase runs on its own model: <strong>Ask</strong> and <strong>Plan</strong> use the planning model, inline edits use the implementation model, and <strong>Agent</strong> runs the full <em>plan → implement → review</em> pipeline. Leave a role on <em>Auto-select</em> to pick the best model from the keys you've configured.</p>
 			<div id="autoRoutingList"></div>
 			<label class="review-toggle"><input type="checkbox" id="enableReview" /> Run a review pass after Agent runs</label>
+			<label class="review-toggle" title="Splits the plan into steps and runs a sub-agent per step instead of one continuous Agent run.">
+				<input type="checkbox" id="enableDecompose" /> Decompose Agent runs into per-step sub-agents</label>
 		</section>
 
 		<section id="historyPanel" class="hidden">

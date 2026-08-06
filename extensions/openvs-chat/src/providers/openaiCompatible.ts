@@ -8,7 +8,8 @@ import {
 	ModelEntry, ProviderInfo, RetryInfo, STREAM_FETCH_OPTS, StreamChatResult, ToolCall, apiFetch,
 	describeHttpError, normalizeFinishReason, readSSE, retryNotice,
 } from './types';
-import { parseToolArgs } from './toolCalls';
+import { normalizeToolCallId, parseToolArgs } from './toolCalls';
+import { RateLimitSnapshot, RateLimitTracker } from './rateLimits';
 import { CLOSE_MARK, OPEN_MARK } from '../persona/thinking';
 
 /**
@@ -68,6 +69,20 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 	 */
 	protected allowsContentWithToolCalls(): boolean {
 		return true;
+	}
+
+	/**
+	 * Rewrites a tool-call id on its way to the wire, applied to the assistant turn's
+	 * `tool_calls[].id` and the matching `tool` turn's `tool_call_id` from one place so the
+	 * two can never disagree.
+	 *
+	 * Keyed off the *model* by default rather than the provider, because the constraint that
+	 * forces this — Mistral's `^[a-zA-Z0-9]{9}$` — follows the Mistral family across every
+	 * gateway that serves it (OpenRouter, NVIDIA, Cloudflare, a `custom` endpoint), not just
+	 * Mistral's own API. See {@link normalizeToolCallId}.
+	 */
+	protected toolCallId(id: string, model: string): string {
+		return normalizeToolCallId(id, model);
 	}
 
 	/**
@@ -139,11 +154,25 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 	 * short, transient notice (rate limit / slow start) so an auto-retry doesn't look like
 	 * a silent hang. 429 gets its own patient budget inside {@link apiFetch}.
 	 */
-	private streamFetchOpts(onNotice?: (text: string) => void): ApiFetchOptions {
+	private streamFetchOpts(model: string, onNotice?: (text: string) => void): ApiFetchOptions {
 		return {
 			...STREAM_FETCH_OPTS,
 			onRetry: (info: RetryInfo) => onNotice?.(retryNotice(this.info.label, info)),
+			...this.rateLimits.fetchOpts(model),
 		};
+	}
+
+	/**
+	 * What this backend has said about its own token allowances, per model.
+	 *
+	 * Held on the provider because providers are long-lived singletons in the registry, so
+	 * one run's reading is available to the next — the allowance belongs to the account and
+	 * the model, not to a conversation.
+	 */
+	protected readonly rateLimits = new RateLimitTracker();
+
+	rateLimit(model: string): RateLimitSnapshot | undefined {
+		return this.rateLimits.get(model);
 	}
 
 	/**
@@ -160,13 +189,13 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 			{ ...this.authHeaders(request.apiKey), 'Accept': 'text/event-stream' },
 			mode => JSON.stringify({
 				model: request.model,
-				messages: serializeMessages(request.messages, mode, this.wantsCacheBreakpoints(request.model)),
+				messages: serializeMessages(request.messages, mode, this.wantsCacheBreakpoints(request.model), id => this.toolCallId(id, request.model)),
 				[this.tokenLimitField(request.model)]: request.maxTokens,
 				stream: true,
 				...this.extraBody(),
 			}),
 			request.signal,
-			this.streamFetchOpts(request.onNotice),
+			this.streamFetchOpts(request.model, request.onNotice),
 		);
 
 		if (!response.ok) {
@@ -182,14 +211,15 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 		await readSSE(response, data => {
 			try {
 				const json = JSON.parse(data);
+				throwStreamError(this.info.label, json);
 				const raw = json?.choices?.[0]?.finish_reason;
 				if (raw) {
 					finishReason = normalizeFinishReason(raw);
 					truncated = finishReason === 'length';
 				}
 				const delta = json?.choices?.[0]?.delta;
-				const reasoning: string | undefined = delta?.reasoning_content;
-				if (typeof reasoning === 'string' && reasoning) {
+				const reasoning = reasoningDelta(delta);
+				if (reasoning) {
 					if (phase === 'idle') {
 						request.onToken(OPEN_MARK);
 						phase = 'reasoning';
@@ -232,7 +262,7 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 			{ ...this.authHeaders(request.apiKey), 'Accept': 'text/event-stream' },
 			mode => JSON.stringify({
 				model: request.model,
-				messages: serializeMessages(request.messages, mode, this.wantsCacheBreakpoints(request.model)),
+				messages: serializeMessages(request.messages, mode, this.wantsCacheBreakpoints(request.model), id => this.toolCallId(id, request.model)),
 				[this.tokenLimitField(request.model)]: request.maxTokens,
 				tools: request.tools.map(t => ({
 					type: 'function',
@@ -243,7 +273,7 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 				...this.extraBody(),
 			}),
 			request.signal,
-			this.streamFetchOpts(request.onNotice),
+			this.streamFetchOpts(request.model, request.onNotice),
 		);
 
 		if (!response.ok) {
@@ -264,6 +294,7 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 			} catch {
 				return;
 			}
+			throwStreamError(this.info.label, json);
 			const raw = json?.choices?.[0]?.finish_reason;
 			if (raw) {
 				finishReason = normalizeFinishReason(raw);
@@ -274,12 +305,13 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 				return;
 			}
 			// Stream reasoning for visibility, but keep it out of the recorded turn.
-			if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
+			const thought = reasoningDelta(delta);
+			if (thought) {
 				if (!reasoning) {
 					request.onToken?.(OPEN_MARK);
 				}
-				reasoning += delta.reasoning_content;
-				request.onToken?.(delta.reasoning_content);
+				reasoning += thought;
+				request.onToken?.(thought);
 			}
 			if (typeof delta.content === 'string' && delta.content) {
 				if (reasoning && !content) {
@@ -309,8 +341,71 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 	}
 }
 
+/**
+ * Raises a backend's in-band stream error, which arrives on an HTTP **200**.
+ *
+ * Several OpenAI-compatible backends (NVIDIA NIM and other vLLM-based gateways in
+ * particular) answer a failure by opening the stream normally and then sending the error as
+ * an SSE event. Every such event was silently skipped here — it matches no `choices` shape —
+ * so the request completed with no content at all, and the agent loop reported "the model
+ * returned an empty reply" four times before giving up. The reason the provider gave was
+ * sitting in the stream the whole time. The Anthropic client has always raised these; this
+ * is the same rule for every other backend.
+ */
+function throwStreamError(label: string, json: unknown): void {
+	if (!json || typeof json !== 'object') {
+		return;
+	}
+	const payload = json as { error?: unknown; object?: unknown; message?: unknown };
+	const error = payload.error;
+	const message = typeof error === 'string'
+		? error
+		: typeof (error as { message?: unknown })?.message === 'string'
+			? (error as { message: string }).message
+			// vLLM-style: `{ object: 'error', message: '...' }` with no nested error object.
+			: payload.object === 'error' && typeof payload.message === 'string' ? payload.message : undefined;
+	if (error !== undefined || payload.object === 'error') {
+		throw new Error(`${label}: ${message || 'the provider reported an error mid-stream.'}`);
+	}
+}
+
+/**
+ * The chain-of-thought fragment in one streamed delta, whatever the backend calls it.
+ *
+ * There is no standard here and the difference is not cosmetic: DeepSeek-style backends
+ * send `reasoning_content`, while **Groq and OpenRouter send `reasoning`** — and a
+ * reasoning model that spends a whole turn thinking (gpt-oss, Nemotron, GLM) returns no
+ * `content` and no tool calls on that turn. Reading only one spelling made those turns
+ * arrive as *empty* replies, so the agent loop nudged, got another one, and after four
+ * gave up on a run the model was in the middle of doing correctly.
+ *
+ * Some gateways wrap it in an object rather than sending a bare string, so both shapes
+ * are accepted; anything else is ignored rather than stringified into the transcript.
+ */
+function reasoningDelta(delta: Record<string, unknown> | undefined): string {
+	for (const key of ['reasoning_content', 'reasoning']) {
+		const value = delta?.[key];
+		if (typeof value === 'string' && value) {
+			return value;
+		}
+		if (value && typeof value === 'object') {
+			const nested = (value as { content?: unknown; text?: unknown }).content
+				?? (value as { text?: unknown }).text;
+			if (typeof nested === 'string' && nested) {
+				return nested;
+			}
+		}
+	}
+	return '';
+}
+
 /** Serializes the conversation into the OpenAI Chat Completions wire format. */
-function serializeMessages(messages: ChatMessage[], mode: NarrationMode, breakpoints = false): Record<string, unknown>[] {
+function serializeMessages(
+	messages: ChatMessage[],
+	mode: NarrationMode,
+	breakpoints = false,
+	toolCallId: (id: string) => string = id => id,
+): Record<string, unknown>[] {
 	const out: Record<string, unknown>[] = [];
 	for (const m of messages) {
 		// `split` puts the narration in its own turn ahead of the tool calls. The model's
@@ -319,7 +414,7 @@ function serializeMessages(messages: ChatMessage[], mode: NarrationMode, breakpo
 		if (mode === 'split' && m.role === 'assistant' && m.toolCalls?.length && m.content.trim()) {
 			out.push({ role: 'assistant', content: m.content });
 		}
-		out.push(serializeMessage(m, mode === 'inline'));
+		out.push(serializeMessage(m, mode === 'inline', toolCallId));
 	}
 	return breakpoints ? withCacheBreakpoints(out) : out;
 }
@@ -361,20 +456,27 @@ function withCacheBreakpoints(messages: Record<string, unknown>[]): Record<strin
 }
 
 /** Serializes an internal message into the OpenAI Chat Completions wire format. */
-function serializeMessage(m: ChatMessage, contentWithToolCalls: boolean): Record<string, unknown> {
+function serializeMessage(
+	m: ChatMessage,
+	contentWithToolCalls: boolean,
+	toolCallId: (id: string) => string,
+): Record<string, unknown> {
 	if (m.role === 'assistant' && m.toolCalls?.length) {
 		return {
 			role: 'assistant',
 			content: contentWithToolCalls ? (m.content || null) : null,
 			tool_calls: m.toolCalls.map(tc => ({
-				id: tc.id,
+				id: toolCallId(tc.id),
 				type: 'function',
 				function: { name: tc.name, arguments: JSON.stringify(tc.args) },
 			})),
 		};
 	}
 	if (m.role === 'tool') {
-		return { role: 'tool', tool_call_id: m.toolCallId, content: m.content };
+		// Left undefined (and so omitted by JSON.stringify) when the turn carries no id, as
+		// before — rewriting an absent id into an empty string would be a new, invalid field.
+		const id = m.toolCallId === undefined ? undefined : toolCallId(m.toolCallId);
+		return { role: 'tool', tool_call_id: id, content: m.content };
 	}
 	if (m.images?.length) {
 		const parts: Record<string, unknown>[] = [];

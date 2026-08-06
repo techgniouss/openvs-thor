@@ -13,6 +13,80 @@ import { ToolCall } from './types';
  */
 export const MALFORMED_ARGS = '__malformedArgs';
 
+/** The only tool-call id shape Mistral's API accepts; anything else fails the request. */
+const SHORT_TOOL_CALL_ID = /^[a-zA-Z0-9]{9}$/;
+
+/**
+ * Models whose backend validates tool-call ids against {@link SHORT_TOOL_CALL_ID}.
+ *
+ * Matched on the *model*, not the provider, because the Mistral family is served from four
+ * places here — Mistral's own API, `mistralai/*` on OpenRouter, `mistralai/*` on NVIDIA, and
+ * `@cf/mistralai/*` on Cloudflare — and a `custom` endpoint can be pointed at any of them.
+ * The vendor prefix means the token is preceded by `/` as often as it starts the id.
+ */
+const SHORT_ID_MODEL = /(^|[/:._-])(mistral|mixtral|ministral|magistral|devstral|codestral|pixtral)/i;
+
+/** Alphabet for {@link shortToolCallId}: exactly the characters the constraint permits. */
+const ID_ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+/** FNV-1a over `text`, seeded so two passes can produce independent halves of an id. */
+function hash32(text: string, seed: number): number {
+	let hash = seed >>> 0;
+	for (let i = 0; i < text.length; i++) {
+		hash ^= text.charCodeAt(i);
+		hash = Math.imul(hash, 0x01000193) >>> 0;
+	}
+	return hash >>> 0;
+}
+
+/** Renders `count` digits of `value` in {@link ID_ALPHABET}. */
+function encodeId(value: number, count: number): string {
+	let out = '';
+	let n = value >>> 0;
+	for (let i = 0; i < count; i++) {
+		out += ID_ALPHABET[n % ID_ALPHABET.length];
+		n = Math.floor(n / ID_ALPHABET.length);
+	}
+	return out;
+}
+
+/** Whether `model`'s backend will reject a tool-call id that isn't nine alphanumerics. */
+export function needsShortToolCallIds(model: string): boolean {
+	return SHORT_ID_MODEL.test(model);
+}
+
+/**
+ * Maps an arbitrary tool-call id onto the `^[a-zA-Z0-9]{9}$` form Mistral requires,
+ * deterministically — the same input always yields the same output, which is what lets the
+ * assistant turn's `tool_calls[].id` and the matching `tool` turn's `tool_call_id` still
+ * refer to each other after the rewrite.
+ *
+ * Ids that already fit pass through untouched, so a backend-issued id survives verbatim.
+ * Three kinds don't fit: `parseTextToolCalls` labels a call recovered from prose
+ * `text_call_0`; the streaming accumulator falls back to `call_<index>` when a backend
+ * omits the id; and switching providers mid-conversation carries another vendor's ids
+ * (`toolu_01…`) into the history. Each fails the whole request with HTTP 400 — the first
+ * two on the *second* step of any run that needed the recovery path.
+ *
+ * Rewriting is safe even where it isn't needed: Chat Completions is stateless, so a backend
+ * has no record of the ids it issued to validate against — only self-consistency within the
+ * one request matters, and that is preserved by construction.
+ *
+ * Two independently seeded hashes, because one 32-bit value cannot fill nine base-62
+ * digits: 62^6 already exceeds 2^32, so the last three characters would be constant.
+ */
+export function shortToolCallId(id: string): string {
+	if (SHORT_TOOL_CALL_ID.test(id)) {
+		return id;
+	}
+	return encodeId(hash32(id, 0x811c9dc5), 5) + encodeId(hash32(id, 0x9e3779b9), 4);
+}
+
+/** {@link shortToolCallId} where `model` needs it, the identity everywhere else. */
+export function normalizeToolCallId(id: string, model: string): string {
+	return needsShortToolCallIds(model) ? shortToolCallId(id) : id;
+}
+
 /**
  * Parses the `arguments` string of a tool call, repairing the malformations non-frontier
  * models routinely emit.

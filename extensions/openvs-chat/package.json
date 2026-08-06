@@ -27,6 +27,9 @@
     "anthropic",
     "nvidia",
     "openrouter",
+    "groq",
+    "mistral",
+    "cloudflare",
     "kimi",
     "moonshot",
     "qwen",
@@ -247,7 +250,12 @@
             "openai",
             "anthropic",
             "nvidia",
+            "gemini",
+            "antigravity",
             "openrouter",
+            "groq",
+            "mistral",
+            "cloudflare",
             "kimi",
             "qwen",
             "custom"
@@ -256,7 +264,12 @@
             "%config.provider.openai%",
             "%config.provider.anthropic%",
             "%config.provider.nvidia%",
+            "%config.provider.gemini%",
+            "%config.provider.antigravity%",
             "%config.provider.openrouter%",
+            "%config.provider.groq%",
+            "%config.provider.mistral%",
+            "%config.provider.cloudflare%",
             "%config.provider.kimi%",
             "%config.provider.qwen%",
             "%config.provider.custom%"
@@ -309,6 +322,26 @@
           "default": "",
           "description": "%config.authUrl%"
         },
+        "openvsChat.gemini.model": {
+          "type": "string",
+          "default": "gemini-2.5-flash",
+          "description": "%config.gemini.model%"
+        },
+        "openvsChat.gemini.baseUrl": {
+          "type": "string",
+          "default": "https://generativelanguage.googleapis.com/v1beta/openai",
+          "description": "%config.gemini.baseUrl%"
+        },
+        "openvsChat.gemini.authUrl": {
+          "type": "string",
+          "default": "",
+          "description": "%config.authUrl%"
+        },
+        "openvsChat.antigravity.model": {
+          "type": "string",
+          "default": "gemini-2.5-flash",
+          "description": "%config.antigravity.model%"
+        },
         "openvsChat.openrouter.model": {
           "type": "string",
           "default": "deepseek/deepseek-chat-v3-0324:free",
@@ -320,6 +353,56 @@
           "description": "%config.openrouter.baseUrl%"
         },
         "openvsChat.openrouter.authUrl": {
+          "type": "string",
+          "default": "",
+          "description": "%config.authUrl%"
+        },
+        "openvsChat.groq.model": {
+          "type": "string",
+          "default": "llama-3.3-70b-versatile",
+          "description": "%config.groq.model%"
+        },
+        "openvsChat.groq.baseUrl": {
+          "type": "string",
+          "default": "https://api.groq.com/openai/v1",
+          "description": "%config.groq.baseUrl%"
+        },
+        "openvsChat.groq.authUrl": {
+          "type": "string",
+          "default": "",
+          "description": "%config.authUrl%"
+        },
+        "openvsChat.mistral.model": {
+          "type": "string",
+          "default": "mistral-medium-latest",
+          "description": "%config.mistral.model%"
+        },
+        "openvsChat.mistral.baseUrl": {
+          "type": "string",
+          "default": "https://api.mistral.ai/v1",
+          "description": "%config.mistral.baseUrl%"
+        },
+        "openvsChat.mistral.authUrl": {
+          "type": "string",
+          "default": "",
+          "description": "%config.authUrl%"
+        },
+        "openvsChat.cloudflare.accountId": {
+          "type": "string",
+          "default": "",
+          "description": "%config.cloudflare.accountId%"
+        },
+        "openvsChat.cloudflare.model": {
+          "type": "string",
+          "default": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+          "description": "%config.cloudflare.model%"
+        },
+        "openvsChat.cloudflare.baseUrl": {
+          "type": "string",
+          "default": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
+          "description": "%config.cloudflare.baseUrl%"
+        },
+        "openvsChat.cloudflare.authUrl": {
           "type": "string",
           "default": "",
           "description": "%config.authUrl%"

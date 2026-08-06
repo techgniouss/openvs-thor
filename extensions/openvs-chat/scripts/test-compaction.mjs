@@ -187,4 +187,36 @@ assert.strictEqual(await m.compactMessages(convo(20, 4_000), async () => '   '),
 	assert.ok(!res.messages.some(x => x.content.startsWith('[tool result]')),
 		'the conversation itself is not flattened');
 }
+// The summarizer request is bounded by the caller's budget. Unbounded it was the LARGEST
+// request a run ever made — agent steps are trimmed to the context budget, this was not —
+// so on a backend with a tight per-request allowance it failed every time, twice, and
+// compaction turned itself off for the rest of the run. On exactly the providers whose cost
+// compaction exists to control.
+{
+	const big = n => 'x'.repeat(n);
+	const msgs = [{ role: 'system', content: 'SYS' }, { role: 'user', content: 'REQ' }];
+	for (let i = 0; i < 20; i++) {
+		msgs.push({ role: 'assistant', content: 'step ' + i, toolCalls: [{ id: 'c' + i, name: 'read_file', args: { path: `f${i}.ts` } }] });
+		msgs.push({ role: 'tool', content: big(24_000), toolCallId: 'c' + i }); // the read cap
+	}
+	for (let i = 0; i < 6; i++) { msgs.push({ role: 'user', content: 'recent ' + i }); }
+
+	const send = async budget => {
+		let sent;
+		const res = await m.compactMessages(msgs, async payload => { sent = payload; return 'SUMMARY'; }, 2, budget);
+		assert.ok(res, 'compaction ran');
+		return m.estimateMessagesTokens ? m.estimateMessagesTokens(sent) : sent.reduce((n, x) => n + Math.ceil(x.content.length / 4) + 4, 0);
+	};
+	const unbounded = await send(undefined);
+	const bounded = await send(6_000);
+	assert.ok(unbounded > 100_000, `the fixture really is huge unbounded (${unbounded} tokens)`);
+	assert.ok(bounded <= 6_000, `a budget is honoured (${bounded} tokens for a 6000 budget)`);
+	// The narration is what a summary is made of; the file dumps are not. Trimming runs
+	// before tool turns are flattened precisely so it can tell those apart.
+	let sent;
+	await m.compactMessages(msgs, async payload => { sent = payload; return 'S'; }, 2, 6_000);
+	assert.ok(sent.some(x => x.content.includes('step 19')), 'recent narration survives the bound');
+	assert.ok(sent.at(-1).content.includes('Summarize the conversation'), 'the summary prompt is still last');
+}
+
 console.log('test-compaction: all assertions passed');

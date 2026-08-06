@@ -16,6 +16,7 @@ import assert from 'node:assert/strict';
 const { NvidiaProvider } = await import(new URL('../out/providers/nvidia.js', import.meta.url));
 const { KimiProvider } = await import(new URL('../out/providers/kimi.js', import.meta.url));
 const { OpenRouterProvider } = await import(new URL('../out/providers/openrouter.js', import.meta.url));
+const { MistralProvider } = await import(new URL('../out/providers/mistral.js', import.meta.url));
 
 /** One SSE response that is enough for readSSE to see a terminal event and finish. */
 function completion(text = 'ok') {
@@ -199,6 +200,159 @@ const sent = (bodies, n) => bodies[n].messages.map(m => ({
 		],
 		[true, false, false],
 		'caching is declared per provider, and defaults to off',
+	);
+}
+
+// 8. Mistral validates every tool-call id against ^[a-zA-Z0-9]{9}$ and rejects the whole
+// request otherwise. Our own ids don't always fit — a tool call recovered from prose is
+// labelled `text_call_0`, the streaming accumulator falls back to `call_<index>`, and
+// switching provider mid-conversation carries another vendor's ids into the history — so
+// they are rewritten on the wire. The rewrite has to be deterministic, or the assistant
+// turn and its tool result would stop referring to the same call.
+const mixedIds = [
+	{ role: 'user', content: 'go' },
+	{ role: 'assistant', content: 'reading', toolCalls: [{ id: 'text_call_0', name: 'read_file', args: {} }] },
+	{ role: 'tool', content: 'x', toolCallId: 'text_call_0' },
+	{ role: 'assistant', content: '', toolCalls: [{ id: 'toolu_01VpEm654Hvf', name: 'read_file', args: {} }] },
+	{ role: 'tool', content: 'y', toolCallId: 'toolu_01VpEm654Hvf' },
+	{ role: 'assistant', content: '', toolCalls: [{ id: 'AbCdEf123', name: 'read_file', args: {} }] },
+	{ role: 'tool', content: 'z', toolCallId: 'AbCdEf123' },
+];
+
+/** Every tool-call id in the n-th recorded request, in wire order. */
+const sentIds = (bodies, n) => bodies[n].messages.flatMap(
+	m => m.tool_calls?.map(t => t.id) ?? (m.tool_call_id ? [m.tool_call_id] : []));
+
+{
+	const bodies = stubFetch([() => completion()]);
+	await new MistralProvider().runAgentStep({ ...request(), messages: mixedIds });
+	const ids = sentIds(bodies, 0);
+	assert.deepStrictEqual(
+		[
+			ids.every(id => /^[a-zA-Z0-9]{9}$/.test(id)),
+			ids[0] === ids[1],
+			ids[2] === ids[3],
+			ids[4], ids[5],
+			new Set(ids).size,
+		],
+		[true, true, true, 'AbCdEf123', 'AbCdEf123', 3],
+		'ids are rewritten to Mistral\'s form, each call still matches its own result, ' +
+		'an already-valid id is passed through, and three distinct calls stay distinct',
+	);
+}
+
+// 8b. The constraint follows the *model*, not the provider: the same Mistral weights are
+// served by OpenRouter, NVIDIA and Cloudflare under a `mistralai/` prefix, and a run there
+// used to die at HTTP 400 on the first step that recovered a tool call from prose.
+{
+	const bodies = stubFetch([() => completion()]);
+	await new OpenRouterProvider().runAgentStep({
+		...request(), model: 'mistralai/mistral-small-3.2-24b-instruct', messages: mixedIds,
+	});
+	assert.ok(sentIds(bodies, 0).every(id => /^[a-zA-Z0-9]{9}$/.test(id)),
+		'a Mistral model behind a gateway gets the same treatment');
+}
+
+// 8c. …and nowhere else. Rewriting ids a backend issued, for a backend that never asked for
+// it, would be a gratuitous change to a request that was already valid.
+{
+	const bodies = stubFetch([() => completion()]);
+	await new OpenRouterProvider().runAgentStep({ ...request(), model: 'openai/gpt-4o-mini', messages: mixedIds });
+	assert.deepStrictEqual(sentIds(bodies, 0),
+		['text_call_0', 'text_call_0', 'toolu_01VpEm654Hvf', 'toolu_01VpEm654Hvf', 'AbCdEf123', 'AbCdEf123'],
+		'every other model gets its ids verbatim');
+}
+
+// 9. Whether a repeated prefix is cheap is read from the provider, and Groq caches
+// automatically — cached tokens there are half price AND exempt from the rate limits the
+// free tier actually runs out of, so compacting early would be paid for twice.
+{
+	const { GroqProvider } = await import(new URL('../out/providers/groq.js', import.meta.url));
+	const { CloudflareProvider } = await import(new URL('../out/providers/cloudflare.js', import.meta.url));
+	assert.deepStrictEqual(
+		[
+			new GroqProvider().info.cachesPrompts === true,
+			new MistralProvider().info.cachesPrompts === true,
+			new CloudflareProvider().info.cachesPrompts === true,
+		],
+		[true, false, false],
+		'only the backends that actually cache declare it',
+	);
+}
+
+// 10. A turn that is nothing but chain-of-thought still reaches the agent loop as content.
+// There is no standard field for it — DeepSeek-style backends send `reasoning_content`,
+// Groq and OpenRouter send `reasoning`, and some gateways wrap it in an object. Reading one
+// spelling made a thinking turn (gpt-oss, Nemotron, GLM produce them routinely) arrive
+// EMPTY, so the loop nudged, got another, and after four gave up mid-task on a model that
+// was working correctly.
+{
+	const thinkingOnly = field => () => {
+		const body = new ReadableStream({
+			start(controller) {
+				const event = JSON.stringify({ choices: [{ delta: { [field]: 'weighing the options' }, finish_reason: 'stop' }] });
+				controller.enqueue(new TextEncoder().encode(`data: ${event}\n\n`));
+				controller.close();
+			},
+		});
+		return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+	};
+	const nested = () => {
+		const body = new ReadableStream({
+			start(controller) {
+				const event = JSON.stringify({ choices: [{ delta: { reasoning: { content: 'weighing the options' } }, finish_reason: 'stop' }] });
+				controller.enqueue(new TextEncoder().encode(`data: ${event}\n\n`));
+				controller.close();
+			},
+		});
+		return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+	};
+	const steps = [];
+	for (const respond of [thinkingOnly('reasoning_content'), thinkingOnly('reasoning'), nested]) {
+		stubFetch([respond]);
+		steps.push(await new OpenRouterProvider().runAgentStep({ ...request(), model: 'openai/gpt-oss-120b' }));
+	}
+	assert.deepStrictEqual(
+		steps.map(s => s.content),
+		['weighing the options', 'weighing the options', 'weighing the options'],
+		'every spelling of a reasoning delta survives as the step\'s content',
+	);
+}
+
+// 11. A backend that reports a failure *inside* an HTTP 200 stream must surface it. NVIDIA
+// NIM and other vLLM-based gateways do exactly that, and every such event was skipped here
+// because it matches no `choices` shape — so the request finished with no content, and the
+// agent loop reported "the model returned an empty reply" four times and gave up while the
+// provider's actual reason sat unread in the stream. Anthropic has always raised these.
+{
+	const errorStream = payload => () => {
+		const body = new ReadableStream({
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`));
+				controller.close();
+			},
+		});
+		return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+	};
+	const failures = [];
+	for (const payload of [
+		{ error: { message: 'Internal server error' } },
+		{ object: 'error', message: 'model is loading' },
+		{ error: 'plain string form' },
+	]) {
+		stubFetch([errorStream(payload)]);
+		await new NvidiaProvider().runAgentStep(request()).then(
+			step => failures.push(`resolved with ${JSON.stringify(step.content)}`),
+			err => failures.push(err.message));
+	}
+	assert.deepStrictEqual(
+		failures,
+		[
+			'NVIDIA (free models): Internal server error',
+			'NVIDIA (free models): model is loading',
+			'NVIDIA (free models): plain string form',
+		],
+		'an in-band stream error is raised with what the provider said, not swallowed into an empty reply',
 	);
 }
 

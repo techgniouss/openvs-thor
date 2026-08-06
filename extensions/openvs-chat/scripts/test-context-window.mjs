@@ -58,5 +58,41 @@ assert.strictEqual(m.contextWindowFor('z-ai/glm-4.6'), 128_000);
 assert.strictEqual(m.contextWindowFor('minimax/minimax-m2'), 192_000);
 assert.strictEqual(m.contextWindowFor('openai/gpt-oss-120b'), 128_000);
 assert.strictEqual(m.contextWindowFor('mistralai/devstral-medium'), 128_000);
+// Mistral's own API offers `-latest` aliases, so the family patterns can't be keyed to a
+// version number; `groq/compound` carries no model family in its id at all.
+assert.strictEqual(m.contextWindowFor('mistral-medium-latest'), 128_000);
+assert.strictEqual(m.contextWindowFor('mistral-small-latest'), 128_000);
+assert.strictEqual(m.contextWindowFor('@cf/mistralai/mistral-small-3.1-24b-instruct'), 128_000);
+assert.strictEqual(m.contextWindowFor('groq/compound'), 128_000);
+// Still 32k: the older open-weights checkpoints genuinely have a small window, and widening
+// the family patterns above must not sweep them up.
+// budgetsForCeiling is the ONE place a stated per-request allowance is split between the
+// reply reservation and the conversation. Both the agent loop and the plain streaming path
+// call it; they previously carried three near-identical formulas, one using the raw limit
+// where another used the discounted one — the kind of drift that reads as "works in Agent
+// mode, fails in Ask".
+{
+	// Groq free tier, the case this exists for: the default 8192 reservation alone exceeds
+	// the whole allowance, so the reply must come down before trimming can achieve anything.
+	const groq = m.budgetsForCeiling(8_000, 8_192);
+	assert.deepStrictEqual(groq, { reply: 1_800, conversation: 5_400 });
+	assert.ok(groq.reply + groq.conversation <= 8_000, 'the two halves fit the allowance together');
+
+	// Never asks for more reply than the user configured, however roomy the allowance.
+	assert.strictEqual(m.budgetsForCeiling(300_000, 4_096).reply, 4_096);
+	// And never collapses the reply to nothing on a tiny one.
+	assert.strictEqual(m.budgetsForCeiling(1_000, 8_192).reply, 512);
+	// Floors hold rather than going negative when the reservation eats the allowance.
+	const tiny = m.budgetsForCeiling(1_000, 8_192);
+	assert.ok(tiny.conversation >= 1_000 && tiny.reply >= 512, `floors hold: ${JSON.stringify(tiny)}`);
+}
+
+assert.strictEqual(m.contextWindowFor('open-mistral-7b'), 32_000);
+// Two families whose newest release broke the pattern that matched the previous ones, both
+// caught by test-model-axes.mjs landing them on the 32k default.
+assert.strictEqual(m.contextWindowFor('z-ai/glm-5.2'), 200_000);
+assert.strictEqual(m.contextWindowFor('z-ai/glm-4.6'), 128_000, 'GLM-5 must not shadow GLM-4');
+assert.strictEqual(m.contextWindowFor('@cf/google/gemma-4-26b-a4b-it'), 256_000);
+assert.strictEqual(m.contextWindowFor('google/gemma-3-12b-it'), 8_000, 'Gemma 4 must not shadow Gemma 3');
 
 console.log('test-context-window: all assertions passed');

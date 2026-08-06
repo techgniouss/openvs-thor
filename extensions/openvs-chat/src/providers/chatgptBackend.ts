@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { chatgptSessionId, decodeJwtClaims } from '../oauth';
+import { chatgptAccountId, chatgptSessionId, decodeJwtClaims } from '../oauth';
 import {
 	AgentRequest, AgentStep, ChatMessage, ChatRequest, FinishReason, STREAM_FETCH_OPTS,
 	StreamChatResult, ToolCall, apiFetch, describeHttpError, readSSE, retryNotice,
@@ -19,22 +19,42 @@ import { parseToolArgs } from './toolCalls';
 
 const CHATGPT_RESPONSES_URL = 'https://chatgpt.com/backend-api/codex/responses';
 
-/** Models the ChatGPT backend accepts (Codex-enabled models only). */
-export const CHATGPT_MODELS = ['gpt-5', 'gpt-5-codex', 'codex-mini-latest'];
+/**
+ * Models the ChatGPT-account Codex backend actually accepts. This is NOT the OpenAI
+ * Platform API's model set — `gpt-5`, `gpt-4o`, every o-series id, and most `-codex`
+ * suffixed names return HTTP 400 "not supported when using Codex with a ChatGPT
+ * account" on this backend (entitlement-gated, not a naming issue). There is no
+ * discovery endpoint for this list; it can only be found by testing candidate names
+ * live. Curated 2026-08-04 from a live sweep of 36 candidates against a real
+ * ChatGPT-account cred — exactly these 3 passed. Ordered fastest-first (also the
+ * dropdown default). Re-sweep and update when OpenAI rotates model names.
+ */
+export const CHATGPT_MODELS = ['gpt-5.4-mini', 'gpt-5.4', 'gpt-5.5'];
 
 /** True when the stored OpenAI credential is a ChatGPT OAuth access token. */
 export function isChatGptToken(apiKey: string): boolean {
 	return apiKey.startsWith('eyJ') && apiKey.split('.').length === 3;
 }
 
+/**
+ * The reference implementation this mirrors (`providers/codex.py`) decodes this
+ * claim from the sign-in's `id_token`, not the `access_token` — the access token
+ * isn't guaranteed to carry it. Try the access token first (cheap, no cross-module
+ * call) and fall back to the id-token-derived value `oauth.ts` cached at sign-in /
+ * refresh time, matching the reference exactly.
+ */
 function accountId(accessToken: string): string {
 	const claims = decodeJwtClaims(accessToken);
 	const auth = claims?.['https://api.openai.com/auth'] as Record<string, unknown> | undefined;
 	const id = auth?.['chatgpt_account_id'];
-	if (typeof id !== 'string') {
-		throw new Error('ChatGPT sign-in token is missing the account id. Please sign in again.');
+	if (typeof id === 'string' && id) {
+		return id;
 	}
-	return id;
+	const cached = chatgptAccountId(accessToken);
+	if (cached) {
+		return cached;
+	}
+	throw new Error('ChatGPT sign-in token is missing the account id. Please sign in again.');
 }
 
 function headers(accessToken: string): Record<string, string> {
@@ -188,7 +208,6 @@ export async function chatgptStreamChat(label: string, request: ChatRequest): Pr
 		model: normalizeModel(request.model),
 		instructions: systemText(request.messages),
 		input: toInputItems(request.messages),
-		max_output_tokens: request.maxTokens,
 		store: false,
 		stream: true,
 	}, request.signal, request.onToken, request.onNotice);
@@ -200,7 +219,6 @@ export async function chatgptAgentStep(label: string, request: AgentRequest): Pr
 		model: normalizeModel(request.model),
 		instructions: systemText(request.messages),
 		input: toInputItems(request.messages),
-		max_output_tokens: request.maxTokens,
 		tools: request.tools.map(t => ({
 			type: 'function',
 			name: t.name,

@@ -9,10 +9,11 @@ import { stripThinking } from '../persona/thinking';
 import { TodoItem, UPDATE_TODOS_TOOL, parseTodoUpdate } from '../persona/todos';
 import { extractTextToolCalls } from '../providers/toolCalls';
 import { AgentStep, CONTINUE_PROMPT, ChatProvider, ChatMessage, ToolCall, ToolSpec, endsInRepeatLoop, isAbortError, isTransientProviderError } from '../providers/types';
-import { CACHED_COMPACT_TRIGGER, COMPACT_TRIGGER, canCompact, compactMessages, compactionThreshold, shouldCompact } from './compaction';
-import { estimateMessagesTokens, estimateToolsTokens, isContextLengthError, trimMessages } from './context';
+import { budgetsForCeiling } from './contextWindow';
+import { CACHED_COMPACT_TRIGGER, COMPACT_TRIGGER, SUMMARY_MAX_TOKENS, canCompact, compactMessages, compactionThreshold, shouldCompact } from './compaction';
+import { elidedToolCallIds, estimateMessagesTokens, estimateToolsTokens, isContextLengthError, parseTokenLimit, pruneToolOutput, trimMessages } from './context';
 import { Guardrails, autoApproves, loadGuardrails, resolveWorkspacePath } from './guardrails';
-import { AGENT_TOOLS, ASK_USER_TOOL, AskOption, MAX_ASK_OPTIONS, READ_ONLY_TOOL_NAMES, SPAWN_SUBAGENT_TOOL, ToolApprover, VerifyCommand, asBoolean, asString, commandTextOf, detectVerificationCommands, executeTool, isVerificationCommand } from './tools';
+import { AGENT_TOOLS, ASK_USER_TOOL, AskOption, MAX_ASK_OPTIONS, READ_ONLY_TOOL_NAMES, SPAWN_SUBAGENT_TOOL, ToolApprover, ToolLimits, VerifyCommand, asBoolean, asString, commandTextOf, detectVerificationCommands, executeTool, isVerificationCommand } from './tools';
 
 const MCP_PREFIX = 'mcp__';
 
@@ -76,11 +77,43 @@ const DEFAULT_CONTEXT_TOKENS = 120_000;
 const MIN_CONTEXT_TOKENS = 8_000;
 
 /**
+ * Floor once a backend has stated its own per-request ceiling. The normal floor is an
+ * assumption about what a conversation needs; a stated ceiling is a fact about what the
+ * backend will accept, and holding 8k against a stated 8k guarantees every later step is
+ * rejected too. Below this there is no room for even one file, so the run should fail
+ * loudly rather than crawl.
+ */
+const MIN_STATED_CONTEXT_TOKENS = 1_000;
+
+/**
+ * Largest share of a request's budget the tool schemas may take before the MCP ones are
+ * dropped. Half is generous — it still leaves the conversation less room than the tool
+ * definitions — but the point is to catch the case where there is no room at all, not to
+ * second-guess a user who connected a server on a model that can afford it.
+ */
+const MAX_TOOL_SCHEMA_SHARE = 0.5;
+
+/**
+ * Share of the conversation budget one `read_file` result may occupy, and the characters-
+ * per-token ratio used to convert one into the other — the same 4:1 the estimator uses.
+ */
+const MAX_READ_SHARE = 0.5;
+const CHARS_PER_TOKEN = 4;
+
+/**
  * Consecutive summarizer failures tolerated before compaction is abandoned for the run.
  * More than one because a single failure is usually a rate limit or a network blip, and
  * giving up on the first would forfeit compaction for the rest of a long run.
  */
 const MAX_SUMMARIZER_FAILURES = 2;
+
+/**
+ * Compactions tolerated that succeed yet leave the request still over the threshold.
+ * One is normal — bulky recent turns become compactable a step or two later. Two in a row
+ * means the budget is too small for a summary to rescue, and every further attempt is a
+ * model call bought for nothing.
+ */
+const MAX_COMPACTIONS_WITHOUT_RELIEF = 2;
 
 /**
  * How many consecutive empty replies are retried before the run gives up. A step with
@@ -90,6 +123,13 @@ const MAX_SUMMARIZER_FAILURES = 2;
  * step budget: no work was done, so no budget was spent.
  */
 const MAX_EMPTY_ROUNDS = 3;
+
+/**
+ * Conversation size above which the ledger offers its compaction-tuning advice. Below it
+ * the advice is not merely noise but wrong: forcing earlier compaction on a run whose
+ * prompts are a few thousand tokens buys a summarizer request and saves nothing.
+ */
+const TUNING_HINT_TOKENS = 25_000;
 
 /**
  * How many times a step is re-asked after a *transient* provider failure — a dropped
@@ -249,6 +289,13 @@ interface AgentOptions {
 	steering?: () => string[];
 	/** Estimated-token ceiling for the conversation sent each step. 0 disables trimming. */
 	maxContextTokens?: number;
+	/**
+	 * Upper bound on the reply reservation, below whatever the user configured. Set only by
+	 * a parent that has already learned a backend's per-request ceiling the hard way — a
+	 * sub-agent inheriting the shrunken conversation budget but not the shrunken reply
+	 * reservation would re-earn the same rejection on its first step.
+	 */
+	maxOutputTokens?: number;
 	/** Model context window in tokens; enables auto-compaction at 70% of it. 0/absent disables compaction. */
 	contextWindow?: number;
 	/**
@@ -312,10 +359,20 @@ export class AgentRunner {
 	private peakPromptTokens = 0;
 	/** Estimated tokens in the most recently sent prompt, for the per-step timing trace. */
 	private lastPromptTokens = 0;
+	/**
+	 * Running total of input tokens this run has sent, schemas included, and how many
+	 * requests it took. Cumulative rather than peak because an agent step re-sends the whole
+	 * conversation: what a run costs is the sum over its steps, and a peak of 20k says
+	 * nothing about whether that was two steps or forty.
+	 */
+	private totalPromptTokens = 0;
+	private requestCount = 0;
 	/** Set once compacting stops paying for itself, so the run doesn't re-summarize every few steps. */
 	private compactionExhausted = false;
 	/** Consecutive summarizer failures; reset by any success, so a one-off blip isn't terminal. */
 	private summarizerFailures = 0;
+	/** Consecutive compactions that ran but left the request still over the threshold. */
+	private compactionsWithoutRelief = 0;
 	private contextBudget: number;
 	/** The model's latest checklist, so completion can be checked against its own plan. */
 	private todos: TodoItem[] = [];
@@ -345,6 +402,14 @@ export class AgentRunner {
 	private verifyCommands?: Promise<VerifyCommand[]>;
 	/** Memoized estimate of what the tool schemas add to every request. */
 	private toolTokens?: number;
+	/** Reply ceiling adopted after a backend named a per-request token limit; unset until then. */
+	private outputCap?: number;
+	/** Floor under the adaptive budget; lowered once a backend names a ceiling of its own. */
+	private contextFloor = MIN_CONTEXT_TOKENS;
+	/** The tightest per-request ceiling applied so far, so later readings can only tighten. */
+	private appliedCeiling?: number;
+	/** Set once the MCP tool schemas were found not to fit the budget; they are then omitted. */
+	private mcpSchemasDropped = false;
 
 	constructor(
 		private readonly provider: ChatProvider,
@@ -359,6 +424,12 @@ export class AgentRunner {
 		this.mcp = opts?.mcp;
 		this.steering = opts?.steering;
 		this.contextBudget = opts?.maxContextTokens ?? DEFAULT_CONTEXT_TOKENS;
+		this.outputCap = opts?.maxOutputTokens;
+		if (this.outputCap) {
+			// The inherited budget was derived from a stated ceiling; the normal floor would
+			// silently raise it back over that ceiling before the first request.
+			this.contextFloor = MIN_STATED_CONTEXT_TOKENS;
+		}
 		this.contextWindow = opts?.contextWindow ?? 0;
 		this.keepHead = opts?.keepHead;
 		this.retryDelaysMs = opts?.retryDelaysMs?.length ? opts.retryDelaysMs : STEP_RETRY_DELAYS_MS;
@@ -396,7 +467,7 @@ export class AgentRunner {
 		if (this.depth < this.guardrails.maxSubagentDepth && this.budget.spawned < this.guardrails.maxSubagents) {
 			base.push(SPAWN_SUBAGENT_TOOL);
 		}
-		if (this.mcp) {
+		if (this.mcp && !this.mcpSchemasDropped) {
 			base.push(...this.mcp.tools());
 		}
 		return base;
@@ -421,13 +492,24 @@ export class AgentRunner {
 		}
 	}
 
-	/** One line of run accounting: how long it took, and how big the prompt got. */
+	/** One line of run accounting: how long it took, and what it cost to send. */
 	private runSummary(): string {
 		const seconds = Math.round((this.now() - this.startedAt) / 1_000);
 		const elapsed = seconds >= 60 ? `${Math.floor(seconds / 60)}m ${seconds % 60}s` : `${seconds}s`;
-		return `Run finished in ${elapsed}; largest prompt sent was ~${Math.round(this.peakPromptTokens / 1_000)}k tokens. `
-			+ 'A large prompt is what makes each step slow on providers without prompt caching — '
-			+ 'lower "openvsChat.agent.maxContextTokens" to force earlier compaction.';
+		// "~" and "estimated" are not hedging: this is the 4-chars-per-token estimate the
+		// budget uses, not a figure from the provider, and reading it as a bill would be wrong.
+		// The total counts the tool schemas the provider is sent (and charges for) on every
+		// request; the peak is the conversation alone. Said plainly, because otherwise the two
+		// read as contradicting each other whenever the total exceeds requests x peak.
+		return (`Run finished in ${elapsed}; ~${round1k(this.totalPromptTokens)}k estimated input tokens over ${this.requestCount} request(s), tool schemas included; `
+			+ `largest single conversation ~${round1k(this.peakPromptTokens)}k. `
+			+ (this.peakPromptTokens >= TUNING_HINT_TOKENS
+				// Only when the conversation is actually large. On a short run this advice is not
+				// just noise, it is wrong: forcing earlier compaction on 5k prompts buys a
+				// summarizer request to save nothing.
+				? 'Each step re-sends the whole conversation, so the total grows with the square of a long run — '
+				+ 'lower "openvsChat.agent.maxContextTokens" to force earlier compaction.'
+				: '')).trim();
 	}
 
 	/** Whether the run has used up its wall-clock allowance. */
@@ -497,7 +579,11 @@ export class AgentRunner {
 			// Never mid-continuation: the provisional turns below are spliced back out by
 			// index, and summarizing them away would also throw out the half-written answer.
 			if (this.contextWindow && !this.compactionExhausted && !carryTurns
-				&& shouldCompact(messages, this.contextWindow, this.contextBudget, this.compactTrigger, this.toolOverhead())
+				// Judged on what a step actually SENDS, not on what the run is holding. Where
+				// pruning already keeps requests small, compacting as well buys nothing and
+				// costs a summarizer round trip — which is itself a model call, so the saving
+				// would be handed straight back.
+				&& shouldCompact(this.pruned(messages), this.contextWindow, this.contextBudget, this.compactTrigger, this.toolOverhead())
 				&& canCompact(messages, this.keepHead)) {
 				const compacted = await this.compact(messages, params);
 				if (compacted) {
@@ -517,6 +603,20 @@ export class AgentRunner {
 					if (estimateMessagesTokens(head) >= compactionThreshold(this.contextWindow, this.contextBudget, this.compactTrigger)) {
 						this.compactionExhausted = true;
 						callbacks.onNote('The conversation is still near the context limit after compacting — older tool output will be trimmed from here on.');
+					} else if (shouldCompact(this.pruned(messages), this.contextWindow, this.contextBudget, this.compactTrigger, this.toolOverhead())) {
+						// Compacted, and STILL over the threshold. Once is the transient case the
+						// head check above deliberately tolerates — bulky recent turns roll into the
+						// compactable middle a step or two later, and compacting them does pay.
+						// Repeatedly is not: on a budget small enough that the summary plus one
+						// protected file read already exceeds it, every step buys another summarizer
+						// request and no relief — spending the very allowance that made the budget
+						// small, on a measure that cannot help.
+						if (++this.compactionsWithoutRelief >= MAX_COMPACTIONS_WITHOUT_RELIEF) {
+							this.compactionExhausted = true;
+							callbacks.onNote('Compacting is no longer getting the conversation under the request budget for this model — older tool output will be trimmed from here on instead.');
+						}
+					} else {
+						this.compactionsWithoutRelief = 0;
 					}
 				} else if (++this.summarizerFailures >= MAX_SUMMARIZER_FAILURES) {
 					// Persistent failure (not a one-off rate limit), so stop paying for it.
@@ -647,9 +747,22 @@ export class AgentRunner {
 				// vanish. Ask again a few times, then stop with an explanation.
 				if (!result.content.trim()) {
 					if (emptyRounds >= MAX_EMPTY_ROUNDS) {
+						// The finish reason is named because the causes need different answers and
+						// look identical from the chat: `length` means the reply budget was spent
+						// before any text arrived, `stop` means the backend really did return
+						// nothing, and none reported means the stream ended without a terminal event.
 						return {
 							reason: 'stalled',
-							detail: `The model returned ${emptyRounds + 1} empty replies in a row, so the run stopped with the task unfinished. This is usually a provider hiccup — send "continue" to resume, or switch models.`,
+							detail: `${this.provider.info.label} returned ${emptyRounds + 1} empty replies in a row for "${params.model}" `
+								+ `(finish reason: ${result.finishReason ?? 'none reported'}), so the run stopped with the task unfinished. `
+								// A clean `stop` with tools attached and nothing said is the signature of a
+								// model that takes a `tools` array and cannot actually call one: the capability
+								// tables are name patterns, so a model can pass them and still be unable to run
+								// Agent mode. Worth naming — "provider hiccup" sends the user back to retry a
+								// model that will fail identically every time.
+								+ (result.finishReason === 'stop' && this.tools().length
+									? 'It ended every turn cleanly with nothing to say, which usually means it cannot call tools — pick a model marked with a wrench in the model list, or use Ask mode.'
+									: 'This is usually a provider hiccup — send "continue" to resume, or switch models.'),
 						};
 					}
 					emptyRounds++;
@@ -836,8 +949,12 @@ export class AgentRunner {
 
 	/**
 	 * Asks the model for one step, keeping the conversation inside the context budget.
-	 * If the provider still rejects it as too long, the budget is halved and the step is
+	 * If the provider still rejects it as too big, the budget is cut and the step is
 	 * retried once — a run should shed old file dumps rather than die on a 400.
+	 *
+	 * How far it is cut depends on what the rejection said. A ceiling the backend named
+	 * outright is adopted verbatim (see {@link adoptRequestCeiling}); otherwise the budget
+	 * is halved, which is the best guess available when the backend only says "too long".
 	 */
 	private async step(
 		messages: ChatMessage[],
@@ -848,18 +965,26 @@ export class AgentRunner {
 		// is left of the budget after them. Floored, so a huge MCP toolset degrades into a
 		// short conversation rather than into no conversation at all.
 		const ask = (budget: number) => this.provider.runAgentStep!({
-			// Measured after trimming, so the figure is what the provider was actually asked
-			// to read rather than what the run is holding.
-			messages: this.measured(trimMessages(messages, Math.max(MIN_CONTEXT_TOKENS, budget - this.toolOverhead()))),
+			messages: this.forSending(messages, budget),
 			tools: this.tools(),
 			model: params.model,
 			apiKey: params.apiKey,
 			baseUrl: params.baseUrl,
-			maxTokens: params.maxTokens,
+			maxTokens: Math.min(params.maxTokens, this.outputCap ?? params.maxTokens),
 			signal: params.signal,
 			onToken: delta => callbacks.onToken(delta),
 			onNotice: text => callbacks.onNote(text),
 		});
+		// Backends state their per-request token allowance on every response, so from the
+		// second request onward the ceiling is known rather than guessed. Applied here, before
+		// the request is built, so a run that started inside the allowance never grows out of
+		// it and earns the rejection the previous phase could only recover from.
+		const stated = this.provider.rateLimit?.(params.model)?.limitTokens;
+		if (stated && this.adoptRequestCeiling(stated, params.maxTokens)) {
+			callbacks.onNote(`${this.provider.info.label} allows ~${stated} tokens per request on this model — sizing each step to fit, replies capped at ${this.outputCap}.`);
+		}
+		// After the ceiling, since that is what can make a tool set that fitted stop fitting.
+		this.enforceToolBudget(callbacks);
 		try {
 			return this.recoverTextToolCalls(await ask(this.contextBudget));
 		} catch (err) {
@@ -867,11 +992,166 @@ export class AgentRunner {
 				throw err;
 			}
 			// The estimate was optimistic for this model; keep the smaller budget for the
-			// rest of the run so every later step stays inside the real window.
-			this.contextBudget = Math.max(MIN_CONTEXT_TOKENS, Math.floor(this.contextBudget / 2));
-			callbacks.onNote(`The conversation outgrew the model's context window — trimming older tool output and retrying.`);
+			// rest of the run so every later step stays inside the real limit.
+			const stated = parseTokenLimit(err.message);
+			// Falls through to halving when the ceiling was already applied and the request
+			// was refused anyway — re-adopting the same number would change nothing and the
+			// retry would fail identically.
+			if (stated && this.adoptRequestCeiling(stated, params.maxTokens)) {
+				callbacks.onNote(`The provider caps a request at ${stated} tokens — reducing the reply limit to ${this.outputCap} and trimming older tool output, then retrying.`);
+			} else {
+				this.contextBudget = Math.max(this.contextFloor, Math.floor(this.contextBudget / 2));
+				callbacks.onNote(`The conversation outgrew the model's context window — trimming older tool output and retrying.`);
+			}
 			return this.recoverTextToolCalls(await ask(this.contextBudget));
 		}
+	}
+
+	/**
+	 * Re-derives the run's budgets from a per-request token ceiling the backend named.
+	 *
+	 * Both halves of the request are charged against that one number, so both have to move:
+	 * the reply reservation is cut to a share of the ceiling (never *up* — a stated ceiling
+	 * is not a licence to ask for more output than the user configured), and the conversation
+	 * gets what is left. Kept for the rest of the run, since the ceiling is a property of the
+	 * account and model rather than of this one step.
+	 *
+	 * Returns whether it changed anything, so a caller can report a new ceiling once instead
+	 * of on every step that re-reads the same headers.
+	 */
+	private adoptRequestCeiling(limit: number, configuredOutput: number): boolean {
+		// A ceiling learned the hard way (a 413 naming a smaller number than the headers
+		// advertise) must not be undone by the next response's headers, or the run would
+		// oscillate between a budget that works and one that just failed.
+		if (this.appliedCeiling !== undefined && limit >= this.appliedCeiling) {
+			return false;
+		}
+		this.appliedCeiling = limit;
+		const { reply: output, conversation: budget } = budgetsForCeiling(limit, configuredOutput);
+		// A generous allowance must constrain nothing. This is a tokens-per-*request* limit,
+		// not a context window: a backend reporting 300k would otherwise push the budget far
+		// past the model's real window and trade a rate-limit rejection for a context one.
+		// Hence min, in both directions — this may only ever tighten.
+		if (budget >= this.contextBudget && output >= (this.outputCap ?? configuredOutput)) {
+			return false;
+		}
+		this.outputCap = Math.min(this.outputCap ?? configuredOutput, output);
+		this.contextFloor = MIN_STATED_CONTEXT_TOKENS;
+		this.contextBudget = Math.min(this.contextBudget, budget);
+		return true;
+	}
+
+	/**
+	 * The conversation as this step will actually send it: dead tool output elided, then
+	 * trimmed to fit whatever budget is left after the tool schemas.
+	 *
+	 * The run's own `messages` array is never rewritten. Every pass here works on a copy, so
+	 * the full transcript stays available to compaction and to the next step — a cheaper
+	 * prompt is a property of one request, not a decision to destroy history.
+	 */
+	private forSending(messages: ChatMessage[], budget: number): ChatMessage[] {
+		// What is left for the conversation once the tool schemas have taken their cut —
+		// they ride on every request, so budgeting the messages alone understates it.
+		const conversationBudget = Math.max(this.contextFloor, budget - this.toolOverhead());
+		// Measured after both passes, so the figure is what the provider was actually asked
+		// to read rather than what the run is holding.
+		const sent = this.measured(trimMessages(this.pruned(messages), conversationBudget));
+		this.forgetElidedReads(messages, sent);
+		return sent;
+	}
+
+	/**
+	 * Drops tool output the model no longer needs sent — but only where re-sending it is
+	 * actually paid for.
+	 *
+	 * On a backend that caches the prompt prefix, re-sending an old file dump costs a
+	 * fraction of its first price, while eliding it rewrites the middle and throws the whole
+	 * cached prefix away. That is the same trade `COMPACT_TRIGGER` vs `CACHED_COMPACT_TRIGGER`
+	 * already makes, and it comes out the same way: on a caching provider, proactive pruning
+	 * loses money. Those runs keep the existing behaviour — trim only when a request would
+	 * otherwise not fit.
+	 */
+	private pruned(messages: ChatMessage[]): ChatMessage[] {
+		if (this.provider.info.cachesPrompts) {
+			return messages;
+		}
+		return pruneToolOutput(messages, {
+			readTools: READ_ONLY_TOOL_NAMES,
+			// Only a wholesale replacement kills an earlier read. See `pruneToolOutput`.
+			wholeFileWriteTool: 'write_file',
+		});
+	}
+
+	/**
+	 * Stops treating a read as "already answered" once its result no longer reaches the model.
+	 *
+	 * Without this the two halves of the run contradict each other: the prompt carries a
+	 * marker where a file dump used to be, while the repeat-read breaker answers the obvious
+	 * re-read with "its result is still above in this conversation — read it there". It is
+	 * not there. The model cannot see the content and cannot fetch it, so it re-asks until
+	 * the step budget runs out, being told off more sharply each time.
+	 *
+	 * This applies to trimming too, which has always elided old tool output — so the
+	 * deadlock predates proactive pruning; pruning would only have made it common.
+	 */
+	private forgetElidedReads(before: ChatMessage[], after: ChatMessage[]): void {
+		const elided = elidedToolCallIds(before, after);
+		if (!elided.length || !this.answeredReads.size) {
+			return;
+		}
+		const ids = new Set(elided);
+		for (const m of before) {
+			for (const call of m.toolCalls ?? []) {
+				if (ids.has(call.id) && READ_ONLY_TOOL_NAMES.includes(call.name)) {
+					this.answeredReads.delete(repeatKey(call));
+				}
+			}
+		}
+	}
+
+	/**
+	 * Drops the MCP tool schemas when they no longer leave room for a conversation.
+	 *
+	 * The built-in set is a known ~1.2k tokens; MCP adds an unbounded amount, and every
+	 * request of the run carries all of it. Connect a few servers on a backend with a small
+	 * per-request allowance and the schemas alone can exceed the whole budget — at which
+	 * point every request is refused, the ceiling logic shrinks a conversation that was never
+	 * the problem, and nothing anywhere names the actual cause. Dropping them keeps the run
+	 * working with the built-in tools and says exactly what was given up and why.
+	 *
+	 * One-way: re-adding them after the budget was found too small would just re-fail.
+	 */
+	private enforceToolBudget(callbacks: AgentCallbacks): void {
+		if (this.mcpSchemasDropped || !this.mcp) {
+			return;
+		}
+		const withMcp = this.toolOverhead();
+		if (withMcp <= this.contextBudget * MAX_TOOL_SCHEMA_SHARE) {
+			return;
+		}
+		this.mcpSchemasDropped = true;
+		// The memoized figure counted the schemas that are now gone.
+		this.toolTokens = undefined;
+		callbacks.onNote(`The connected MCP servers' tool definitions come to ~${withMcp} tokens — more than half of this model's ~${Math.round(this.contextBudget)}-token request budget, leaving no room for the conversation itself. Continuing with the built-in tools only (~${this.toolOverhead()} tokens). Disconnect a server, or use a model with a larger allowance, to use them.`);
+	}
+
+	/**
+	 * Per-call tool caps sized to what this run can actually carry.
+	 *
+	 * `read_file`'s default 24k-character page is ~6k tokens. That is fine against a normal
+	 * window and absurd against a backend whose whole per-request allowance is 8k: the read
+	 * would come back larger than the conversation budget and be elided by trimming before the
+	 * model could use a line of it — the agent reads a file and effectively sees nothing.
+	 * Reads are paged and every truncated result names the offset to continue from, so sizing
+	 * the page to the budget costs extra calls rather than information.
+	 *
+	 * Half the conversation budget, because a single read must never crowd out the transcript
+	 * that gives it meaning. Left at the default whenever the budget is roomy enough that the
+	 * cap would not bind.
+	 */
+	private toolLimits(): ToolLimits {
+		const conversation = Math.max(MIN_STATED_CONTEXT_TOKENS, this.contextBudget - this.toolOverhead());
+		return { maxReadChars: Math.floor(conversation * CHARS_PER_TOKEN * MAX_READ_SHARE) };
 	}
 
 	/**
@@ -892,6 +1172,11 @@ export class AgentRunner {
 	private measured(messages: ChatMessage[]): ChatMessage[] {
 		this.lastPromptTokens = estimateMessagesTokens(messages);
 		this.peakPromptTokens = Math.max(this.peakPromptTokens, this.lastPromptTokens);
+		// The ledger counts the tool schemas as well, because the provider charges for them
+		// on every request; peak/last stay messages-only so the per-step trace keeps meaning
+		// what it always meant.
+		this.totalPromptTokens += this.lastPromptTokens + this.toolOverhead();
+		this.requestCount++;
 		return messages;
 	}
 
@@ -922,19 +1207,29 @@ export class AgentRunner {
 	private async compact(messages: ChatMessage[], params: AgentParams) {
 		return compactMessages(messages, async (toSummarize, maxTokens) => {
 			let text = '';
+			// Counted like any other request: compaction is a model call over the bulkiest
+			// part of the conversation, so a ledger that omitted it would credit compaction
+			// with a saving it had partly spent. No tool schemas here — this call carries none.
+			this.totalPromptTokens += estimateMessagesTokens(toSummarize);
+			this.requestCount++;
 			await this.provider.streamChat({
 				messages: toSummarize,
 				model: params.model,
 				apiKey: params.apiKey,
 				baseUrl: params.baseUrl,
-				maxTokens,
+				// Subject to the same reply ceiling as a step: on a backend that charges the
+				// reservation against a per-minute allowance, asking for more than the
+				// allowance permits fails before the model reads a word.
+				maxTokens: Math.min(maxTokens, this.outputCap ?? maxTokens),
 				signal: params.signal,
 				onToken: delta => { text += delta; },
 			});
 			// Reasoning models stream their chain of thought through onToken too;
 			// the stored summary must not carry it.
 			return stripThinking(text);
-		}, this.keepHead);
+			// Bounded by the run's own conversation budget, less the summary it asks for.
+			// The summarizer carries no tool schemas, so `toolOverhead` is not deducted here.
+		}, this.keepHead, Math.max(MIN_STATED_CONTEXT_TOKENS, this.contextBudget - SUMMARY_MAX_TOKENS));
 	}
 
 	/**
@@ -1108,7 +1403,7 @@ export class AgentRunner {
 		}
 		const { result, isError } = call.name.startsWith(MCP_PREFIX)
 			? await this.callMcp(call)
-			: await executeTool(call, this.approver, this.guardrails);
+			: await executeTool(call, this.approver, this.guardrails, this.toolLimits());
 		this.recordToolOutcome(call, key, isRead, isError);
 		callbacks.onToolEnd(call, result, isError);
 		return { call, result, isError };
@@ -1142,7 +1437,7 @@ export class AgentRunner {
 			}
 			let pending = shared.get(p.key);
 			if (!pending) {
-				pending = executeTool(p.call, this.approver, this.guardrails);
+				pending = executeTool(p.call, this.approver, this.guardrails, this.toolLimits());
 				shared.set(p.key, pending);
 			}
 			return pending;
@@ -1219,6 +1514,7 @@ export class AgentRunner {
 			// the default budget until the provider rejects the request outright. Its seed is
 			// [system, goal] — both must survive compaction, hence keepHead 2.
 			maxContextTokens: this.contextBudget,
+			maxOutputTokens: this.outputCap,
 			contextWindow: this.contextWindow,
 			keepHead: 2,
 			// The delegate gets what is *left* of the parent's wall clock, not a fresh
@@ -1292,6 +1588,11 @@ function subagentSystem(readOnly: boolean): string {
  * let a model re-read the same file indefinitely just by spelling it differently — the exact
  * loop this guard exists to stop, walked straight around.
  */
+/** Tokens as thousands, to one decimal, so a sub-1k run doesn't report "~0k". */
+function round1k(tokens: number): number {
+	return Math.round(tokens / 100) / 10;
+}
+
 function repeatKey(call: ToolCall): string {
 	const args: Record<string, unknown> = { ...call.args };
 	if (typeof args.path === 'string') {

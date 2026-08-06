@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { ChatMessage } from '../providers/types';
-import { dropOrphanToolResults, estimateMessagesTokens } from './context';
+import { dropOrphanToolResults, estimateMessagesTokens, trimMessages } from './context';
 
 /**
  * Conversation auto-compaction. Trimming (context.ts) is a lossy emergency valve —
@@ -53,8 +53,13 @@ const KEEP_RECENT_TURNS = 6;
 /** Below this many compactable turns, a summary would cost more than it saves. */
 const MIN_COMPACTABLE = 4;
 
-/** Response budget for the summary itself. */
-const SUMMARY_MAX_TOKENS = 1_500;
+/**
+ * Response budget for the summary itself. Exported because callers must deduct it from what
+ * they allow the summarizer to *send*: a backend charges the reservation and the prompt
+ * against the same per-request allowance, so budgeting only the prompt overshoots by exactly
+ * this much.
+ */
+export const SUMMARY_MAX_TOKENS = 1_500;
 
 /** Prefix of the synthetic turn that replaces compacted history. */
 export const COMPACT_MARKER = '[Conversation summary — earlier turns were compacted]';
@@ -164,11 +169,21 @@ function firstTurnEnd(messages: ChatMessage[]): number {
  * request, …]`, and the default — preserve through the first user turn — would then
  * protect the bulky context blob while summarizing away the request itself. Omit it
  * only for a bare conversation whose first user turn genuinely is the task.
+ *
+ * `maxInputTokens` bounds what the summarizer is *sent*. Without it this function asked the
+ * model to read the entire conversation up to the tail, at full size — making the summarizer
+ * call the largest single request a run ever made, larger than any agent step, since those
+ * are trimmed to the context budget and this was not. On a backend with a tight per-request
+ * allowance it therefore failed every time, twice in a row, and compaction switched itself
+ * off for the rest of the run — on exactly the providers whose cost it exists to control.
+ * Trimming happens *before* the tool turns are flattened, so the pass can still recognize
+ * bulky tool output and blank it, keeping the narration a summary is actually made of.
  */
 export async function compactMessages(
 	messages: ChatMessage[],
 	summarize: (messages: ChatMessage[], maxTokens: number) => Promise<string>,
 	keepHead?: number,
+	maxInputTokens?: number,
 ): Promise<{ messages: ChatMessage[]; before: number; after: number; replaced: number } | undefined> {
 	const start = keepHead === undefined ? firstTurnEnd(messages) : Math.min(Math.max(keepHead, 0), messages.length);
 	if (start < 0) {
@@ -178,12 +193,22 @@ export async function compactMessages(
 	if (end - start < MIN_COMPACTABLE) {
 		return undefined;
 	}
+	const slice = messages.slice(0, end);
+	const bounded = maxInputTokens && maxInputTokens > 0;
+	// Two stages, because they can do different things. The first runs while tool turns are
+	// still tool turns, so it can recognize a bulky file dump and blank it while leaving the
+	// narration a summary is actually made of. The second runs on the finished payload,
+	// because flattening ADDS characters — a `[tool result] ` prefix per turn — and a bound
+	// measured before that is not the bound the request is judged by. Usually a no-op; on a
+	// transcript of many small tool turns it was a 300-token overshoot, which is exactly the
+	// margin a tight per-request allowance does not have.
+	const payload = [
+		...flattenToolTurns(bounded ? trimMessages(slice, maxInputTokens) : slice),
+		{ role: 'user' as const, content: SUMMARY_PROMPT },
+	];
 	let summary: string;
 	try {
-		summary = (await summarize(
-			[...flattenToolTurns(messages.slice(0, end)), { role: 'user', content: SUMMARY_PROMPT }],
-			SUMMARY_MAX_TOKENS,
-		)).trim();
+		summary = (await summarize(bounded ? trimMessages(payload, maxInputTokens) : payload, SUMMARY_MAX_TOKENS)).trim();
 	} catch {
 		return undefined;
 	}

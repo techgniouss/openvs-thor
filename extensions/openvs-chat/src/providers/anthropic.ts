@@ -8,6 +8,7 @@ import {
 	ProviderInfo, STREAM_FETCH_OPTS, StreamChatResult, ToolCall, apiFetch, describeHttpError,
 	normalizeFinishReason, readSSE, retryNotice,
 } from './types';
+import { RateLimitSnapshot, RateLimitTracker } from './rateLimits';
 import { parseToolArgs } from './toolCalls';
 
 const ANTHROPIC_VERSION = '2023-06-01';
@@ -30,6 +31,19 @@ function isOAuthToken(apiKey: string): boolean {
  * blocks, and tool calls arrive as `tool_use` blocks.
  */
 export class AnthropicProvider implements ChatProvider {
+	/**
+	 * Anthropic states its allowances under its own header prefix
+	 * (`anthropic-ratelimit-input-tokens-*`), which {@link parseRateLimitHeaders} reads
+	 * alongside the `x-ratelimit-*` spelling. Recorded here for the same reason as
+	 * everywhere else — a limit learned from a header costs nothing, a limit learned from a
+	 * rejection costs a request.
+	 */
+	private readonly rateLimits = new RateLimitTracker();
+
+	rateLimit(model: string): RateLimitSnapshot | undefined {
+		return this.rateLimits.get(model);
+	}
+
 	readonly info: ProviderInfo = {
 		id: 'anthropic',
 		label: 'Anthropic (Claude)',
@@ -91,6 +105,7 @@ export class AnthropicProvider implements ChatProvider {
 		}, request.signal, {
 			...STREAM_FETCH_OPTS,
 			onRetry: info => request.onNotice?.(retryNotice(this.info.label, info)),
+			...this.rateLimits.fetchOpts(request.model),
 		});
 
 		if (!response.ok) {
@@ -161,6 +176,7 @@ export class AnthropicProvider implements ChatProvider {
 		}, request.signal, {
 			...STREAM_FETCH_OPTS,
 			onRetry: info => request.onNotice?.(retryNotice(this.info.label, info)),
+			...this.rateLimits.fetchOpts(request.model),
 		});
 
 		if (!response.ok) {

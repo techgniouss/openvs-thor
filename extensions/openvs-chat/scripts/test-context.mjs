@@ -101,12 +101,14 @@ assert.strictEqual(m.estimateTokens(big(4000)), 1000);
 }
 
 // isContextLengthError recognizes how each backend words the rejection.
+const GROQ_413 = 'Groq (free tier): request failed (HTTP 413). Request too large for model `qwen/qwen3.6-27b` in organization `org_01k` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Requested 13155, please reduce your message size and try again.';
 for (const msg of [
 	'This model\'s maximum context length is 128000 tokens',
 	'Error code: 400 - context_length_exceeded',
 	'input exceeds the context window',
 	'Request too large: too many tokens',
 	'prompt tokens exceed the limit',
+	GROQ_413,
 ]) {
 	assert.ok(m.isContextLengthError(msg), `should detect: ${msg}`);
 }
@@ -114,8 +116,105 @@ for (const msg of [
 	'authentication failed (HTTP 401)',
 	'rate limited (HTTP 429)',
 	'The provider did not start responding within 150s',
+	// A 429 for the *same* TPM ceiling must stay a wait-and-retry: shrinking the
+	// conversation doesn't refill a per-minute quota, and the transport already backs off.
+	'Groq (free tier): rate limited (HTTP 429). Rate limit reached for model `qwen/qwen3.6-27b` on tokens per minute (TPM): Limit 8000, Used 7900, Requested 900. Please try again in 6s.',
 ]) {
 	assert.ok(!m.isContextLengthError(msg), `should not detect: ${msg}`);
+}
+
+// parseTokenLimit pulls the ceiling out of the rejection, so the retry lands under it in
+// one hop instead of halving a 120k budget down toward 8k over several dead requests.
+assert.strictEqual(m.parseTokenLimit(GROQ_413), 8000);
+assert.strictEqual(m.parseTokenLimit('This model\'s maximum context length is 128000 tokens, however you requested 130000'), 128000);
+assert.strictEqual(m.parseTokenLimit('exceeded the limit of 32,000 tokens'), 32000);
+// No number, or one too small to be a token budget, leaves the caller to halve blindly.
+assert.strictEqual(m.parseTokenLimit('input exceeds the context window'), undefined);
+assert.strictEqual(m.parseTokenLimit('Rate limit reached, retry limit 3 exceeded'), undefined);
+
+// trimMessages must actually FIT the budget it was given, including when the only thing
+// left over it is tool output the function normally protects. One fresh read is 24k
+// characters — on a small budget that single result exceeds the whole allowance, and
+// returning it anyway produced a request the caller sent and the provider refused. The
+// protection has to yield to the budget, not the other way round.
+{
+	const msgs = [{ role: 'system', content: 'SYS' }, { role: 'user', content: 'REQ' }];
+	for (let i = 0; i < 20; i++) {
+		msgs.push({ role: 'assistant', content: `step ${i}`, toolCalls: [{ id: `c${i}`, name: 'read_file', args: { path: `f${i}.ts` } }] });
+		msgs.push({ role: 'tool', content: 'x'.repeat(24_000), toolCallId: `c${i}` });
+	}
+	for (const budget of [6_000, 2_000, 1_000]) {
+		const out = m.trimMessages(msgs, budget);
+		assert.ok(m.estimateMessagesTokens(out) <= budget,
+			`a ${budget}-token budget is met, not merely approached (got ${m.estimateMessagesTokens(out)})`);
+	}
+	// Still a usable conversation: the task and the newest result's head both survive.
+	const out = m.trimMessages(msgs, 2_000);
+	assert.deepStrictEqual(out.slice(0, 2), msgs.slice(0, 2), 'the task itself is never trimmed away');
+	assert.ok(out.at(-1).content.startsWith('x'.repeat(200)), 'the newest result keeps its identifying head');
+}
+
+// pruneToolOutput drops output the model no longer needs sent, at any budget. The three
+// rules are asserted together on one transcript so their interaction is what's pinned, not
+// three separate happy paths.
+{
+	const opts = { readTools: ['read_file', 'list_files', 'search_files'], wholeFileWriteTool: 'write_file', keepRecentTurns: 2 };
+	const call = (id, name, args) => ({ role: 'assistant', content: '', toolCalls: [{ id, name, args }] });
+	const dump = (id, tag) => ({ role: 'tool', toolCallId: id, content: `${tag} ${'x'.repeat(1_000)}` });
+	const before = [
+		{ role: 'system', content: 'sys' },
+		{ role: 'user', content: 'go' },
+		// Read of a.ts, then the identical read again later — the first is dominated.
+		call('c1', 'read_file', { path: 'a.ts' }), dump('c1', 'A-FIRST'),
+		// Read of b.ts, later replaced wholesale — the read is dead.
+		call('c2', 'read_file', { path: 'b.ts' }), dump('c2', 'B-READ'),
+		// Read of c.ts, later only *edited* — a targeted edit leaves the dump mostly right,
+		// so eliding it would force a re-read that costs more than it saves.
+		call('c3', 'read_file', { path: 'c.ts' }), dump('c3', 'C-READ'),
+		call('c4', 'write_file', { path: 'b.ts', content: 'new' }), dump('c4', 'WROTE-B'),
+		call('c5', 'edit_file', { path: 'c.ts' }), dump('c5', 'EDITED-C'),
+		call('c6', 'read_file', { path: 'a.ts' }), dump('c6', 'A-SECOND'),
+		call('c7', 'read_file', { path: 'd.ts' }), dump('c7', 'D-RECENT'),
+	];
+	const after = m.pruneToolOutput(before, opts);
+	const body = id => after.find(x => x.toolCallId === id).content;
+	assert.deepStrictEqual(
+		[
+			body('c1').includes(m.SUPERSEDED_MARKER),
+			body('c2').includes(m.SUPERSEDED_MARKER),
+			body('c3').includes(m.SUPERSEDED_MARKER),
+			body('c6') === before.find(x => x.toolCallId === 'c6').content,
+			body('c7') === before.find(x => x.toolCallId === 'c7').content,
+		],
+		[true, true, false, true, true],
+		'duplicate read and whole-file-overwritten read are elided; edit_file does not elide; recent output is verbatim',
+	);
+	// The head survives, so the model can tell what it is being offered a re-read of.
+	assert.ok(body('c1').startsWith('A-FIRST'), 'an elided result keeps its identifying head');
+	// Old output goes regardless of what replaced it, which is where the bulk actually is.
+	assert.ok(body('c3').includes(m.DECAY_MARKER), 'output older than the kept turns is elided by age');
+	// Nothing is dropped, only shortened: dropping turns is trimMessages' job and needs the
+	// orphan handling this pass deliberately does not do.
+	assert.strictEqual(after.length, before.length, 'pruning never removes a message');
+	// Unchanged input must come back as the same array, so the common case allocates nothing.
+	assert.strictEqual(m.pruneToolOutput(after, opts), after, 'a second pass is a no-op');
+}
+
+// elidedToolCallIds reports what the model can no longer read, however it was lost.
+{
+	const before = [
+		{ role: 'assistant', content: '', toolCalls: [{ id: 'a', name: 'read_file', args: {} }, { id: 'b', name: 'read_file', args: {} }] },
+		{ role: 'tool', toolCallId: 'a', content: 'kept' },
+		{ role: 'tool', toolCallId: 'b', content: 'original' },
+		{ role: 'tool', toolCallId: 'c', content: 'dropped entirely' },
+	];
+	const after = [
+		{ role: 'assistant', content: '', toolCalls: [{ id: 'a', name: 'read_file', args: {} }, { id: 'b', name: 'read_file', args: {} }] },
+		{ role: 'tool', toolCallId: 'a', content: 'kept' },
+		{ role: 'tool', toolCallId: 'b', content: 'shortened…' },
+	];
+	assert.deepStrictEqual(m.elidedToolCallIds(before, after), ['b', 'c'],
+		'shortened and dropped both count; untouched does not');
 }
 
 // The incremental token accounting inside trimMessages must agree exactly with a full

@@ -30,6 +30,22 @@ const MAX_DECODE_BYTES = 1_000_000;
 const MAX_READ_CHARS = 24_000;
 
 /**
+ * Per-call caps the agent loop can tighten below the module defaults.
+ *
+ * The defaults are sized for a normal context window. They are the wrong size when the
+ * backend's per-request token allowance is far smaller than the model's window — Groq's
+ * free tier serves a 128k-window model with an 8k allowance, where one read at
+ * {@link MAX_READ_CHARS} is ~6k tokens against a conversation budget of ~4k. The result
+ * would be elided by trimming before the model could use a line of it, so the read has to
+ * be smaller at the source. Reads are paged and each truncated result names the offset to
+ * continue from, so a tighter cap costs extra calls rather than information.
+ */
+export interface ToolLimits {
+	/** Characters one `read_file` may return, including the line-number gutter. */
+	readonly maxReadChars?: number;
+}
+
+/**
  * Width of the line-number gutter prefixed to every line of a read_file result, and the
  * separator that closes it. Reads are numbered so the model can cite `path:line`, aim an
  * offset at a known line, and describe an edit site without re-reading the file to count
@@ -503,7 +519,7 @@ export function normalizeToolCall(call: ToolCall): ToolCall {
 }
 
 /** Executes a single tool call, applying guardrails and prompting for approval on side effects. */
-export async function executeTool(rawCall: ToolCall, approver: ToolApprover, guardrails?: Guardrails): Promise<ToolResult> {
+export async function executeTool(rawCall: ToolCall, approver: ToolApprover, guardrails?: Guardrails, limits?: ToolLimits): Promise<ToolResult> {
 	const call = normalizeToolCall(rawCall);
 	// Arguments that never parsed are reported as such, with the text quoted back. Falling
 	// through would run the tool with no arguments at all, and its complaint ("an empty path
@@ -536,7 +552,7 @@ export async function executeTool(rawCall: ToolCall, approver: ToolApprover, gua
 		switch (call.name) {
 			case 'read_file': {
 				const found = pathArg(false);
-				return found.ok ? await readFile(found.target, asNumber(call.args.offset), asNumber(call.args.limit))
+				return found.ok ? await readFile(found.target, asNumber(call.args.offset), asNumber(call.args.limit), limits?.maxReadChars)
 					: { result: found.error, isError: true };
 			}
 			case 'list_dir': {
@@ -598,7 +614,7 @@ export async function executeTool(rawCall: ToolCall, approver: ToolApprover, gua
 	}
 }
 
-async function readFile(target: WorkspacePath, offset?: number, limit?: number): Promise<ToolResult> {
+async function readFile(target: WorkspacePath, offset?: number, limit?: number, maxChars = MAX_READ_CHARS): Promise<ToolResult> {
 	const path = target.display;
 	let bytes: Uint8Array;
 	try {
@@ -615,7 +631,7 @@ async function readFile(target: WorkspacePath, offset?: number, limit?: number):
 		throw err;
 	}
 	// `stream: true` keeps a multi-byte sequence straddling the cut from decoding as U+FFFD.
-	const decodeLimit = Math.max(MAX_DECODE_BYTES, MAX_READ_CHARS);
+	const decodeLimit = Math.max(MAX_DECODE_BYTES, maxChars);
 	const partial = bytes.byteLength > decodeLimit;
 	const text = new TextDecoder().decode(bytes.slice(0, decodeLimit), { stream: partial });
 	const lines = text.split('\n');
@@ -627,7 +643,7 @@ async function readFile(target: WorkspacePath, offset?: number, limit?: number):
 	const out: string[] = [];
 	let chars = 0;
 	for (const line of wanted) {
-		if (chars + line.length + 1 + GUTTER_COST > MAX_READ_CHARS) {
+		if (chars + line.length + 1 + GUTTER_COST > maxChars) {
 			break;
 		}
 		out.push(line);
@@ -648,7 +664,7 @@ async function readFile(target: WorkspacePath, offset?: number, limit?: number):
 	// no lines at all. Return the head of that line and point past it — a note offering
 	// the offset just used would send a compliant model round the same call forever.
 	if (!out.length) {
-		const head = wanted[0].slice(0, MAX_READ_CHARS);
+		const head = wanted[0].slice(0, maxChars);
 		const note = `\n\n[line ${start + 1} is ${wanted[0].length} characters; showing its first ${head.length}. `
 			+ (start + 1 < lines.length
 				? `Call read_file with offset=${start + 2} to continue past it.]`
