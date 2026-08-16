@@ -6,6 +6,7 @@
 import * as vscode from 'vscode';
 import { WebAuthManager } from './auth';
 import { ChatViewProvider, InlineKind } from './chatViewProvider';
+import { generateCommitMessage } from './git/commitMessage';
 import { McpManager } from './mcp/manager';
 import { loadEnvFile } from './oauth';
 import { ProviderRegistry } from './providers/registry';
@@ -68,6 +69,15 @@ export function activate(context: vscode.ExtensionContext): void {
 		vscode.commands.registerCommand('openvsChat.createSkill', () => createSkill(viewProvider)),
 		vscode.commands.registerCommand('openvsChat.mcpAdd', () => mcpAdd(mcp)),
 		vscode.commands.registerCommand('openvsChat.mcpOpenConfig', () => mcpOpenConfig()),
+		vscode.commands.registerCommand('openvsChat.generateCommitMessage', (rootUri?: vscode.Uri, _resourceGroups?: unknown, token?: vscode.CancellationToken) => {
+			// The scm/inputBox toolbar always supplies a token; only the Command Palette (no
+			// args) needs one made up here, and that one must be disposed once done with it.
+			if (token) {
+				return generateCommitMessage(registry, rootUri, token);
+			}
+			const cts = new vscode.CancellationTokenSource();
+			return generateCommitMessage(registry, rootUri, cts.token).finally(() => cts.dispose());
+		}),
 	);
 
 	// Inline-editor commands operate on the active selection (or whole file).
