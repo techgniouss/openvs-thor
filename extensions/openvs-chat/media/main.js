@@ -189,25 +189,26 @@
 		// 'edit' was replaced by 'plan' as the middle mode; migrate stale persisted state.
 		mode = persisted.mode === 'edit' ? 'plan' : (persisted.mode || 'ask');
 		selectedProvider = persisted.selectedProvider || '';
-		if (Array.isArray(persisted.sessions) && persisted.sessions.length) {
-			sessions = persisted.sessions.map(s => ({
+		// Conversations themselves are NOT restored into live tabs — every time this view
+		// (re)opens it starts on a fresh chat rather than resuming whatever was on screen
+		// last time. Nothing is lost: each restored session is archived into History first,
+		// same as closing its tab would do, so it's one click away in the 🕘 panel instead
+		// of being the thing the user has to look at (and close) before they can start over.
+		const restored = Array.isArray(persisted.sessions) && persisted.sessions.length
+			? persisted.sessions.map(s => ({
 				id: s.id || newSessionId(),
 				title: s.title || '',
 				messages: Array.isArray(s.messages) ? s.messages : [],
 				streaming: false,
 				pending: null,
 				queue: Array.isArray(s.queue) ? s.queue : [],
-				compactSummary: typeof s.compactSummary === 'string' ? s.compactSummary : undefined,
-				compactedUpTo: typeof s.compactedUpTo === 'number' ? s.compactedUpTo : 0,
-			}));
-			activeSessionId = sessions.some(s => s.id === persisted.activeSessionId)
-				? persisted.activeSessionId
-				: sessions[0].id;
-		} else if (Array.isArray(persisted.messages) && persisted.messages.length) {
-			// Migrate the single-conversation state from before chat tabs existed.
-			const s = { id: newSessionId(), title: '', messages: persisted.messages, streaming: false, pending: null, queue: [] };
-			sessions = [s];
-			activeSessionId = s.id;
+			}))
+			: (Array.isArray(persisted.messages) && persisted.messages.length
+				// Migrate the single-conversation state from before chat tabs existed.
+				? [{ id: newSessionId(), title: '', messages: persisted.messages, streaming: false, pending: null, queue: [] }]
+				: []);
+		for (const s of restored) {
+			archiveSession(s);
 		}
 	}
 	if (!sessions.length) {

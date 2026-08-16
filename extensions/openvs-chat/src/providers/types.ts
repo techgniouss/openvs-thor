@@ -12,6 +12,14 @@ export interface ToolCall {
 	readonly id: string;
 	readonly name: string;
 	readonly args: Record<string, unknown>;
+	/**
+	 * Opaque provider-specific continuation token that must be echoed back verbatim
+	 * alongside this call when it is replayed into history on a later step — e.g.
+	 * Gemini 3's `thoughtSignature`, required on every `functionCall` part or the API
+	 * 400s ("Function call is missing a thought_signature"). Undefined for providers
+	 * that don't need one; never interpreted, only round-tripped.
+	 */
+	readonly signature?: string;
 }
 
 /** A single image attached to a user message, already downscaled/re-encoded client-side. */

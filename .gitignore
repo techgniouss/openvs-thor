@@ -95,11 +95,33 @@ lerna-debug.log*
 # packaged extension output
 *.vsix
 
+# packaged desktop builds
+VSCode-*/
+Code - OSS-*/
+Code-OSS-*/
+*.tar.gz
+*.tar.xz
+*.zip
+
 # misc build/test extras
 *.orig
 .stylelintcache
 
+# local openvs workspace configs & state
+.openvs/*.local.*
+.openvs/secrets/
+.openvs/tokens.json
+.openvs/mcp.local.json
+.openvs/history/
+
+# AI agent & assistant caches
+.gemini/
+.cursor/
+.cline/
+.roo/
+
 # graphify
 graphify-out/
 .graphify/
+
 

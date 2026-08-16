@@ -34,7 +34,8 @@ const OPENVS_CHAT_VIEW_ID = 'openvsChat.view';
  * Identifier of the openvs-chat view container, kept in sync with the view
  * container registration in `extensions/openvs-chat`.
  */
-const OPENVS_CHAT_CONTAINER_ID = 'openvsChat';
+const OPENVS_CHAT_CONTAINER_ID = 'workbench.view.extension.openvsChat';
+const OPENVS_CHAT_CONTAINER_RAW_ID = 'openvsChat';
 
 /**
  * Identifier of the OpenVS chat toggle — the title-bar button and the Command
@@ -201,6 +202,11 @@ export class OpenVSChatRedirectContribution extends Disposable implements IWorkb
 		}
 	}
 
+	private getOpenVSChatContainer() {
+		return this.viewDescriptorService.getViewContainerById(OPENVS_CHAT_CONTAINER_ID)
+			?? this.viewDescriptorService.getViewContainerById(OPENVS_CHAT_CONTAINER_RAW_ID);
+	}
+
 	/**
 	 * Moves the openvs-chat view container to the AuxiliaryBar (secondary
 	 * sidebar) if it exists and is still at its default location — the spot
@@ -211,7 +217,7 @@ export class OpenVSChatRedirectContribution extends Disposable implements IWorkb
 	 * changes so a later manual move by the user is respected.
 	 */
 	private relocateOpenVSChatContainer(): void {
-		const container = this.viewDescriptorService.getViewContainerById(OPENVS_CHAT_CONTAINER_ID);
+		const container = this.getOpenVSChatContainer();
 		if (!container) {
 			return;
 		}
@@ -252,6 +258,9 @@ export class OpenVSChatRedirectContribution extends Disposable implements IWorkb
 			return;
 		}
 
-		this.paneCompositePartService.openPaneComposite(OPENVS_CHAT_CONTAINER_ID, ViewContainerLocation.AuxiliaryBar, false);
+		const container = this.getOpenVSChatContainer();
+		if (container) {
+			this.paneCompositePartService.openPaneComposite(container.id, ViewContainerLocation.AuxiliaryBar, false);
+		}
 	}
 }

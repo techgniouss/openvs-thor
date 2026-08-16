@@ -47,7 +47,7 @@
   },
   "contributes": {
     "viewsContainers": {
-      "activitybar": [
+      "secondarySidebar": [
         {
           "id": "openvsChat",
           "title": "%viewsContainers.chat.title%",
