@@ -3,17 +3,24 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { Codicon } from '../../../../base/common/codicons.js';
+import { KeyCode, KeyMod } from '../../../../base/common/keyCodes.js';
 import { Disposable, MutableDisposable } from '../../../../base/common/lifecycle.js';
-import { localize } from '../../../../nls.js';
+import { localize, localize2 } from '../../../../nls.js';
+import { Action2, MenuId, MenuRegistry, registerAction2 } from '../../../../platform/actions/common/actions.js';
 import { CommandsRegistry } from '../../../../platform/commands/common/commands.js';
+import { ContextKeyExpr } from '../../../../platform/contextkey/common/contextkey.js';
 import { ServicesAccessor } from '../../../../platform/instantiation/common/instantiation.js';
+import { KeybindingWeight } from '../../../../platform/keybinding/common/keybindingsRegistry.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
 import { Registry } from '../../../../platform/registry/common/platform.js';
 import { IWorkbenchContribution } from '../../../common/contributions.js';
 import { Extensions as ViewExtensions, IViewContainersRegistry, IViewDescriptorService, ViewContainerLocation } from '../../../common/views.js';
 import { IChatEntitlementService } from '../../../services/chat/common/chatEntitlementService.js';
+import { IWorkbenchLayoutService, Parts } from '../../../services/layout/browser/layoutService.js';
+import { IPaneCompositePartService } from '../../../services/panecomposite/browser/panecomposite.js';
 import { IViewsService } from '../../../services/views/common/viewsService.js';
-import { ACTION_ID_OPEN_CHAT, CHAT_OPEN_ACTION_ID, getOpenChatActionIdForMode } from './actions/chatActions.js';
+import { ACTION_ID_OPEN_CHAT, CHAT_CATEGORY, CHAT_OPEN_ACTION_ID, getOpenChatActionIdForMode } from './actions/chatActions.js';
 import { ChatViewContainerId } from './chat.js';
 import { ChatMode } from '../common/chatModes.js';
 
@@ -28,6 +35,90 @@ const OPENVS_CHAT_VIEW_ID = 'openvsChat.view';
  * container registration in `extensions/openvs-chat`.
  */
 const OPENVS_CHAT_CONTAINER_ID = 'openvsChat';
+
+/**
+ * Identifier of the OpenVS chat toggle — the title-bar button and the Command
+ * Palette entry both run this. Deliberately *not* one of the native chat
+ * command ids: those are rerouted below, but their actions carry a
+ * `ChatContextKeys.enabled` precondition that `chat.disableAIFeatures` turns
+ * off, which hides them from the palette and disables their keybindings.
+ */
+const OPENVS_CHAT_TOGGLE_ACTION_ID = 'workbench.action.openvsChat.toggle';
+
+/**
+ * Reveals the openvs-chat webview and focuses it. If the openvs-chat extension
+ * is disabled or uninstalled, {@link IViewsService.openView} resolves to
+ * `null`; surface that to the user instead of silently doing nothing.
+ */
+async function openOpenVSChatView(accessor: ServicesAccessor): Promise<void> {
+	// Both services are resolved up front: the accessor is only valid
+	// synchronously, so nothing may be read off it after the await below.
+	const viewsService = accessor.get(IViewsService);
+	const notificationService = accessor.get(INotificationService);
+
+	const view = await viewsService.openView(OPENVS_CHAT_VIEW_ID, true);
+	if (!view) {
+		notificationService.info(localize('openvsChatUnavailable', "The OpenVS Chat view is unavailable. Check that the openvs-chat extension is installed and enabled."));
+	}
+}
+
+/**
+ * Opens the openvs-chat view, or closes it when it is already the visible
+ * secondary-side-bar view — the same toggle behavior the native chat button
+ * has, so a second click on the title-bar icon puts the editor back to full
+ * width.
+ */
+registerAction2(class ToggleOpenVSChatAction extends Action2 {
+
+	constructor() {
+		super({
+			id: OPENVS_CHAT_TOGGLE_ACTION_ID,
+			title: localize2('openvsChat.toggle', "Open Chat with Agent"),
+			category: CHAT_CATEGORY,
+			icon: Codicon.chatSparkle,
+			f1: true,
+			keybinding: {
+				weight: KeybindingWeight.WorkbenchContrib,
+				primary: KeyMod.CtrlCmd | KeyMod.Alt | KeyCode.KeyI,
+				mac: { primary: KeyMod.CtrlCmd | KeyMod.WinCtrl | KeyCode.KeyI }
+			}
+		});
+	}
+
+	override async run(accessor: ServicesAccessor): Promise<void> {
+		const viewsService = accessor.get(IViewsService);
+		if (viewsService.isViewVisible(OPENVS_CHAT_VIEW_ID)) {
+			viewsService.closeView(OPENVS_CHAT_VIEW_ID);
+			return;
+		}
+
+		await openOpenVSChatView(accessor);
+	}
+});
+
+// Title-bar chat button. The command center is on by default and hosts the
+// button next to the search box (where Copilot's sits); when it is turned off
+// the same action falls back to the global title-bar toolbar, mirroring how
+// the native chat entry is registered.
+MenuRegistry.appendMenuItem(MenuId.CommandCenter, {
+	command: {
+		id: OPENVS_CHAT_TOGGLE_ACTION_ID,
+		title: localize('openvsChat.titleBar', "Chat"),
+		icon: Codicon.chatSparkle
+	},
+	order: 10001
+});
+
+MenuRegistry.appendMenuItem(MenuId.TitleBar, {
+	command: {
+		id: OPENVS_CHAT_TOGGLE_ACTION_ID,
+		title: localize('openvsChat.titleBarFallback', "Chat"),
+		icon: Codicon.chatSparkle
+	},
+	group: 'navigation',
+	when: ContextKeyExpr.has('config.window.commandCenter').negate(),
+	order: 1
+});
 
 /**
  * Redirects the native chat entry points to the openvs-chat webview and
@@ -48,6 +139,8 @@ export class OpenVSChatRedirectContribution extends Disposable implements IWorkb
 	constructor(
 		@IChatEntitlementService chatEntitlementService: IChatEntitlementService,
 		@IViewDescriptorService private readonly viewDescriptorService: IViewDescriptorService,
+		@IPaneCompositePartService private readonly paneCompositePartService: IPaneCompositePartService,
+		@IWorkbenchLayoutService private readonly layoutService: IWorkbenchLayoutService,
 	) {
 		super();
 
@@ -79,7 +172,7 @@ export class OpenVSChatRedirectContribution extends Disposable implements IWorkb
 			'inlineChat.start', // ACTION_START in contrib/inlineChat/common/inlineChat.ts (not exported)
 			'interactiveEditor.start', // legacy alias of inlineChat.start
 		]) {
-			this._register(CommandsRegistry.registerCommand(commandId, this.openOpenVSChatView));
+			this._register(CommandsRegistry.registerCommand(commandId, openOpenVSChatView));
 		}
 
 		// The extension may not have registered its view container yet; listen
@@ -130,21 +223,35 @@ export class OpenVSChatRedirectContribution extends Disposable implements IWorkb
 		}
 
 		this.relocateListener.clear();
+
+		this.fillEmptyAuxiliaryBar();
 	}
 
 	/**
-	 * Reveals the openvs-chat webview, standing in for the native chat open
-	 * command. Kept as a reusable method so other redirects (e.g. menu-based
-	 * overrides) can invoke the same behavior. If the openvs-chat extension is
-	 * disabled or uninstalled, {@link IViewsService.openView} resolves to
-	 * `null`; surface that to the user instead of silently doing nothing.
+	 * Opens openvs-chat in the secondary side bar when that bar is showing but
+	 * has no active view container.
+	 *
+	 * The workbench decides what to restore into the secondary side bar during
+	 * `initLayout`, long before the extension host starts: with nothing stored
+	 * for the workspace it falls back to the location's *default* container,
+	 * which upstream is the native chat container — the one
+	 * {@link hideNativeChatContainer} deregisters moments later. The restore
+	 * then finds nothing to open and the bar renders empty, which is what a
+	 * first run in every new workspace would otherwise look like.
+	 *
+	 * Deliberately narrow: it never reveals a bar the user has hidden, never
+	 * displaces a container the user is looking at, and does not take focus —
+	 * the editor keeps it on startup.
 	 */
-	private openOpenVSChatView = async (accessor: ServicesAccessor): Promise<void> => {
-		const viewsService = accessor.get(IViewsService);
-		const view = await viewsService.openView(OPENVS_CHAT_VIEW_ID, true);
-		if (!view) {
-			const notificationService = accessor.get(INotificationService);
-			notificationService.info(localize('openvsChatUnavailable', "The OpenVS Chat view is unavailable. Check that the openvs-chat extension is installed and enabled."));
+	private fillEmptyAuxiliaryBar(): void {
+		if (!this.layoutService.isVisible(Parts.AUXILIARYBAR_PART)) {
+			return;
 		}
-	};
+
+		if (this.paneCompositePartService.getActivePaneComposite(ViewContainerLocation.AuxiliaryBar)) {
+			return;
+		}
+
+		this.paneCompositePartService.openPaneComposite(OPENVS_CHAT_CONTAINER_ID, ViewContainerLocation.AuxiliaryBar, false);
+	}
 }

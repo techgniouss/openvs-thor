@@ -21,12 +21,13 @@ import {
  * Scope of this implementation, kept honest rather than guessed:
  *  - Tool calling (`runAgentStep`) uses the public Gemini API's function-calling wire
  *    shape (`tools: [{ functionDeclarations }]`, response parts carrying
- *    `functionCall: { name, args }`) — this is a best-effort port, NOT verified against
- *    the internal Code Assist API specifically. The inference: every field already
- *    confirmed correct here (`contents`, `generationConfig`, role names) matches the
- *    public API's naming exactly, suggesting they share the same proto schema, but
- *    that's a plausibility argument, not a live test. If tool calls silently fail to
- *    round-trip, this is the first place to look.
+ *    `functionCall: { name, args }`) — this is a best-effort port, NOT fully verified
+ *    against the internal Code Assist API. One divergence is confirmed live: this
+ *    endpoint rejects the public API's 'function' role for tool results with an
+ *    explicit HTTP 400 naming its own role enum — see {@link AntigravityContent}'s
+ *    role type for the fix and what is still unverified about it. `contents` shape,
+ *    `generationConfig` and the 'user'/'model' role names otherwise match the public
+ *    API and are accepted as-is.
  *  - No true token streaming. `generateContent` (non-streaming) is used and the whole
  *    answer is delivered as one `onToken` call; the SSE variant
  *    (`streamGenerateContent?alt=sse`) exists but its event shape isn't verified here.
@@ -299,9 +300,20 @@ interface AntigravityPart {
 }
 
 interface AntigravityContent {
-	// 'function' carries tool RESULTS back to the model — distinct from 'model', which
-	// carries the tool CALLS the model made. Matches the public Gemini API's chat shape.
-	readonly role: 'user' | 'model' | 'function';
+	// The public Gemini API has a third role, 'function', for tool RESULTS — this
+	// endpoint is not that API. Confirmed live: it rejects 'function' outright
+	// (HTTP 400 "Role 'function' is not supported. Please use a valid role: SYSTEM,
+	// SYSTEM_1, USER, ASSISTANT, DEVELOPER, CONTEXT, USER_CONTEXT, MODEL, USER"),
+	// while plain 'user'/'model' turns are accepted as-is (lowercase, unchanged) —
+	// the error only ever names the unrecognized role, never these two. There is no
+	// enum member obviously meaning "tool result" in that list, so a tool result is
+	// sent as a 'user' turn instead, same as Anthropic's Messages API models a
+	// `tool_result` as a `user`-role content block rather than a role of its own —
+	// plausible here too, since this gateway's own model catalog serves Claude
+	// models (`claude-sonnet-4-6`) alongside Gemini ones through the one shape.
+	// Unverified beyond that inference: 'USER_CONTEXT' is the next thing to try if
+	// 'user' turns out to be wrong too — see the class doc's caveat on this file.
+	readonly role: 'user' | 'model';
 	readonly parts: AntigravityPart[];
 }
 
@@ -339,10 +351,10 @@ function toContents(messages: ChatMessage[]): AntigravityContent[] {
 			continue;
 		}
 		if (m.role === 'tool') {
-			// Multiple consecutive tool results (a batched step's parallel calls) merge into
-			// one 'function' turn — the model issued them together, so the response should
-			// come back together too.
-			append('function', [{ functionResponse: { name: toolNameById.get(m.toolCallId ?? '') ?? 'unknown', response: { content: m.content } } }]);
+			// Sent as a 'user' turn — see the role type's doc for why. Multiple consecutive
+			// tool results (a batched step's parallel calls) merge into one turn either way:
+			// the model issued them together, so the response should come back together too.
+			append('user', [{ functionResponse: { name: toolNameById.get(m.toolCallId ?? '') ?? 'unknown', response: { content: m.content } } }]);
 			continue;
 		}
 		if (m.role === 'assistant' && m.toolCalls?.length) {

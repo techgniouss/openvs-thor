@@ -5,7 +5,7 @@
 
 import { McpToolset } from '../mcp/manager';
 import { SUBAGENT_PREAMBLE } from '../persona/prompts';
-import { stripThinking } from '../persona/thinking';
+import { stripThinking, stripThinkingTags } from '../persona/thinking';
 import { TodoItem, UPDATE_TODOS_TOOL, parseTodoUpdate } from '../persona/todos';
 import { extractTextToolCalls } from '../providers/toolCalls';
 import { AgentStep, CONTINUE_PROMPT, ChatProvider, ChatMessage, ToolCall, ToolSpec, endsInRepeatLoop, isAbortError, isTransientProviderError } from '../providers/types';
@@ -187,6 +187,20 @@ const COMPLETION_CHECK_PROMPT =
 	'decision from the user, call ask_user instead of describing the question.';
 
 /**
+ * Prose that announces an action instead of taking it ("now I'll update the config").
+ * That — not "are you finished?" — is what {@link COMPLETION_CHECK_PROMPT} exists to
+ * catch, and on a run that has not called a single tool it is the only thing worth a
+ * round trip: a conversational turn ("hi", or any question answered in one reply) matches
+ * nothing here and ends with the one reply it deserves, instead of coming back a second
+ * time to report on changes that were never made.
+ *
+ * Broad, but every alternative names a subject that is doing the intending. "going to" on
+ * its own matched "this is going to be tricky", which is an observation about the work,
+ * not a promise to do it — and it appears in plenty of finished answers.
+ */
+const STATED_INTENT = /\b(?:I(?:'|’)?ll\b|I will\b|we(?:'|’)?ll\b|we will\b|(?:I(?:'|’)?m|I am|we(?:'|’)?re|we are) (?:going to|about to)\b|let me\b|let(?:'|’)?s\b|now I\b|next,? I\b|I(?:'|’)?m about to\b|proceed to\b|(?:I|we) (?:should|need to|can) (?:now )?(?:start|begin|update|add|fix|run|check)\b|start(?:ing)? (?:by|with)\b|begin(?:ning)? (?:by|with)\b)/i;
+
+/**
  * How many times each reason may push the model back to work within one quiet stretch.
  *
  * One each. Every nudge is a full round trip at the most expensive moment of the run —
@@ -279,6 +293,15 @@ interface AgentOptions {
 	budget?: SubagentBudget;
 	/** Read-only sub-agents get only inspection tools and can't spawn or write. */
 	readOnly?: boolean;
+	/**
+	 * This run was handed work to do, so prose with no tool call is always pushed back on
+	 * — the completion gate does not first ask whether the run was a conversation.
+	 *
+	 * For the Auto pipeline's implementer, which is given a plan and told to carry it out:
+	 * there, unlike a chat turn, "already done" with nothing to show for it is exactly the
+	 * claim worth one more round trip to test.
+	 */
+	expectsWork?: boolean;
 	/** Connected MCP servers whose tools are offered alongside the built-ins. */
 	mcp?: McpToolset;
 	/**
@@ -339,6 +362,8 @@ export class AgentRunner {
 	private readonly depth: number;
 	private readonly budget: SubagentBudget;
 	private readonly readOnly: boolean;
+	/** Whether this run was handed work, so the completion gate never treats it as chat. */
+	private readonly expectsWork: boolean;
 	private readonly mcp?: McpToolset;
 	private readonly steering?: () => string[];
 	private readonly contextWindow: number;
@@ -378,6 +403,12 @@ export class AgentRunner {
 	private todos: TodoItem[] = [];
 	/** True once this run wrote to the workspace with no successful verification run since. */
 	private unverifiedWrites = false;
+	/**
+	 * True once any tool has actually run in this run. What separates an abandoned task
+	 * from a conversation: a turn that answered in prose without touching a single tool
+	 * was never doing work that could be left half-done.
+	 */
+	private didToolWork = false;
 	/**
 	 * Commands that ran successfully since the last write. Kept because whether a command
 	 * counts as verification can only be judged fully against the workspace's own detected
@@ -421,6 +452,7 @@ export class AgentRunner {
 		this.depth = opts?.depth ?? 0;
 		this.budget = opts?.budget ?? { spawned: 0 };
 		this.readOnly = opts?.readOnly ?? false;
+		this.expectsWork = opts?.expectsWork ?? false;
 		this.mcp = opts?.mcp;
 		this.steering = opts?.steering;
 		this.contextBudget = opts?.maxContextTokens ?? DEFAULT_CONTEXT_TOKENS;
@@ -775,7 +807,7 @@ export class AgentRunner {
 				// or never verified what it wrote — push back before believing it's done.
 				// Read-only Ask/Plan and research sub-agents legitimately end with a prose
 				// answer, so they finish immediately (no wasted round).
-				const nudge = await this.completionNudge();
+				const nudge = await this.completionNudge(result.content);
 				if (nudge) {
 					step++;
 					messages.push({ role: 'user', content: nudge });
@@ -787,6 +819,7 @@ export class AgentRunner {
 			// Real tool work means the model is engaged again: let every nudge reason arm
 			// itself afresh for the next quiet stretch.
 			this.nudgeCounts.clear();
+			this.didToolWork = true;
 			step++;
 
 			const outcomes = await this.runTools(result.toolCalls, params, callbacks);
@@ -820,8 +853,11 @@ export class AgentRunner {
 	 * (it changed code and never checked it), then the generic "did you actually finish"
 	 * catch. Each reason is capped by {@link MAX_NUDGES_PER_REASON} per quiet stretch so
 	 * a model that will not comply still terminates.
+	 *
+	 * `lastText` is the prose the model just produced, which decides whether the generic
+	 * catch fires at all on a run that has done no tool work — see {@link genericNudge}.
 	 */
-	private async completionNudge(): Promise<string | undefined> {
+	private async completionNudge(lastText: string): Promise<string | undefined> {
 		if (this.readOnly) {
 			return undefined;
 		}
@@ -839,7 +875,7 @@ export class AgentRunner {
 			// the ordinary "are you actually finished?" instead of inventing a chore.
 			const commands = await this.verificationCommands();
 			if (!commands.length) {
-				return this.takeNudge('generic') ? COMPLETION_CHECK_PROMPT : undefined;
+				return this.genericNudge(lastText);
 			}
 			// The name-shape test is a heuristic and cannot know a project's own conventions.
 			// A command the workspace itself advertises counts even when the shape test
@@ -849,6 +885,33 @@ export class AgentRunner {
 			} else {
 				return this.takeNudge('verify') ? verifyPrompt(commands) : undefined;
 			}
+		}
+		return this.genericNudge(lastText);
+	}
+
+	/**
+	 * The generic "are you actually finished?" prompt, or undefined when asking it would
+	 * be pure cost.
+	 *
+	 * A run that has not called a single tool is a conversation, not an abandoned task:
+	 * the model was asked something and answered it. Nudging there bought a second request
+	 * and a second reply on every greeting, question and "thanks" — the second one being a
+	 * summary of changes that were never made, which reads as the assistant reporting on
+	 * work it invented. The exception is prose that states an action it did not take, the
+	 * case the nudge was written for; that is worth the round trip on step one.
+	 *
+	 * Once any tool has run the gate is unconditional, exactly as before: mid-task prose is
+	 * where the model abandons its own plan, and there the round trip pays for itself. So
+	 * is a run started with {@link AgentOptions.expectsWork}, which was handed a task and
+	 * cannot have been a conversation whatever it chose to reply.
+	 */
+	private genericNudge(lastText: string): string | undefined {
+		// Only what the model actually said. Its reasoning is full of "let me check…"
+		// whether or not the answer promises anything, so testing the raw turn would fire
+		// the gate on every step of every model using the <thinking> scaffold — which is
+		// the default, and would have left this fixing nothing.
+		if (!this.expectsWork && !this.didToolWork && !STATED_INTENT.test(stripThinkingTags(lastText))) {
+			return undefined;
 		}
 		return this.takeNudge('generic') ? COMPLETION_CHECK_PROMPT : undefined;
 	}
@@ -1517,6 +1580,10 @@ export class AgentRunner {
 			maxOutputTokens: this.outputCap,
 			contextWindow: this.contextWindow,
 			keepHead: 2,
+			// A delegate is spawned with a goal, never to make conversation, so prose with
+			// no tool call is always worth one push-back. (Read-only delegates end on their
+			// prose answer regardless — the gate returns early for them.)
+			expectsWork: true,
 			// The delegate gets what is *left* of the parent's wall clock, not a fresh
 			// allowance: a fresh one would let a chain of sub-agents multiply the ceiling
 			// out, which is the same mistake the step budget used to make. Floored at one

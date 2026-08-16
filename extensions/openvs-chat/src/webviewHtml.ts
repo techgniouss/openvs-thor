@@ -94,6 +94,7 @@ export const CHAT_APP_HTML = `
 		<main id="messages"></main>
 
 		<footer id="composer">
+			<div id="slashMenu" class="slash-menu hidden" role="listbox" aria-label="Slash commands"></div>
 			<div class="composer-box">
 				<div id="skillChip" class="context-chip hidden"></div>
 				<div id="contextChip" class="context-chip hidden"></div>

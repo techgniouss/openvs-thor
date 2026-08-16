@@ -306,6 +306,10 @@ export class AutoOrchestrator {
 			// instruction); only what the agent produces during the run may be compacted.
 			const runner = new AgentRunner(provider, this.approver, this.maxSteps, {
 				mcp: this.mcp,
+				// This phase was handed a plan and told to carry it out, so "already done"
+				// with no tool call is worth one push-back — the reading that lets a chat
+				// turn end on its first reply must not also let the implementer opt out.
+				expectsWork: true,
 				...this.budgetFor(a, maxTokens),
 				keepHead: seed.length,
 				steering,
@@ -387,6 +391,8 @@ export class AutoOrchestrator {
 			const runner = new AgentRunner(provider, this.approver, this.maxSteps, {
 				budget,
 				mcp: this.mcp,
+				// One step of the same implementer — see runCode.
+				expectsWork: true,
 				...this.budgetFor(a, maxTokens),
 				keepHead: stepSeed.length,
 				steering: params.steering,

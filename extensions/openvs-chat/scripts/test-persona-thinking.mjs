@@ -7,7 +7,7 @@
 //   node extensions/openvs-chat/scripts/test-persona-thinking.mjs
 import assert from 'node:assert/strict';
 
-const { ThinkingStreamParser, formatThinking, stripThinking, stripHistoryThinking } = await import(new URL('../out/persona/thinking.js', import.meta.url));
+const { ThinkingStreamParser, formatThinking, stripThinking, stripThinkingTags, stripHistoryThinking } = await import(new URL('../out/persona/thinking.js', import.meta.url));
 
 /** The rendered open marker, spelled once so the tests below stay readable. */
 const MARK = '🤔 *Thinking…*\n\n';
@@ -117,5 +117,18 @@ console.log('test-persona-thinking: all assertions passed');
 		h([{ role: 'user', content: `${MARK}quoted` }]),
 		[{ role: 'user', content: `${MARK}quoted` }]);
 	assert.deepStrictEqual(h([]), []);
+}
+
+// stripThinkingTags: the raw form, read by the agent loop before anything reformats it.
+{
+	assert.deepStrictEqual(
+		[
+			stripThinkingTags('<thinking>Let me check the config.</thinking>\n\nHello!'),
+			stripThinkingTags('<thinking>never closed, so all of it is reasoning'),
+			stripThinkingTags('Plain answer, no tags.'),
+			stripThinkingTags('a<thinking>one</thinking>b<thinking>two</thinking>c'),
+		],
+		['Hello!', '', 'Plain answer, no tags.', 'abc'],
+		'raw reasoning blocks are removed, closed or not, however many');
 }
 console.log('test-persona-thinking stripThinking: all assertions passed');
