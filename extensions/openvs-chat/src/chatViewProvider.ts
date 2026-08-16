@@ -17,6 +17,7 @@ import { McpManager } from './mcp/manager';
 import { supportsNativeSignIn } from './oauth';
 import { buildEnvContext } from './persona/envContext';
 import { modeDoctrine, personaBase } from './persona/prompts';
+import { smallTalkKind } from './persona/smallTalk';
 import { ThinkingStreamParser, formatThinking, stripHistoryThinking, stripThinking } from './persona/thinking';
 import { ProviderRegistry } from './providers/registry';
 import { ChatMessage, ChatProvider, ModelEntry, entrySupportsTools, isAbortError, modelSupportsVision } from './providers/types';
@@ -153,6 +154,81 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	 * by whichever run drains it, which is the old behaviour.
 	 */
 	private readonly steerQueues = new Map<string, Array<{ runId: string; text: string }>>();
+
+	/**
+	 * The runs that will actually drain {@link steerQueues}, by tab.
+	 *
+	 * Steering only reaches a live agent loop. A run without one — Ask, Plan, an inline
+	 * edit, or an Auto greeting answered with a single reply — leaves anything typed into
+	 * it sitting in the queue until the next run deletes it, so the message rendered as
+	 * delivered and then vanished.
+	 *
+	 * Absence means "not steerable". That direction matters: a path that never declares
+	 * itself gets the safe answer, so the next kind of run someone adds cannot reintroduce
+	 * the silent drop by forgetting about this. Declared at the head of the send, before
+	 * the prompt is assembled, because a correction typed during those seconds belongs to
+	 * the loop that is about to start and is drained when it does.
+	 */
+	private readonly steerableRuns = new Map<string, string>();
+
+	/**
+	 * Records whether this run can be steered and tells the tab, which until now assumed it
+	 * could — the composer offers live steering off that assumption.
+	 */
+	private declareSteerable(sessionId: string, runId: string, steerable: boolean, post: SessionPost): void {
+		if (steerable) {
+			this.steerableRuns.set(sessionId, runId);
+		} else if (this.steerableRuns.get(sessionId) === runId) {
+			this.steerableRuns.delete(sessionId);
+		}
+		post({ type: 'steerable', steerable });
+	}
+
+	/**
+	 * Discards steering left over from earlier runs in this tab, keeping what was typed
+	 * into `runId` itself.
+	 *
+	 * A loop used to clear the whole queue as it started, which also threw away anything
+	 * typed in the seconds between the send and the first request — assembling the prompt
+	 * reads rules files, probes the environment and may compact, so that window is real.
+	 * Those messages were meant for exactly this run.
+	 */
+	private dropForeignSteering(sessionId: string, runId: string): void {
+		const queued = this.steerQueues.get(sessionId);
+		if (!queued?.length) {
+			return;
+		}
+		const mine = queued.filter(entry => !entry.runId || entry.runId === runId);
+		if (mine.length) {
+			this.steerQueues.set(sessionId, mine);
+		} else {
+			this.steerQueues.delete(sessionId);
+		}
+	}
+
+	/** Forgets a finished run's steerability, unless a later run has already claimed the tab. */
+	private clearSteerable(sessionId: string, runId: string): void {
+		if (this.steerableRuns.get(sessionId) === runId) {
+			this.steerableRuns.delete(sessionId);
+		}
+	}
+
+	/**
+	 * Hands back steering this run accepted but never read — typed into its final step, or
+	 * into a run that was stopped or failed before the loop drained again.
+	 *
+	 * The queue is deleted with the run, so without this those corrections disappear as
+	 * completely as the ones the rejection path exists to catch; the difference is only
+	 * where they were lost. Returned, the tab sends them as an ordinary follow-up, which is
+	 * what already happens to anything else typed while a run was in flight.
+	 */
+	private bounceUndelivered(sessionId: string, runId: string, post: SessionPost): void {
+		for (const entry of this.steerQueues.get(sessionId) ?? []) {
+			if (!entry.runId || entry.runId === runId) {
+				post({ type: 'steerRejected', text: entry.text });
+			}
+		}
+	}
 
 	/**
 	 * Drains the steering messages belonging to `runId`, discarding any left behind by a
@@ -688,6 +764,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				break;
 			case 'steer':
 				if (message.sessionId && message.text?.trim()) {
+					// Nothing will drain this: the run has no agent loop. Hand it back rather
+					// than queue it, so the tab can send it as an ordinary follow-up instead
+					// of showing it delivered to a run that cannot receive it. Checked here,
+					// against the run that is actually in flight, so it also covers the gap
+					// between the tab sending and hearing back which shape the run took.
+					if (this.steerableRuns.get(message.sessionId) !== (message.runId ?? '')) {
+						// Spelled as a plain `post({ type: … })`: test-webview derives what the
+						// host can send from exactly that shape, and a call it cannot see is a
+						// message nothing checks the webview still handles.
+						const post = this.sessionPost(message.sessionId, message.runId);
+						post({ type: 'steerRejected', text: message.text.trim() });
+						break;
+					}
 					const queue = this.steerQueues.get(message.sessionId) ?? [];
 					queue.push({ runId: message.runId ?? '', text: message.text.trim() });
 					this.steerQueues.set(message.sessionId, queue);
@@ -938,18 +1027,44 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private async handleSend(message: WebviewToHost): Promise<void> {
-		const mode: ChatMode = message.mode ?? 'ask';
+		const requestedMode: ChatMode = message.mode ?? 'ask';
 		const sessionId = message.sessionId || 'default';
 		// The webview mints the id when it starts the run so it can fence messages from
 		// the moment it sends; the fallback covers programmatic sends (inline actions).
 		const runId = message.runId || newRunId();
 		const post = this.sessionPost(sessionId, runId);
-		const fail = (text: string) => { post({ type: 'error', message: text }); post({ type: 'done' }); };
+		// Every one of these bails out ahead of the try/finally below, so the run's
+		// steerability has to be forgotten here or a failed send would leave the tab
+		// marked steerable for a run that never started.
+		const fail = (text: string) => {
+			this.clearSteerable(sessionId, runId);
+			post({ type: 'error', message: text });
+			post({ type: 'done' });
+		};
 
 		if (message.provider === AUTO_PROVIDER) {
-			await this.handleAutoSend(mode, message, sessionId, runId);
+			await this.handleAutoSend(requestedMode, message, sessionId, runId);
 			return;
 		}
+
+		// A greeting has no task in it to hand a write-capable tool loop: Agent mode would
+		// otherwise let a model spend a step listing the workspace before saying hello, or
+		// — as seen with Mistral — read "hi" itself as a task and start acting on something
+		// nobody asked for. Answered as Ask instead, same as handleAutoSend already does for
+		// Auto. An acknowledgement ("ok", "sounds good") is deliberately excluded: it usually
+		// means *proceed with what you just proposed*, so downgrading it would answer an
+		// approval by silently doing nothing.
+		const history: ChatMessage[] = this.sanitizeHistory(message.messages ?? []);
+		const request = history.at(-1);
+		const talkKind = !message.context && request?.role === 'user' && !request.images?.length
+			? smallTalkKind(request.content) : undefined;
+		const greeting = requestedMode === 'agent' && talkKind === 'greeting';
+		const mode: ChatMode = greeting ? 'ask' : requestedMode;
+
+		// Only Agent mode runs a loop that drains steering (runAgent passes the drain in);
+		// Ask, Plan and inline Edit do not. Declared before the prompt is assembled so a
+		// correction typed during that wait is queued for the loop rather than bounced.
+		this.declareSteerable(sessionId, runId, mode === 'agent', post);
 
 		const providerId = message.provider || this.registry.getDefaultProviderId();
 		const provider = this.registry.getProvider(providerId);
@@ -967,6 +1082,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			return;
 		}
 		if (provider.info.requiresApiKey && !apiKey) {
+			// Bails out before the try/finally too — same reason as `fail`.
+			this.clearSteerable(sessionId, runId);
 			post({
 				type: 'error',
 				message: `No API key for ${provider.info.label}. Open the Providers panel (gear icon) to add a key or sign in.`,
@@ -1002,11 +1119,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		this.activeRequests.set(sessionId, controller);
 
 		try {
-			// Built inside the try: a failure while assembling the prompt (rules file,
-			// environment probe, attached context) must still report an error and a `done`,
-			// or the tab stays stuck "streaming" forever.
-			const history: ChatMessage[] = this.sanitizeHistory(message.messages ?? []);
-			const readTools = (mode === 'ask' || mode === 'plan') && !!provider.runAgentStep && this.modelToolCapable(providerId, provider, model);
+			// `history`, `request` and `talkKind` were already computed above (needed there
+			// to decide the effective mode before steerability is declared). A greeting or a
+			// thank-you needs nothing from the workspace either way — handing it the tool loop
+			// let a model spend a step listing files before saying hello, and charged every
+			// such turn ~1.9k tokens of tool schemas for the privilege.
+			const smallTalk = !!talkKind;
+			const readTools = (mode === 'ask' || mode === 'plan') && !smallTalk && !!provider.runAgentStep && this.modelToolCapable(providerId, provider, model);
 			const systemPrompt = this.buildSystemPrompt(mode, await this.baseSystem(), !!message.inline, readTools);
 			const assembled: ChatMessage[] = [{ role: 'system', content: systemPrompt }];
 			const context = await this.resolveContext(mode, message.context);
@@ -1059,8 +1178,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			// would throw away the new run's steering queue.
 			if (this.activeRequests.get(sessionId) === controller) {
 				this.activeRequests.delete(sessionId);
+				// Not after a Stop. The tab sends a returned message as a follow-up, so
+				// bouncing one here would start a fresh run out of the press that was meant
+				// to end all of it. Aborted, the text simply stays in the transcript.
+				if (!controller.signal.aborted) {
+					this.bounceUndelivered(sessionId, runId, post);
+				}
 				this.steerQueues.delete(sessionId);
 			}
+			this.clearSteerable(sessionId, runId);
 			post({ type: 'done' });
 		}
 	}
@@ -1086,10 +1212,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	 * full plan → implement → review pipeline across the role-routed models; otherwise
 	 * it routes to the single best role model (plan for Ask/Plan, code for inline edits).
 	 */
-	private async handleAutoSend(mode: ChatMode, message: WebviewToHost, sessionId: string, runId: string): Promise<void> {
+	private async handleAutoSend(requestedMode: ChatMode, message: WebviewToHost, sessionId: string, runId: string): Promise<void> {
 		const history: ChatMessage[] = this.sanitizeHistory(message.messages ?? []);
+		// A greeting has no work in it to plan, implement or review: the pipeline spent
+		// three model calls and printed three phase headers to say hello back. It takes the
+		// single-model path below instead, which is what Ask already does here.
+		//
+		// Greetings only. An "ok" or "sounds good" reads as small talk but usually means
+		// *go ahead with what you just proposed* — skipping the pipeline for one of those
+		// would answer approval by doing nothing at all.
+		const request = history.at(-1);
+		const greeting = requestedMode === 'agent' && !message.context
+			&& request?.role === 'user' && !request.images?.length
+			&& smallTalkKind(request.content) === 'greeting';
+		const mode: ChatMode = greeting ? 'ask' : requestedMode;
 		const post = this.sessionPost(sessionId, runId);
 		const fail = (text: string) => { post({ type: 'error', message: text }); };
+		// The implementer phase is the only part of an Auto run that drains steering, so a
+		// greeting — answered with one plain reply — cannot be steered at all. The tab keeps
+		// its Agent mode either way: only the steering changes, so a queued follow-up still
+		// runs as the user asked.
+		this.declareSteerable(sessionId, runId, mode === 'agent', post);
 
 		this.activeRequests.get(sessionId)?.abort();
 		const controller = new AbortController();
@@ -1122,9 +1265,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				let stepThinking: ThinkingStreamParser | undefined;
 				post({ type: 'todos', items: [] });
 				// An Auto run is still an agent run to the user, and the webview offers the
-				// same mid-run steering box. Without draining the queue here those messages
-				// were rendered as delivered and then silently discarded.
-				this.steerQueues.delete(sessionId);
+				// same mid-run steering box. Stragglers from a previous run in this tab go;
+				// what was typed into this one is kept for the implementer to drain.
+				this.dropForeignSteering(sessionId, runId);
 				await orchestrator.run(
 					{
 						history, contextText, baseSystemPrompt: await this.baseSystem(), signal: controller.signal,
@@ -1202,8 +1345,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		} finally {
 			if (this.activeRequests.get(sessionId) === controller) {
 				this.activeRequests.delete(sessionId);
+				// Not after a Stop. The tab sends a returned message as a follow-up, so
+				// bouncing one here would start a fresh run out of the press that was meant
+				// to end all of it. Aborted, the text simply stays in the transcript.
+				if (!controller.signal.aborted) {
+					this.bounceUndelivered(sessionId, runId, post);
+				}
 				this.steerQueues.delete(sessionId);
 			}
+			this.clearSteerable(sessionId, runId);
 			// Auto picks the models, so the run has to say which ones it picked — the per-phase
 			// headers scroll away, and after a fallback they no longer agree with each other.
 			const phases = AUTO_ROLES.flatMap(role => {
@@ -1355,7 +1505,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				...messages.slice(1),
 			];
 		}
-		this.steerQueues.delete(sessionId);
+		// Stragglers from an earlier run in this tab only — a correction typed while this
+		// run was assembling its prompt was meant for this run, and is drained below.
+		this.dropForeignSteering(sessionId, runId);
 		const runner = new AgentRunner(provider, this.approverFor(sessionId, runId, params.signal), maxSteps, {
 			mcp: this.mcp,
 			maxContextTokens: this.configuredContextTokens(params.model, params.maxTokens, provider.info.id),

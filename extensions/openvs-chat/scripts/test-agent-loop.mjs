@@ -127,10 +127,62 @@ const noopCallbacks = () => {
 	assert.strictEqual(provider.seen.length, 1, 'read-only is not nudged');
 }
 
+// 1c. A conversational turn is not a task: a run that never called a tool, answering
+// prose that states no intent to act, ends on its first reply. Nudging one costs a full
+// round trip and answers "hi" with a spurious report about what was changed.
+{
+	const provider = fakeProvider([{ content: 'Hello! What would you like to work on?', toolCalls: [] }]);
+	const runner = new AgentRunner(provider, approver, 10);
+	const result = await runner.run([{ role: 'user', content: 'hi' }], params, noopCallbacks());
+	assert.deepStrictEqual(result, { reason: 'done' }, 'a greeting ends the run');
+	assert.strictEqual(provider.seen.length, 1, 'a greeting costs exactly one request');
+}
+
+// 1c-ii. The same greeting, from a model using the <thinking> scaffold — which is on by
+// default. Reasoning is full of "let me check…" regardless of what the answer promises, so
+// a gate that read the raw turn would fire on every step and fix nothing.
+{
+	const provider = fakeProvider([
+		{ content: '<thinking>The user said hi. Let me greet them and offer help.</thinking>\n\nHello! What are we working on?', toolCalls: [] },
+	]);
+	const runner = new AgentRunner(provider, approver, 10);
+	const result = await runner.run([{ role: 'user', content: 'hi' }], params, noopCallbacks());
+	assert.deepStrictEqual(result, { reason: 'done' });
+	assert.strictEqual(provider.seen.length, 1, 'intent is read from the answer, not the reasoning');
+}
+
+// 1d. Once the run HAS done tool work, plain prose is still nudged — the model summarizing
+// mid-task is the case the gate exists for, whether or not it announced a next step.
+{
+	const provider = fakeProvider([
+		{ content: '', toolCalls: [{ id: 'c0', name: 'list_files', args: { path: '.' } }] },
+		{ content: 'All done.', toolCalls: [] },
+		{ content: 'Yes, finished.', toolCalls: [] },
+	]);
+	const runner = new AgentRunner(provider, approver, 10);
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.deepStrictEqual(result, { reason: 'done' });
+	assert.strictEqual(provider.seen.length, 3, 'a run that did work is still asked to confirm');
+}
+
+// 1e. A run handed work (Auto's implementer, which is given a plan and told to carry it
+// out) is always pushed back on. "Already done" with no tool call is the claim worth a
+// round trip to test — the chat-turn reading above must not let that phase opt out.
+{
+	const provider = fakeProvider([
+		{ content: 'That is already implemented.', toolCalls: [] },
+		{ content: 'Confirmed, nothing left.', toolCalls: [] },
+	]);
+	const runner = new AgentRunner(provider, approver, 10, { expectsWork: true });
+	const result = await runner.run([{ role: 'user', content: 'implement the plan' }], params, noopCallbacks());
+	assert.deepStrictEqual(result, { reason: 'done' });
+	assert.strictEqual(provider.seen.length, 2, 'a run that was handed work is still nudged');
+}
+
 // 2. The nudge is not repeated forever: exactly one per quiet stretch.
 {
 	const provider = fakeProvider([
-		{ content: 'thinking out loud', toolCalls: [] },
+		{ content: 'Let me look at the config.', toolCalls: [] },
 		{ content: 'still just talking', toolCalls: [] },
 		{ content: 'and again', toolCalls: [] },
 	]);
@@ -144,13 +196,15 @@ const noopCallbacks = () => {
 {
 	const steps = [];
 	for (let i = 0; i < 6; i++) { steps.push({ content: `part ${i}`, toolCalls: [], truncated: true }); }
-	steps.push({ content: 'finished', toolCalls: [] }, { content: 'yes really', toolCalls: [] });
+	steps.push({ content: 'finished', toolCalls: [] });
 	const provider = fakeProvider(steps);
-	// maxSteps of 2 would have been exhausted long before step 8 if continuations cost budget.
+	// maxSteps of 2 would have been exhausted long before step 7 if continuations cost budget.
 	const runner = new AgentRunner(provider, approver, 2);
 	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
 	assert.strictEqual(result.reason, 'done', 'continuations do not burn the step budget');
-	assert.strictEqual(provider.seen.length, 8);
+	// Six continuations plus the reply that completed them. No closing nudge: nothing in
+	// this run called a tool, so the final prose is an answer rather than an abandoned task.
+	assert.strictEqual(provider.seen.length, 7);
 }
 
 // 4. A step truncated with EMPTY content is still resumed (it used to end the run silently).
@@ -158,12 +212,11 @@ const noopCallbacks = () => {
 	const provider = fakeProvider([
 		{ content: '', toolCalls: [], truncated: true },
 		{ content: 'recovered', toolCalls: [] },
-		{ content: 'done now', toolCalls: [] },
 	]);
 	const runner = new AgentRunner(provider, approver, 10);
 	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
 	assert.strictEqual(result.reason, 'done');
-	assert.strictEqual(provider.seen.length, 3, 'empty truncated step resumed rather than treated as done');
+	assert.strictEqual(provider.seen.length, 2, 'empty truncated step resumed rather than treated as done');
 }
 
 // 5. Endless truncation gives up with an explanation instead of looping forever.
@@ -929,11 +982,11 @@ const noopCallbacks = () => {
 	const cb = noopCallbacks();
 	const result = await new AgentRunner(provider, approver, 20, { retryDelaysMs: [1] })
 		.run([{ role: 'user', content: 'go' }], params, cb);
-	// Three calls: the failure, the retry, and the one completion nudge a prose-only
-	// answer always earns.
+	// Two calls: the failure and the retry. The recovered answer states no unfinished
+	// intention and the run called no tools, so it is not asked to confirm on top.
 	assert.deepStrictEqual(
 		[result.reason, calls, cb.notes.some(n => /retrying step \(1\/3\)/.test(n))],
-		['done', 3, true],
+		['done', 2, true],
 		'the dropped stream is retried and the run completes',
 	);
 }
@@ -979,7 +1032,10 @@ const noopCallbacks = () => {
 	let steer = ['actually, use TypeScript'];
 	const script = [
 		{ content: 'first half', toolCalls: [], truncated: true, finishReason: 'length' },
-		{ content: 'second half', toolCalls: [] },
+		// The tool call is what makes the run send another request after the continuation
+		// resolves — the one this test reads. A run that only ever talks now stops at the
+		// answer, so the rejoined turn would never appear in a request at all.
+		{ content: 'second half', toolCalls: [{ id: 'c0', name: 'list_files', args: { path: '.' } }] },
 		{ content: 'done', toolCalls: [] },
 	];
 	const provider = fakeProvider(script);

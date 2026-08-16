@@ -35,7 +35,7 @@
 	 * @typedef {{ role: string, label?: string, provider?: string, model?: string, source?: string }} AutoPhase
 	 * @typedef {{ role: 'user'|'assistant', content: string, images?: {mimeType:string,data:string}[], kind?: 'info'|'error'|'auto', phases?: AutoPhase[] }} Msg
 	 * @typedef {{ content: string, status: 'pending'|'in_progress'|'completed' }} Todo
-	 * @typedef {{ id: string, title: string, messages: Msg[], streaming: boolean, pending: string|null, queue: string[], todos?: Todo[], runId?: string, runMode?: string, compactSummary?: string, compactedUpTo?: number }} Session
+	 * @typedef {{ id: string, title: string, messages: Msg[], streaming: boolean, pending: string|null, queue: string[], todos?: Todo[], runId?: string, runMode?: string, steerable?: boolean, compactSummary?: string, compactedUpTo?: number }} Session
 	 */
 	/** All chat tabs. Each can stream independently; only the active one is rendered. @type {Session[]} */
 	let sessions = [];
@@ -149,6 +149,7 @@
 		imageChips: $('imageChips'),
 		attachButton: $('attachButton'),
 		input: /** @type {HTMLTextAreaElement} */ ($('input')),
+		slashMenu: $('slashMenu'),
 		enhanceButton: /** @type {HTMLButtonElement} */ ($('enhanceButton')),
 		sendButton: /** @type {HTMLButtonElement} */ ($('sendButton')),
 		stopButton: /** @type {HTMLButtonElement} */ ($('stopButton')),
@@ -188,25 +189,26 @@
 		// 'edit' was replaced by 'plan' as the middle mode; migrate stale persisted state.
 		mode = persisted.mode === 'edit' ? 'plan' : (persisted.mode || 'ask');
 		selectedProvider = persisted.selectedProvider || '';
-		if (Array.isArray(persisted.sessions) && persisted.sessions.length) {
-			sessions = persisted.sessions.map(s => ({
+		// Conversations themselves are NOT restored into live tabs — every time this view
+		// (re)opens it starts on a fresh chat rather than resuming whatever was on screen
+		// last time. Nothing is lost: each restored session is archived into History first,
+		// same as closing its tab would do, so it's one click away in the 🕘 panel instead
+		// of being the thing the user has to look at (and close) before they can start over.
+		const restored = Array.isArray(persisted.sessions) && persisted.sessions.length
+			? persisted.sessions.map(s => ({
 				id: s.id || newSessionId(),
 				title: s.title || '',
 				messages: Array.isArray(s.messages) ? s.messages : [],
 				streaming: false,
 				pending: null,
 				queue: Array.isArray(s.queue) ? s.queue : [],
-				compactSummary: typeof s.compactSummary === 'string' ? s.compactSummary : undefined,
-				compactedUpTo: typeof s.compactedUpTo === 'number' ? s.compactedUpTo : 0,
-			}));
-			activeSessionId = sessions.some(s => s.id === persisted.activeSessionId)
-				? persisted.activeSessionId
-				: sessions[0].id;
-		} else if (Array.isArray(persisted.messages) && persisted.messages.length) {
-			// Migrate the single-conversation state from before chat tabs existed.
-			const s = { id: newSessionId(), title: '', messages: persisted.messages, streaming: false, pending: null, queue: [] };
-			sessions = [s];
-			activeSessionId = s.id;
+			}))
+			: (Array.isArray(persisted.messages) && persisted.messages.length
+				// Migrate the single-conversation state from before chat tabs existed.
+				? [{ id: newSessionId(), title: '', messages: persisted.messages, streaming: false, pending: null, queue: [] }]
+				: []);
+		for (const s of restored) {
+			archiveSession(s);
 		}
 	}
 	if (!sessions.length) {
@@ -1145,18 +1147,24 @@
 			// cards don't each grow a row nobody but the "point this at my own gateway /
 			// local Ollama" user wants open by default.
 			const hasBaseUrl = p.baseUrlOverride !== undefined;
-			card.innerHTML = `
+			// Cloudflare needs both fields to authenticate, so they share ONE Save button.
+				// Two independent buttons each trigger their own full settings refresh
+				// (saveKey/setCloudflareAccountId both call postConfig), which rebuilds every
+				// provider card from the persisted config — including whichever of the two
+				// fields had not been saved yet, wiping out whatever was still typed there.
+				// One button that saves both together closes that window.
+				card.innerHTML = `
 				<div class="provider-title"><strong>${escapeHtml(p.label)}</strong> ${status}
 					${p.supportsTools ? '<span class="tag">agent</span>' : ''}</div>
 				<div class="provider-row">
 					<input type="password" class="key-input" placeholder="${p.requiresApiKey ? 'Paste API key…' : 'Paste API key… (optional)'}" />
-					<button class="save-key">Save</button>
+					${hasAccountId ? '' : '<button class="save-key">Save</button>'}
 				</div>
 				${hasAccountId ? `
 				<div class="provider-row">
 					<input type="text" class="account-id-input" placeholder="Cloudflare account id…"
 						value="${escapeHtml(p.cloudflareAccountId || '')}" />
-					<button class="save-account-id">Save</button>
+					<button class="save-credentials" title="Saves the API token above together with this account id">Save</button>
 				</div>` : ''}
 				<div class="provider-actions">
 					<button class="sign-in" title="${signInTitle}">${signInLabel}</button>
@@ -1176,14 +1184,22 @@
 					</div>
 				</details>` : ''}`;
 			const keyInput = /** @type {HTMLInputElement} */ (card.querySelector('.key-input'));
-			card.querySelector('.save-key')?.addEventListener('click', () => {
-				vscode.postMessage({ type: 'saveKey', provider: p.id, key: keyInput.value });
-				keyInput.value = '';
-			});
 			if (hasAccountId) {
 				const accountIdInput = /** @type {HTMLInputElement} */ (card.querySelector('.account-id-input'));
-				card.querySelector('.save-account-id')?.addEventListener('click', () => {
+				card.querySelector('.save-credentials')?.addEventListener('click', () => {
+					// The key is optional here (an env var or an already-saved key may cover it),
+					// so an empty box is left alone rather than clearing a stored key — "Clear key"
+					// below already does that explicitly.
+					if (keyInput.value.trim()) {
+						vscode.postMessage({ type: 'saveKey', provider: p.id, key: keyInput.value });
+						keyInput.value = '';
+					}
 					vscode.postMessage({ type: 'setCloudflareAccountId', text: accountIdInput.value.trim() });
+				});
+			} else {
+				card.querySelector('.save-key')?.addEventListener('click', () => {
+					vscode.postMessage({ type: 'saveKey', provider: p.id, key: keyInput.value });
+					keyInput.value = '';
 				});
 			}
 			if (hasBaseUrl) {
@@ -1405,7 +1421,7 @@
 	function placeholderFor() {
 		const s = cur();
 		if (s && s.streaming) {
-			return s.runMode === 'agent'
+			return s.runMode === 'agent' && s.steerable !== false
 				? 'Agent is running — type here to steer it live (Enter to send)…'
 				: 'Streaming — type here to queue your next message (Enter to add)…';
 		}
@@ -1515,11 +1531,47 @@
 			scrollToBottom();
 		}
 		saveState();
+		// Optimistic: the bubble says "delivered" before the host has said it can be. The
+		// host bounces it back (see 'steerRejected') when the run has no agent loop, and
+		// undoSteer puts it in the queue instead — where the user can see and edit it.
 		// Stamped with the run it was typed into, exactly like every other run-scoped
 		// message. Without it a correction typed as one run finished was delivered to
 		// whichever run started next in this tab — the user watched their instruction be
 		// applied to the wrong task.
 		vscode.postMessage({ type: 'steer', sessionId: s.id, runId: s.runId, text });
+	}
+
+	/**
+	 * Takes back a steering message the host could not deliver and queues it as an ordinary
+	 * follow-up, sent when the run finishes. The optimistic turn is removed from both the
+	 * transcript and the DOM first — leaving it would send the model an instruction it was
+	 * never given an answer to, and show the user a message that was silently ignored.
+	 */
+	function undoSteer(s, text) {
+		for (let i = s.messages.length - 1; i >= 0; i--) {
+			const m = s.messages[i];
+			if (m.role === 'user' && m.content === text) {
+				s.messages.splice(i, 1);
+				break;
+			}
+		}
+		if (s.id === activeSessionId) {
+			// The last steering bubble is the one just posted; ids would be a bigger change
+			// to the transcript model than this narrow case is worth.
+			const steering = els.messages.querySelectorAll('.message.steering');
+			steering[steering.length - 1]?.remove();
+		}
+		// The bounce can arrive after the run already ended, and the queue is only drained
+		// by the 'done' that has then been and gone — so send it straight away instead of
+		// leaving it as a chip the user has to notice. Same mode the drain would have used.
+		if (s.streaming) {
+			s.queue.push(text);
+			if (s.id === activeSessionId) { renderQueueChips(); }
+			saveState();
+			return;
+		}
+		saveState();
+		sendText(text, s.runMode && s.runMode !== 'edit' ? { mode: s.runMode } : undefined, s);
 	}
 
 	// ---- Working indicator ------------------------------------------------------
@@ -1916,6 +1968,10 @@
 		// queue. Agent runs steer, everything else queues — Auto included, since its
 		// implementer phase is an agent loop and the orchestrator forwards steering to it.
 		s.runMode = sendMode;
+		// Assume the run can be steered; the host says otherwise (see the 'steerable'
+		// message) for a turn it answers without an agent loop. Reset per run, or one
+		// downgraded turn would leave the tab unable to steer every run after it.
+		s.steerable = true;
 
 		// In Auto mode the per-phase header creates its own bubble; otherwise pre-create one
 		// for non-agent streaming. (openStream only touches the DOM for the visible tab.)
@@ -1948,6 +2004,7 @@
 	}
 
 	function send() {
+		hideSlashMenu();
 		const s = cur();
 		const text = els.input.value.trim();
 		if (!text && !pendingImages.length) { return; }
@@ -1955,7 +2012,7 @@
 		if (s.streaming) {
 			// Mid-run input: steer a live agent run, queue for anything else.
 			if (!text) { return; }
-			if (s.runMode === 'agent') {
+			if (s.runMode === 'agent' && s.steerable !== false) {
 				steer(s, text);
 			} else {
 				s.queue.push(text);
@@ -1999,6 +2056,103 @@
 	}
 
 	const SLASH_INLINE = ['explain', 'fix', 'doc', 'optimize', 'tests'];
+
+	/**
+	 * Every slash command `handleSlash` recognizes, with a one-line description — the
+	 * catalog the composer's autocomplete menu filters and shows. Kept as its own list
+	 * (rather than derived from `handleSlash`'s branches) because a command's *description*
+	 * has no natural home inside that dispatch logic.
+	 */
+	const SLASH_COMMANDS = [
+		{ cmd: 'ask', desc: 'Switch to Ask mode (optionally with a message)' },
+		{ cmd: 'plan', desc: 'Switch to Plan mode' },
+		{ cmd: 'agent', desc: 'Switch to Agent mode' },
+		{ cmd: 'auto', desc: 'Use Auto — role-routed plan → implement → review' },
+		{ cmd: 'explain', desc: 'Explain the current editor selection' },
+		{ cmd: 'fix', desc: 'Fix the current editor selection' },
+		{ cmd: 'doc', desc: 'Document the current editor selection' },
+		{ cmd: 'optimize', desc: 'Optimize the current editor selection' },
+		{ cmd: 'tests', desc: 'Write tests for the current editor selection' },
+		{ cmd: 'enhance', desc: 'Rewrite your draft into a sharper prompt' },
+		{ cmd: 'skills', desc: 'List available skills' },
+		{ cmd: 'skill', desc: 'Activate a skill — "off" clears all, "new" creates one' },
+		{ cmd: 'mcp', desc: 'MCP server status — "add" registers, "reconnect" retries' },
+		{ cmd: 'history', desc: 'Reopen a previous conversation' },
+		{ cmd: 'clear', desc: 'Clear this chat tab (saved to History)' },
+		{ cmd: 'help', desc: 'Show all slash commands' },
+	];
+	/** Filtered matches currently shown in the slash menu, and which one is highlighted. */
+	let slashMatches = [];
+	let slashIndex = 0;
+
+	function slashMenuOpen() {
+		return !!els.slashMenu && !els.slashMenu.classList.contains('hidden');
+	}
+
+	function hideSlashMenu() {
+		if (!els.slashMenu || els.slashMenu.classList.contains('hidden')) { return; }
+		els.slashMenu.classList.add('hidden');
+		els.slashMenu.innerHTML = '';
+		slashMatches = [];
+	}
+
+	function renderSlashMenu() {
+		els.slashMenu.innerHTML = '';
+		for (let i = 0; i < slashMatches.length; i++) {
+			const c = slashMatches[i];
+			const row = document.createElement('div');
+			row.className = 'slash-item' + (i === slashIndex ? ' active' : '');
+			row.setAttribute('role', 'option');
+			row.innerHTML = `<span class="slash-cmd">/${escapeHtml(c.cmd)}</span><span class="slash-desc">${escapeHtml(c.desc)}</span>`;
+			// mousedown, not click: it fires before the textarea would blur, so preventing
+			// it here keeps focus (and the caret) in the composer instead of tearing the
+			// menu down before the click is read.
+			row.addEventListener('mousedown', (e) => {
+				e.preventDefault();
+				slashIndex = i;
+				applySlashSelection();
+			});
+			els.slashMenu.appendChild(row);
+		}
+	}
+
+	/**
+	 * Shows or hides the slash-command menu for the composer's current content.
+	 *
+	 * Only while the whole draft is still just `/` plus the command word being typed —
+	 * once a space follows, the command is decided and `handleSlash` takes it from there;
+	 * suggesting matches against a command already chosen would be noise, not help.
+	 */
+	function updateSlashMenu() {
+		if (!els.slashMenu) { return; }
+		const m = /^\/(\w*)$/.exec(els.input.value);
+		if (!m) { hideSlashMenu(); return; }
+		const partial = m[1].toLowerCase();
+		slashMatches = SLASH_COMMANDS.filter(c => c.cmd.startsWith(partial));
+		if (!slashMatches.length) { hideSlashMenu(); return; }
+		slashIndex = 0;
+		renderSlashMenu();
+		els.slashMenu.classList.remove('hidden');
+	}
+
+	function moveSlashSelection(delta) {
+		if (!slashMatches.length) { return; }
+		slashIndex = (slashIndex + delta + slashMatches.length) % slashMatches.length;
+		renderSlashMenu();
+	}
+
+	/** Completes the composer with the highlighted command, ready for its argument. */
+	function applySlashSelection() {
+		const chosen = slashMatches[slashIndex];
+		if (!chosen) { return; }
+		els.input.value = '/' + chosen.cmd + ' ';
+		hideSlashMenu();
+		autoSize();
+		els.input.focus();
+		const len = els.input.value.length;
+		els.input.setSelectionRange(len, len);
+	}
+
 	/** Handles a leading slash command. Returns true if it consumed the input. */
 	function handleSlash(text) {
 		const m = /^\/(\w+)\s*([\s\S]*)$/.exec(text);
@@ -2234,8 +2388,30 @@
 	els.enhanceButton.addEventListener('click', enhance);
 	els.sendButton.addEventListener('click', send);
 	els.stopButton.addEventListener('click', () => vscode.postMessage({ type: 'stop', sessionId: activeSessionId }));
-	els.input.addEventListener('input', autoSize);
+	els.input.addEventListener('input', () => { autoSize(); updateSlashMenu(); });
+	els.input.addEventListener('blur', hideSlashMenu);
 	els.input.addEventListener('keydown', (e) => {
+		if (slashMenuOpen()) {
+			if (e.key === 'ArrowDown') { e.preventDefault(); moveSlashSelection(1); return; }
+			if (e.key === 'ArrowUp') { e.preventDefault(); moveSlashSelection(-1); return; }
+			if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
+				e.preventDefault();
+				// The command is already fully typed and unambiguous ("/ask" with only
+				// "ask" matching) — Enter sends it, same as it would with the menu closed.
+				// Completing it instead (a no-op: it already reads "/ask") would eat the
+				// Enter and leave the user pressing it a second time to actually send.
+				// Tab never sends — it only completes, so it stays predictable either way.
+				const chosen = slashMatches[slashIndex];
+				if (e.key === 'Enter' && chosen && els.input.value.toLowerCase() === '/' + chosen.cmd) {
+					hideSlashMenu();
+					send();
+				} else {
+					applySlashSelection();
+				}
+				return;
+			}
+			if (e.key === 'Escape') { e.preventDefault(); hideSlashMenu(); return; }
+		}
 		if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
 	});
 
@@ -2362,7 +2538,7 @@
 	 */
 	const CHAT_ONLY_MESSAGES = [
 		'token', 'agentStepStart', 'agentStepEnd', 'toolStart', 'toolEnd',
-		'done', 'newChat', 'inline', 'autoPhase', 'autoSummary', 'editProposal', 'compacted',
+		'done', 'newChat', 'inline', 'autoPhase', 'autoSummary', 'editProposal', 'compacted', 'steerable', 'steerRejected',
 		'approvalRequest', 'askRequest', 'promptCancel',
 	];
 
@@ -2465,7 +2641,27 @@
 				if (s.id === activeSessionId) { appendAutoSummary(msg.phases); }
 				break;
 			}
-			case 'agentStepStart': {
+			case 'steerable': {
+			// The host answered this turn without an agent loop even though the tab sent it
+			// as one — a greeting in Auto. Steering only reaches a live loop, so input typed
+			// into this run has to be queued instead; `runMode` deliberately stays as it was,
+			// since a queued follow-up must still run in the mode the user picked.
+			const s = sessionFor(msg);
+			if (!s) { break; }
+			s.steerable = !!msg.steerable;
+			// Not persisted, and must not be: saveState keeps only the transcript-shaped
+			// fields, and a reload restores `streaming: false` with no `runMode` at all —
+			// so the reloaded tab cannot steer anything regardless of this flag.
+			if (s.id === activeSessionId) { updateComposer(); }
+			break;
+		}
+		case 'steerRejected': {
+			const s = sessionFor(msg);
+			if (!s || typeof msg.text !== 'string') { break; }
+			undoSteer(s, msg.text);
+			break;
+		}
+		case 'agentStepStart': {
 				// Open a fresh streaming bubble for the implementer's next step.
 				const s = sessionFor(msg);
 				if (!s) { break; }

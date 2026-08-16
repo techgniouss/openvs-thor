@@ -21,12 +21,17 @@ import {
  * Scope of this implementation, kept honest rather than guessed:
  *  - Tool calling (`runAgentStep`) uses the public Gemini API's function-calling wire
  *    shape (`tools: [{ functionDeclarations }]`, response parts carrying
- *    `functionCall: { name, args }`) — this is a best-effort port, NOT verified against
- *    the internal Code Assist API specifically. The inference: every field already
- *    confirmed correct here (`contents`, `generationConfig`, role names) matches the
- *    public API's naming exactly, suggesting they share the same proto schema, but
- *    that's a plausibility argument, not a live test. If tool calls silently fail to
- *    round-trip, this is the first place to look.
+ *    `functionCall: { name, args }`) — this is a best-effort port, NOT fully verified
+ *    against the internal Code Assist API. One divergence is confirmed live: this
+ *    endpoint rejects the public API's 'function' role for tool results with an
+ *    explicit HTTP 400 naming its own role enum — see {@link AntigravityContent}'s
+ *    role type for the fix and what is still unverified about it. `contents` shape,
+ *    `generationConfig` and the 'user'/'model' role names otherwise match the public
+ *    API and are accepted as-is. Gemini 3 models additionally require a `thoughtSignature`
+ *    echoed back on every replayed `functionCall` part — confirmed live (HTTP 400 "Function
+ *    call is missing a thought_signature"); handled by capturing it onto {@link ToolCall.signature}
+ *    in `extractResult` and echoing it (or {@link SKIP_THOUGHT_SIGNATURE} when none was
+ *    captured) in `toContents`.
  *  - No true token streaming. `generateContent` (non-streaming) is used and the whole
  *    answer is delivered as one `onToken` call; the SSE variant
  *    (`streamGenerateContent?alt=sse`) exists but its event shape isn't verified here.
@@ -125,6 +130,22 @@ const GENERATE_ENDPOINTS = [ENDPOINT_DAILY, ENDPOINT_PROD];
 const LOAD_ENDPOINTS = [ENDPOINT_PROD, ENDPOINT_DAILY];
 
 const ANTIGRAVITY_VERSION = '1.19.4';
+
+/**
+ * Google's documented escape hatch for a `functionCall` part that has no real
+ * `thoughtSignature` to echo back — confirmed via community reports against this exact
+ * error (e.g. https://github.com/earendil-works/pi/issues/1829): set as the value and the
+ * API skips validation instead of 400ing, at the cost of the "degraded model performance"
+ * the error text warns about. Needed for:
+ *  - History replayed from before this file captured signatures, or from a saved session/
+ *    another provider that never had one.
+ *  - Parallel tool calls in one step: per confirmed reports, Gemini only stamps a
+ *    signature on the FIRST functionCall part of a batch — the rest are legitimately
+ *    signature-less and would 400 without this fallback.
+ *  - Any {@link ToolCall} synthesized by prose recovery (`agentRunner.recoverTextToolCalls`)
+ *    rather than parsed from a real `functionCall` part.
+ */
+const SKIP_THOUGHT_SIGNATURE = 'skip_thought_signature_validator';
 
 /**
  * Headers that make the Code Assist API accept the request as if it came from the
@@ -248,6 +269,14 @@ async function onboardUser(
 interface GenerateContentPart {
 	readonly text?: string;
 	readonly functionCall?: { readonly name?: string; readonly args?: Record<string, unknown> };
+	/**
+	 * Gemini 3's opaque continuation token for this part. Required to be echoed back on
+	 * the matching `functionCall` part when it's replayed into a later request's history
+	 * — omitting it 400s with "Function call is missing a thought_signature" (see
+	 * https://ai.google.dev/gemini-api/docs/thought-signatures). Carried through on
+	 * {@link ToolCall.signature} rather than interpreted here.
+	 */
+	readonly thoughtSignature?: string;
 }
 
 interface GenerateContentCandidate {
@@ -288,7 +317,7 @@ function extractResult(body: GenerateContentResponse): { text: string; toolCalls
 	// fallback OpenAICompatibleProvider.runAgentStep uses for a backend that omits it.
 	const toolCalls: ToolCall[] = parts
 		.filter((p): p is GenerateContentPart & { functionCall: { name: string } } => typeof p.functionCall?.name === 'string')
-		.map((p, i) => ({ id: `call_${i}`, name: p.functionCall.name, args: p.functionCall.args ?? {} }));
+		.map((p, i) => ({ id: `call_${i}`, name: p.functionCall.name, args: p.functionCall.args ?? {}, signature: p.thoughtSignature }));
 	return { text, toolCalls, finishReason: mapFinishReason(candidate?.finishReason) };
 }
 
@@ -296,12 +325,25 @@ interface AntigravityPart {
 	readonly text?: string;
 	readonly functionCall?: { readonly name: string; readonly args: Record<string, unknown> };
 	readonly functionResponse?: { readonly name: string; readonly response: Record<string, unknown> };
+	/** Echoed back from {@link GenerateContentPart.thoughtSignature} — see its doc. */
+	readonly thoughtSignature?: string;
 }
 
 interface AntigravityContent {
-	// 'function' carries tool RESULTS back to the model — distinct from 'model', which
-	// carries the tool CALLS the model made. Matches the public Gemini API's chat shape.
-	readonly role: 'user' | 'model' | 'function';
+	// The public Gemini API has a third role, 'function', for tool RESULTS — this
+	// endpoint is not that API. Confirmed live: it rejects 'function' outright
+	// (HTTP 400 "Role 'function' is not supported. Please use a valid role: SYSTEM,
+	// SYSTEM_1, USER, ASSISTANT, DEVELOPER, CONTEXT, USER_CONTEXT, MODEL, USER"),
+	// while plain 'user'/'model' turns are accepted as-is (lowercase, unchanged) —
+	// the error only ever names the unrecognized role, never these two. There is no
+	// enum member obviously meaning "tool result" in that list, so a tool result is
+	// sent as a 'user' turn instead, same as Anthropic's Messages API models a
+	// `tool_result` as a `user`-role content block rather than a role of its own —
+	// plausible here too, since this gateway's own model catalog serves Claude
+	// models (`claude-sonnet-4-6`) alongside Gemini ones through the one shape.
+	// Unverified beyond that inference: 'USER_CONTEXT' is the next thing to try if
+	// 'user' turns out to be wrong too — see the class doc's caveat on this file.
+	readonly role: 'user' | 'model';
 	readonly parts: AntigravityPart[];
 }
 
@@ -339,10 +381,10 @@ function toContents(messages: ChatMessage[]): AntigravityContent[] {
 			continue;
 		}
 		if (m.role === 'tool') {
-			// Multiple consecutive tool results (a batched step's parallel calls) merge into
-			// one 'function' turn — the model issued them together, so the response should
-			// come back together too.
-			append('function', [{ functionResponse: { name: toolNameById.get(m.toolCallId ?? '') ?? 'unknown', response: { content: m.content } } }]);
+			// Sent as a 'user' turn — see the role type's doc for why. Multiple consecutive
+			// tool results (a batched step's parallel calls) merge into one turn either way:
+			// the model issued them together, so the response should come back together too.
+			append('user', [{ functionResponse: { name: toolNameById.get(m.toolCallId ?? '') ?? 'unknown', response: { content: m.content } } }]);
 			continue;
 		}
 		if (m.role === 'assistant' && m.toolCalls?.length) {
@@ -351,7 +393,10 @@ function toContents(messages: ChatMessage[]): AntigravityContent[] {
 				parts.push({ text: m.content });
 			}
 			for (const tc of m.toolCalls) {
-				parts.push({ functionCall: { name: tc.name, args: tc.args } });
+				// Always present — real signature when we captured one, the sentinel otherwise
+				// (see {@link SKIP_THOUGHT_SIGNATURE}). Never omitted: an omitted field is
+				// exactly what produces the "missing thought_signature" 400 this works around.
+				parts.push({ functionCall: { name: tc.name, args: tc.args }, thoughtSignature: tc.signature || SKIP_THOUGHT_SIGNATURE });
 			}
 			append('model', parts);
 			continue;

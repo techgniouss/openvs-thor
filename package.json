@@ -19,6 +19,8 @@
     "check-cyclic-dependencies": "node build/lib/checkCyclicDependencies.ts out",
     "preinstall": "node build/npm/preinstall.ts",
     "postinstall": "node build/npm/postinstall.ts",
+    "openvs:build": "build-openvs.bat",
+    "openvs:run": "run-openvs.bat",
     "compile": "npm-run-all2 -lp compile-client compile-copilot",
     "compile-client": "npm run gulp compile",
     "compile-copilot": "npm --prefix extensions/copilot run compile",

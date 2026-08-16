@@ -698,6 +698,35 @@ body.settings-window #settingsPanel {
 .hint { font-size: 0.8em; color: var(--vscode-descriptionForeground); }
 .hint code, .provider-actions code { font-family: var(--vscode-editor-font-family, monospace); }
 
+/* ---- Slash command menu ---- */
+/* Anchored to #composer (not .composer-box) so it floats above the whole footer,
+   including the mode/provider bar, instead of overlapping it. */
+#composer { position: relative; }
+.slash-menu {
+	position: absolute; left: 8px; right: 8px; bottom: 100%; margin-bottom: 6px;
+	max-height: 220px; overflow-y: auto; z-index: 10;
+	border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, #3c3c3c));
+	border-radius: 8px; background: var(--vscode-editorWidget-background, var(--vscode-dropdown-background));
+	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+}
+.slash-item {
+	display: flex; align-items: baseline; gap: 8px;
+	padding: 5px 10px; cursor: pointer;
+}
+.slash-item:hover { background: var(--vscode-list-hoverBackground, rgba(127, 127, 127, 0.12)); }
+.slash-item.active {
+	background: var(--vscode-list-activeSelectionBackground, rgba(78, 161, 255, 0.25));
+	color: var(--vscode-list-activeSelectionForeground, inherit);
+}
+.slash-cmd {
+	flex: 0 0 auto; font-family: var(--vscode-editor-font-family, monospace);
+	font-weight: 600;
+}
+.slash-desc {
+	flex: 1 1 auto; min-width: 0; font-size: 0.85em; color: var(--vscode-descriptionForeground);
+	overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
 /* ---- Context chip ---- */
 .context-chip {
 	margin: 0 0 4px; padding: 4px 8px; font-size: 0.85em;

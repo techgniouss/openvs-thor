@@ -147,6 +147,29 @@ export function stripThinking(text: string): string {
 	return text.replace(THINKING_BLOCK, '').trim();
 }
 
+/**
+ * Matches a raw reasoning block as the model emitted it. An unclosed tag runs to the end
+ * of the text: a turn that opened one and never closed it was reasoning throughout.
+ *
+ * Case-sensitive, like {@link ThinkingStreamParser}'s own tag search. Matching `<Thinking>`
+ * here and not there would mean this module rendered a block it claims to have stripped.
+ */
+const RAW_THINKING_BLOCK = /<thinking>[\s\S]*?(?:<\/thinking>|$)/g;
+
+/**
+ * Removes raw `<thinking>…</thinking>` blocks. The counterpart to {@link stripThinking},
+ * which works on the rendered markers a committed reply carries: this one operates on what
+ * the model actually emitted, which is what the agent loop sees before anything reformats
+ * it. Anything reading a turn for what the model *said* has to go through here first —
+ * reasoning is full of sentences the model never meant as an answer.
+ */
+export function stripThinkingTags(text: string): string {
+	if (!text.includes(OPEN_TAG)) {
+		return text;
+	}
+	return text.replace(RAW_THINKING_BLOCK, '').trim();
+}
+
 /** The subset of a chat message {@link stripHistoryThinking} needs; keeps this module free of provider imports. */
 interface HistoryMessage {
 	role: string;

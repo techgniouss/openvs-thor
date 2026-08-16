@@ -22,6 +22,7 @@
   "commands.createSkill": "Create New Skill",
   "commands.mcpAdd": "MCP: Add Server",
   "commands.mcpOpenConfig": "MCP: Open Project Config",
+  "commands.generateCommitMessage": "Generate Commit Message",
   "config.skills": "Custom skills (named instruction packs) as `{ id, name, description, instructions }`. They appear in the skill picker and `/skill <id>`, and override built-ins with the same id. Skills can also live in `.openvs/skills/<id>.md`.",
   "config.mcp.servers": "Global MCP (Model Context Protocol) servers, as a map of `id` → `{ command, args, env, cwd }`. Their tools become available to the agent (namespaced `mcp__<id>__<tool>`). Projects can add servers via `.openvs/mcp.json` or `.vscode/mcp.json`. stdio servers only start in a trusted workspace.",
   "config.provider.openai": "OpenAI (ChatGPT)",
