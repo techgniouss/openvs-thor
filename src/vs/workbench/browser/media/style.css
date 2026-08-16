@@ -353,3 +353,18 @@ body {
 	outline: 1px dashed var(--vscode-toolbar-hoverOutline);
 	outline-offset: -1px;
 }
+
+/* OpenVS Thor Chat / Application Icon */
+.codicon-openvs-chat:before {
+	content: '' !important;
+	display: inline-block;
+	width: 16px;
+	height: 16px;
+	background-color: currentColor;
+	-webkit-mask: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0Ij48cGF0aCBmaWxsPSJibGFjayIgZmlsbC1ydWxlPSJldmVub2RkIiBkPSJNMTIgMS41QTEwLjUgMTAuNSAwIDEgMCAyMi41IDEyIDEwLjUgMTAuNSAwIDAgMCAxMiAxLjVabTAgMS44YTguNyA4LjcgMCAxIDEgLTguNyA4LjcgOC43IDguNyAwIDAgMSA4LjctOC43Wm0tMS4yIDMuMiAyLjggMC0xLjIgMy41aDIuMkwxMC44IDE2LjVsMS4yLTQuNUg5LjhMMTAuOCA2LjVaIE01LjggNS44bDIuNyA0LjItMS41IDEuNS0yLjItMy4ydi0yLjVabTEyLjQgMHYyLjVsLTIuMiAzLjItMS41LTEuNSAyLjctNC4yWiBNNy41IDEzLjVsMS41IDMuNSAzIDIuNSAzLTIuNSAxLjUtMy41SDE1bC0zIDIuOC0zLTIuOEg3LjVaIi8+PC9zdmc+") no-repeat 50% 50%;
+	mask: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0Ij48cGF0aCBmaWxsPSJibGFjayIgZmlsbC1ydWxlPSJldmVub2RkIiBkPSJNMTIgMS41QTEwLjUgMTAuNSAwIDEgMCAyMi41IDEyIDEwLjUgMTAuNSAwIDAgMCAxMiAxLjVabTAgMS44YTguNyA4LjcgMCAxIDEgLTguNyA4LjcgOC43IDguNyAwIDAgMSA4LjctOC43Wm0tMS4yIDMuMiAyLjggMC0xLjIgMy41aDIuMkwxMC44IDE2LjVsMS4yLTQuNUg5LjhMMTAuOCA2LjVaIE01LjggNS44bDIuNyA0LjItMS41IDEuNS0yLjItMy4ydi0yLjVabTEyLjQgMHYyLjVsLTIuMiAzLjItMS41LTEuNSAyLjctNC4yWiBNNy41IDEzLjVsMS41IDMuNSAzIDIuNSAzLTIuNSAxLjUtMy41SDE1bC0zIDIuOC0zLTIuOEg3LjVaIi8+PC9zdmc+") no-repeat 50% 50%;
+	-webkit-mask-size: contain;
+	mask-size: contain;
+	vertical-align: middle;
+}
+

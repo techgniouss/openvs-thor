@@ -20,9 +20,12 @@ import { IChatEntitlementService } from '../../../services/chat/common/chatEntit
 import { IWorkbenchLayoutService, Parts } from '../../../services/layout/browser/layoutService.js';
 import { IPaneCompositePartService } from '../../../services/panecomposite/browser/panecomposite.js';
 import { IViewsService } from '../../../services/views/common/viewsService.js';
+import { registerIcon } from '../../../../platform/theme/common/iconRegistry.js';
 import { ACTION_ID_OPEN_CHAT, CHAT_CATEGORY, CHAT_OPEN_ACTION_ID, getOpenChatActionIdForMode } from './actions/chatActions.js';
 import { ChatViewContainerId } from './chat.js';
 import { ChatMode } from '../common/chatModes.js';
+
+export const openvsChatIcon = registerIcon('openvs-chat', Codicon.zap, localize('openvsChatIcon', "Icon for OpenVS Chat."));
 
 /**
  * Identifier of the openvs-chat sidebar view, kept in sync with the view
@@ -76,7 +79,7 @@ registerAction2(class ToggleOpenVSChatAction extends Action2 {
 			id: OPENVS_CHAT_TOGGLE_ACTION_ID,
 			title: localize2('openvsChat.toggle', "Open Chat with Agent"),
 			category: CHAT_CATEGORY,
-			icon: Codicon.chatSparkle,
+			icon: openvsChatIcon,
 			f1: true,
 			keybinding: {
 				weight: KeybindingWeight.WorkbenchContrib,
@@ -105,7 +108,7 @@ MenuRegistry.appendMenuItem(MenuId.CommandCenter, {
 	command: {
 		id: OPENVS_CHAT_TOGGLE_ACTION_ID,
 		title: localize('openvsChat.titleBar', "Chat"),
-		icon: Codicon.chatSparkle
+		icon: openvsChatIcon
 	},
 	order: 10001
 });
@@ -114,7 +117,7 @@ MenuRegistry.appendMenuItem(MenuId.TitleBar, {
 	command: {
 		id: OPENVS_CHAT_TOGGLE_ACTION_ID,
 		title: localize('openvsChat.titleBarFallback', "Chat"),
-		icon: Codicon.chatSparkle
+		icon: openvsChatIcon
 	},
 	group: 'navigation',
 	when: ContextKeyExpr.has('config.window.commandCenter').negate(),
