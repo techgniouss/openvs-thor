@@ -1,7 +1,10 @@
 <!-- OpenVS Relay — Cloudflare Worker + Durable Object + PWA
-     Placeholder app icon: a single-color rounded square with the initial "V". Real icon assets
-     (a proper mark, PNG/maskable variants for platforms that don't accept SVG manifest icons —
-     notably iOS's apple-touch-icon) are a later polish item, not blocking for this phase. -->
+     Fallback SVG icon (kept for the manifest's "any"/SVG entry and old browsers). The real,
+     branded icon — the same mark used for the desktop app (resources/linux/code.png) — ships as
+     PNG/maskable variants generated from that source: icon-192.png, icon-512.png,
+     icon-512-maskable.png, and apple-touch-icon.png (iOS reads only this last one, never the
+     manifest's icons array). Regenerate all four with scripts/gen-pwa-icons.js if the app icon
+     changes; this placeholder square is unused by any modern install path. -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192">
 	<rect width="192" height="192" rx="36" fill="#111318"/>
 	<text x="96" y="128" font-family="system-ui, sans-serif" font-size="112" font-weight="700" fill="#7dd3fc" text-anchor="middle">V</text>

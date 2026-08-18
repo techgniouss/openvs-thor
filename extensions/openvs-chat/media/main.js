@@ -1881,16 +1881,25 @@
 		// Inline code actions run in the internal 'edit' mode without changing the
 		// session's own mode — they pass it as an override instead.
 		const sendMode = (opts && opts.mode) || s.mode || 'ask';
-		const images = pendingImages.length ? pendingImages.slice() : undefined;
+		// `pendingImages`/`currentContext` are both singleton "what's attached to the composer
+		// right now" state, not per-session — this function isn't always called for the *active*
+		// tab (`undoSteer`'s resend and the `done` handler's queue drain below both pass a
+		// `target` that can be a background session finishing while the user is looking at, and
+		// attaching an image or context to, a different one entirely). Taking them
+		// unconditionally used to mean a background tab's resend could silently staple whatever
+		// the user had staged for their *current* composer onto an unrelated chat, and then
+		// clear it out from under them.
+		const isActiveSend = s.id === activeSessionId;
+		const images = (isActiveSend && pendingImages.length) ? pendingImages.slice() : undefined;
 		s.messages.push({ role: 'user', content: text, images });
 		if (!s.title && text) {
 			s.title = text.length > 28 ? text.slice(0, 27) + '…' : text;
 		}
-		if (s.id === activeSessionId) {
+		if (isActiveSend) {
 			appendMessageEl('user', text, images);
+			pendingImages = [];
+			renderImageChips();
 		}
-		pendingImages = [];
-		renderImageChips();
 		// Remember how this run was started so mid-run input knows whether to steer or
 		// queue. Agent runs steer, everything else queues — Auto included, since its
 		// implementer phase is an agent loop and the orchestrator forwards steering to it.
@@ -1927,7 +1936,7 @@
 			mode: sendMode,
 			provider: selectedProvider,
 			model: els.modelSelect.value,
-			context: currentContext || undefined,
+			context: (isActiveSend && currentContext) || undefined,
 			inline: !!(opts && opts.inline),
 			text: text,
 			images: images,

@@ -6,8 +6,11 @@
 // refetches real content from `/api/pending` and only then shows a notification.
 'use strict';
 
-const CACHE_NAME = 'openvs-relay-shell-v1';
-const SHELL_ASSETS = ['/', '/index.html', '/app.js', '/transcript.js', '/cards.js', '/styles.css', '/manifest.webmanifest'];
+const CACHE_NAME = 'openvs-relay-shell-v2';
+const SHELL_ASSETS = [
+	'/', '/index.html', '/app.js', '/transcript.js', '/cards.js', '/styles.css', '/manifest.webmanifest',
+	'/icon.svg', '/icon-192.png', '/icon-512.png', '/icon-512-maskable.png', '/apple-touch-icon.png',
+];
 
 self.addEventListener('install', event => {
 	event.waitUntil(

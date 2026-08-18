@@ -84,7 +84,9 @@ input, textarea, select {
 	display: flex;
 	align-items: center;
 	justify-content: space-between;
-	padding: 10px 12px;
+	/* status-bar-style is black-translucent (index.html) — content draws under the iOS
+	   notch/Dynamic Island without this, since only the composer pads safe-area-inset-bottom. */
+	padding: calc(10px + env(safe-area-inset-top)) 12px 10px;
 	border-bottom: 1px solid var(--border);
 }
 

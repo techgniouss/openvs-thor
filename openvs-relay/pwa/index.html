@@ -1,9 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>OpenVS Remote</title>
 <link rel="manifest" href="/manifest.webmanifest">
 <meta name="theme-color" content="#111318">
+<!-- iOS Safari ignores the manifest's "display": "standalone" entirely — without this meta tag
+     an "Add to Home Screen" install still opens inside Safari chrome (URL bar, tab switcher),
+     which also silently breaks Web Push (iOS only allows it from an actually-standalone launch). -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="OpenVS">
+<!-- iOS also ignores the manifest's icons array — needs its own link. -->
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
 
 <div id="pairScreen" class="pair-screen">
 	<h1>OpenVS Remote</h1>
@@ -50,3 +64,5 @@
 </div>
 
 <script type="module" src="/app.js"></script>
+</body>
+</html>
