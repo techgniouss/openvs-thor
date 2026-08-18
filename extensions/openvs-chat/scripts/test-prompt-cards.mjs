@@ -275,6 +275,22 @@ const askRequest = {
 	assert.strictEqual(h.posted.length, 0, 'a cancelled card is inert');
 }
 
+// 9b. A prompt answered on another sink first (first-answer-wins) retires with a distinct
+// message instead of the generic "the run was stopped" — the run wasn't stopped, this sink
+// just lost the race.
+{
+	const h = harness();
+	h.api.render({ ...approvalRequest });
+	h.api.cancel('p1', 'answered');
+	assert.strictEqual(h.posted.length, 0, 'losing the race never replies either');
+	assert.match(h.card().textContent, /Answered on another device/);
+	assert.doesNotMatch(h.card().textContent, /Cancelled/, 'not the generic stop message');
+	assert.strictEqual(h.api.size(), 0);
+	h.api.cancel('p1', 'answered'); // must be idempotent
+	h.card().findAll('prompt-btn').forEach(b => b.fire('click'));
+	assert.strictEqual(h.posted.length, 0, 'an already-retired card is inert');
+}
+
 // 10. Model-supplied text goes through textContent, never innerHTML, so markup in a
 // question is shown literally rather than parsed.
 {

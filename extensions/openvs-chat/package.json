@@ -170,6 +170,21 @@
         "title": "%commands.generateCommitMessage%",
         "category": "OpenVS Thor",
         "icon": "$(sparkle)"
+      },
+      {
+        "command": "openvsChat.remoteEnable",
+        "title": "%commands.remoteEnable%",
+        "category": "OpenVS Thor"
+      },
+      {
+        "command": "openvsChat.remoteStatus",
+        "title": "%commands.remoteStatus%",
+        "category": "OpenVS Thor"
+      },
+      {
+        "command": "openvsChat.remoteDeployRelay",
+        "title": "%commands.remoteDeployRelay%",
+        "category": "OpenVS Thor"
       }
     ],
     "submenus": [
@@ -533,6 +548,56 @@
           "default": false,
           "description": "%config.agent.traceTiming%"
         },
+        "openvsChat.remote.traceSessions": {
+          "type": "boolean",
+          "default": false,
+          "description": "%config.remote.traceSessions%"
+        },
+        "openvsChat.remote.loopback": {
+          "type": "boolean",
+          "default": false,
+          "description": "%config.remote.loopback%"
+        },
+        "openvsChat.remote.promptEscalationSeconds": {
+          "type": "number",
+          "default": 30,
+          "description": "%config.remote.promptEscalationSeconds%"
+        },
+        "openvsChat.remote.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "%config.remote.enabled%"
+        },
+        "openvsChat.remote.relayUrl": {
+          "type": "string",
+          "default": "",
+          "description": "%config.remote.relayUrl%"
+        },
+        "openvsChat.remote.deviceTokenDays": {
+          "type": "number",
+          "default": 30,
+          "description": "%config.remote.deviceTokenDays%"
+        },
+        "openvsChat.remote.idleDisableHours": {
+          "type": "number",
+          "default": 12,
+          "description": "%config.remote.idleDisableHours%"
+        },
+        "openvsChat.remote.approvalFloor": {
+          "type": "string",
+          "enum": [
+            "always",
+            "auto-edits",
+            "yolo"
+          ],
+          "enumDescriptions": [
+            "%config.guardrails.approval.always%",
+            "%config.guardrails.approval.autoEdits%",
+            "%config.guardrails.approval.yolo%"
+          ],
+          "default": "auto-edits",
+          "description": "%config.remote.approvalFloor%"
+        },
         "openvsChat.rules": {
           "type": "string",
           "editPresentation": "multilineText",
@@ -721,7 +786,7 @@
     "compile": "gulp compile-extension:openvs-chat",
     "watch": "gulp watch-extension:openvs-chat",
     "typecheck": "tsc -p ./tsconfig.json --noEmit && npm run typecheck-webview",
-    "typecheck-webview": "tsc --noEmit --ignoreConfig --allowJs --checkJs --noImplicitAny false --strictNullChecks --target es2022 --lib es2022,dom media/main.js media/prompts.js media/webview.d.ts",
+    "typecheck-webview": "tsc --noEmit --ignoreConfig --allowJs --checkJs --noImplicitAny false --strictNullChecks --target es2022 --lib es2022,dom media/main.js media/prompts.js media/qr.js media/pairing.js media/webview.d.ts",
     "pretest": "tsc -p ./tsconfig.json",
     "test": "node ./scripts/run-tests.mjs",
     "vscode:prepublish": "npm run build-ext",

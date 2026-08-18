@@ -860,6 +860,41 @@ details.thinking > summary:hover { color: var(--vscode-foreground); }
 .prompt-option-desc { font-size: 0.85em; opacity: 0.8; }
 .prompt-resolved { font-size: 0.9em; opacity: 0.85; }
 
+/* ---- Remote control (pairing card + status indicator) ---- */
+.remote-status-row { display: flex; align-items: center; gap: 6px; margin: 4px 0 10px; font-size: 0.9em; }
+.remote-error { color: var(--vscode-errorForeground, #f66); font-size: 0.9em; margin: 4px 0 10px; }
+.remote-status-dot {
+	width: 8px; height: 8px; border-radius: 50%; flex: none;
+	background: var(--vscode-descriptionForeground, #888);
+}
+.remote-status-dot.remote-status-connecting { background: var(--vscode-editorWarning-foreground, #cca700); }
+.remote-status-dot.remote-status-connected { background: var(--vscode-testing-iconPassed, #4caf50); }
+.remote-actions { margin-bottom: 10px; }
+.remote-card-mount:empty { display: none; }
+.remote-pairing-card {
+	display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
+	margin: 6px 0 12px; padding: 12px; border-radius: 8px; max-width: 280px;
+	border: 1px solid var(--vscode-focusBorder, #4ea1ff);
+	background: var(--vscode-editorWidget-background, rgba(127,127,127,0.1));
+}
+.remote-pairing-title { font-weight: 600; }
+.remote-pairing-qr { width: 100%; height: auto; max-width: 220px; border-radius: 4px; }
+.remote-pairing-code {
+	font-family: var(--vscode-editor-font-family, monospace); font-size: 1.1em; letter-spacing: 0.08em;
+	user-select: all; padding: 4px 8px; border-radius: 4px;
+	background: var(--vscode-textCodeBlock-background, rgba(0,0,0,0.2));
+}
+.remote-pairing-expiry { font-size: 0.85em; color: var(--vscode-descriptionForeground); }
+.remote-device-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 10px 0 4px; }
+.remote-device-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+.remote-device-empty { margin: 0; }
+.remote-device-row {
+	display: flex; align-items: center; gap: 8px; padding: 4px 8px; border-radius: 4px;
+	background: var(--vscode-editorWidget-background, rgba(127,127,127,0.08));
+}
+.remote-device-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.remote-device-lastseen { font-size: 0.85em; color: var(--vscode-descriptionForeground); flex: none; }
+
 /* ---- Edit apply bar ---- */
 .edit-apply {
 	display: flex; align-items: center; justify-content: space-between; gap: 8px;

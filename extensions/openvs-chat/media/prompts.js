@@ -262,11 +262,18 @@
 				}
 			},
 			/**
-			 * The run was stopped, so the question can no longer be answered.
+			 * The prompt can no longer be answered here. `reason` distinguishes why: a run
+			 * that was stopped (the default, and every reason but the one below) vs. a reply
+			 * that arrived from another sink first — first-answer-wins, so this one lost the
+			 * race rather than being cancelled outright.
 			 * @param {string} id
+			 * @param {string} [reason]
 			 */
-			cancel(id) {
-				retire(id, '✕ Cancelled — the run was stopped.', 'prompt-answered');
+			cancel(id, reason) {
+				const summary = reason === 'answered'
+					? '✓ Answered on another device.'
+					: '✕ Cancelled — the run was stopped.';
+				retire(id, summary, 'prompt-answered');
 			},
 			/** @param {string} id */
 			has(id) { return open.has(id); },
