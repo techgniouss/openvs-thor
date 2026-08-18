@@ -1,0 +1,28 @@
+{
+	"name": "openvs-relay",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-08-17",
+	"compatibility_flags": ["nodejs_compat"],
+	"durable_objects": {
+		"bindings": [
+			{ "name": "ROOMS", "class_name": "WorkspaceRoom" }
+		]
+	},
+	"migrations": [
+		{ "tag": "v1", "new_sqlite_classes": ["WorkspaceRoom"] }
+	],
+	"assets": {
+		"directory": "./pwa",
+		"binding": "ASSETS",
+		"not_found_handling": "single-page-application"
+	},
+	"observability": {
+		"enabled": true
+	}
+	// Secrets are set via `wrangler secret put <NAME>` at deploy time, never committed here:
+	//   RELAY_PEPPER    - HMAC pepper for pairing-code and device-token hashing (tokens.ts, pairing.ts)
+	//   VAPID_PUBLIC    - Web Push VAPID public key, base64url (push.ts)
+	//   VAPID_PRIVATE   - Web Push VAPID private key, JWK (push.ts)
+	//   VAPID_SUBJECT   - Web Push VAPID JWT `sub` claim, e.g. "mailto:you@example.com"
+	//   RELAY_SIGNUP_KEY (optional) - shared key gating who may claim a pairing code
+}

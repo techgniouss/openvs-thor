@@ -1,0 +1,18 @@
+{
+	"name": "OpenVS Remote",
+	"short_name": "OpenVS",
+	"description": "Remote control for the OpenVS Chat panel — babysit an agent run from your phone.",
+	"start_url": "/",
+	"scope": "/",
+	"display": "standalone",
+	"background_color": "#111318",
+	"theme_color": "#111318",
+	"icons": [
+		{
+			"src": "/icon.svg",
+			"sizes": "any",
+			"type": "image/svg+xml",
+			"purpose": "any"
+		}
+	]
+}

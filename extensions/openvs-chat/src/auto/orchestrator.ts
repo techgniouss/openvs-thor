@@ -6,6 +6,7 @@
 import { AgentCallbacks, AgentRunner, RunResult } from '../agent/agentRunner';
 import { streamBudgeted } from '../agent/budgetedStream';
 import { contextBudgetFor, contextWindowFor, requestBudgets } from '../agent/contextWindow';
+import { Guardrails } from '../agent/guardrails';
 import { ToolApprover, asString, commandTextOf, normalizeToolCall } from '../agent/tools';
 import { McpToolset } from '../mcp/manager';
 import { TodoItem } from '../persona/todos';
@@ -88,6 +89,18 @@ export class AutoOrchestrator {
 		private readonly maxRunMs = 0,
 		/** Per-step timing notes, forwarded to every runner this orchestrates. */
 		private readonly traceTiming = false,
+		/**
+		 * The run's already-resolved {@link Guardrails} (the remote approval floor already
+		 * applied, per "Phase 7a" — see `chatViewProvider.ts`'s `guardrailsForRun`). Forwarded
+		 * to every `AgentRunner` this orchestrates, most importantly the implementer phase
+		 * (`runCode`/`runCodeDecomposed`), which is a real write/command-capable tool loop and
+		 * would otherwise fall back to `AgentRunner`'s own `loadGuardrails()` default —
+		 * silently re-reading the unfloored, possibly `yolo`, desktop setting for a run that
+		 * may have been triggered remotely. Optional only so a caller that has no `Guardrails`
+		 * value on hand yet (none exist today) still compiles; `AgentRunner` supplies its own
+		 * default in that case, same as before this parameter existed.
+		 */
+		private readonly guardrails?: Guardrails,
 	) { }
 
 	/** When this Auto run started, so each phase gets what is left rather than a fresh budget. */
@@ -306,6 +319,7 @@ export class AutoOrchestrator {
 			// instruction); only what the agent produces during the run may be compacted.
 			const runner = new AgentRunner(provider, this.approver, this.maxSteps, {
 				mcp: this.mcp,
+				guardrails: this.guardrails,
 				// This phase was handed a plan and told to carry it out, so "already done"
 				// with no tool call is worth one push-back — the reading that lets a chat
 				// turn end on its first reply must not also let the implementer opt out.
@@ -391,6 +405,7 @@ export class AutoOrchestrator {
 			const runner = new AgentRunner(provider, this.approver, this.maxSteps, {
 				budget,
 				mcp: this.mcp,
+				guardrails: this.guardrails,
 				// One step of the same implementer — see runCode.
 				expectsWork: true,
 				...this.budgetFor(a, maxTokens),

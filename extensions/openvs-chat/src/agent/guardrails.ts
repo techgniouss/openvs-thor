@@ -33,6 +33,40 @@ export const DEFAULT_APPROVAL: ApprovalPolicy = 'yolo';
 export const APPROVAL_POLICIES: readonly ApprovalPolicy[] = ['always', 'auto-edits', 'yolo'];
 
 /**
+ * Where a run was initiated from — the desktop webview sitting next to the machine's owner,
+ * or a remote client (a paired phone, today the only "not webview" sink; see
+ * `chatViewProvider.ts`'s classification at the send call sites). This is a run-level
+ * property, decided once at send time, not re-derived per approval check: re-evaluating it
+ * per tool call would let a mid-run settings change retroactively loosen a run that is
+ * already in flight.
+ */
+export type RunOrigin = 'local' | 'remote';
+
+/**
+ * Strictness rank for {@link ApprovalPolicy}, lowest index strictest. `always` prompts for
+ * everything; `yolo` prompts for nothing. Kept as an explicit array (looked up by
+ * `indexOf`) rather than compared as strings, since neither the enum's declaration order
+ * nor alphabetical order happens to match strictness.
+ */
+const APPROVAL_STRICTNESS: readonly ApprovalPolicy[] = ['always', 'auto-edits', 'yolo'];
+
+/**
+ * Resolves the approval policy a run actually executes under: for a `local` (webview)
+ * origin this is always exactly `configured` — the desktop user's own setting, unchanged,
+ * because a local run must never regress. For a `remote` origin, the stricter of
+ * `configured` and `floor` wins, so a remotely-initiated run can never end up looser than
+ * `openvsChat.remote.approvalFloor` even when the desktop's own `guardrails.approval` is
+ * `yolo` — see this file's header on why `yolo` is defensible only when the person who can
+ * see and veto every action is the one who triggered it.
+ */
+export function applyApprovalFloor(configured: ApprovalPolicy, origin: RunOrigin, floor: ApprovalPolicy): ApprovalPolicy {
+	if (origin === 'local') {
+		return configured;
+	}
+	return APPROVAL_STRICTNESS.indexOf(configured) <= APPROVAL_STRICTNESS.indexOf(floor) ? configured : floor;
+}
+
+/**
  * Reads a stored policy. A value written by an older build (`auto-readonly`) resolves to
  * the rung that matches how it actually behaved, rather than falling through to the
  * default and quietly *loosening* a setting the user chose to tighten.

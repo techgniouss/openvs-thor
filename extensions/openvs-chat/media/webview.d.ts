@@ -70,8 +70,49 @@ declare const OpenVSPrompts: {
 		render(request: OpenVSPromptRequest): any;
 		track(request: OpenVSPromptRequest): void;
 		reattach(sessionId: string): void;
-		cancel(id: string): void;
+		cancel(id: string, reason?: string): void;
 		has(id: string): boolean;
 		size(): number;
+	};
+};
+
+/** A freshly minted pairing code, as answered by the host's `remote` message's `pairing` field. */
+interface OpenVSPairingResult {
+	code: string;
+	expiresAt: number;
+	url: string;
+}
+
+/** One paired device, as answered by the host's `remote` message's `devices` field (Phase 7c). */
+interface OpenVSDeviceInfo {
+	id: string;
+	name: string;
+	createdAt: number;
+	lastSeenAt: number | null;
+	revokedAt: number | null;
+}
+
+/** Byte-mode QR encoder (ECC level L, versions 1-6), provided by `media/qr.js`. */
+declare const OpenVSQr: {
+	encode(text: string): { size: number; modules: boolean[][] };
+};
+
+/**
+ * Remote-control status indicator + pairing card, provided by `media/pairing.js`, which the
+ * host loads after `media/qr.js` and before `media/main.js`.
+ */
+declare const OpenVSPairing: {
+	create(deps: {
+		container: { appendChild(node: any): void };
+		post: (message: any) => void;
+		now?: () => number;
+	}): {
+		update(payload: {
+			enabled: boolean;
+			connected: boolean;
+			idleDisabled?: boolean;
+			pairing?: OpenVSPairingResult;
+			devices?: OpenVSDeviceInfo[];
+		}): void;
 	};
 };

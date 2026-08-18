@@ -35,9 +35,25 @@
 	 * @typedef {{ role: string, label?: string, provider?: string, model?: string, source?: string }} AutoPhase
 	 * @typedef {{ role: 'user'|'assistant', content: string, images?: {mimeType:string,data:string}[], kind?: 'info'|'error'|'auto', phases?: AutoPhase[] }} Msg
 	 * @typedef {{ content: string, status: 'pending'|'in_progress'|'completed' }} Todo
-	 * @typedef {{ id: string, title: string, messages: Msg[], streaming: boolean, pending: string|null, queue: string[], todos?: Todo[], runId?: string, runMode?: string, steerable?: boolean, compactSummary?: string, compactedUpTo?: number }} Session
+	 * @typedef {{ id: string, title: string, messages: Msg[], streaming: boolean, pending: string|null, queue: string[], todos?: Todo[], runId?: string, runMode?: string, steerable?: boolean, compactSummary?: string, compactedUpTo?: number, mode?: string }} Session
 	 */
-	/** All chat tabs. Each can stream independently; only the active one is rendered. @type {Session[]} */
+	/**
+	 * All chat tabs — the RENDERING CACHE, not the source of truth. Session ownership lives
+	 * on the extension host now (`SessionStore`); this array and `activeSessionId` are written
+	 * only by the `sessions`/`transcript` message handlers below, never mutated locally except
+	 * for a few small optimistic UI updates (e.g. `setMode`) that the next `sessions` push
+	 * confirms or corrects.
+	 *
+	 * Both start empty and stay that way until the host's first `sessions` + `transcript` push
+	 * arrives — a reply to the `ready` message posted at the very end of this file's init, one
+	 * message round-trip, same process, typically a handful of milliseconds. That window is
+	 * real, though: `cur()` returns `undefined` until then, so every function that calls it has
+	 * to tolerate that rather than assume a session already exists (see the guards in
+	 * `renderAll`, `updateComposer`, `renderQueueChips`, `sendText`, `send`, `enhance`). Nothing
+	 * here fabricates a placeholder session to paper over the gap — that would just reintroduce
+	 * the local ownership this refactor exists to retire.
+	 * @type {Session[]}
+	 */
 	let sessions = [];
 	let activeSessionId = '';
 	/** @type {{mimeType:string,data:string}[]} pending image attachments for the next send */
@@ -48,7 +64,9 @@
 	/** @type {any[]} */
 	let providers = [];
 	let selectedProvider = '';
-	let mode = 'ask';
+	/** The slash-command catalog, pushed by the host's `commands` message (single source of
+	 * truth — this used to be a hardcoded local list; see `SLASH_COMMANDS` in `src/session/slash.ts`). */
+	let slashCommands = [];
 	/** @type {{ roles: any[], reviewEnabled: boolean, decompose?: boolean }} */
 	let autoConfig = { roles: [], reviewEnabled: true };
 	/** Current agent approval level (synced from `openvsChat.guardrails.approval`). */
@@ -74,8 +92,14 @@
 
 	function newSessionId() { return 's' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
 	function newRunId() { return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8); }
-	/** The active session (always exists after init). */
+	/**
+	 * The active session, or `undefined` during the brief bootstrap window before the host's
+	 * first `sessions` push has arrived (see the doc on `sessions` above) — no longer
+	 * guaranteed to exist the way it was when the webview minted its own session locally.
+	 */
 	function cur() { return sessions.find(s => s.id === activeSessionId) || sessions[0]; }
+	/** The active session's chat mode, or 'ask' as a sane default before `cur()` exists. */
+	function curMode() { return (cur() && cur().mode) || 'ask'; }
 	/**
 	 * The session a host message belongs to, or null when it belongs to no live run:
 	 * an unknown tab, or a run that has already been superseded by a newer one. Both
@@ -165,6 +189,7 @@
 		historyPanel: $('historyPanel'),
 		closeHistory: $('closeHistory'),
 		historyList: $('historyList'),
+		remotePanel: $('remotePanel'),
 	};
 	/** @type {{id:string,name:string,description:string}[]} */
 	let skillsList = [];
@@ -173,119 +198,56 @@
 	let enhancing = false;
 
 	/**
-	 * Closed conversations, newest first: `{ id, title, messages, savedAt }`. Persisted
-	 * in webview state (survives reloads and restarts) and shown in the History panel
-	 * and the empty-state "Recent chats" list.
+	 * Closed conversations, newest first: `{ id, title, messages, savedAt }`. No longer
+	 * persisted client-side — the host owns the archive (`workspaceState`) now. This is a
+	 * read-only mirror of its `history` push, shown in the History panel and the empty-state
+	 * "Recent chats" list.
 	 * @type {{id:string,title:string,messages:Msg[],savedAt:number}[]}
 	 */
 	let history = [];
-	const HISTORY_LIMIT = 50;
-
-	const persisted = vscode.getState();
-	if (persisted) {
-		if (Array.isArray(persisted.history)) {
-			history = persisted.history;
-		}
-		// 'edit' was replaced by 'plan' as the middle mode; migrate stale persisted state.
-		mode = persisted.mode === 'edit' ? 'plan' : (persisted.mode || 'ask');
-		selectedProvider = persisted.selectedProvider || '';
-		// Conversations themselves are NOT restored into live tabs — every time this view
-		// (re)opens it starts on a fresh chat rather than resuming whatever was on screen
-		// last time. Nothing is lost: each restored session is archived into History first,
-		// same as closing its tab would do, so it's one click away in the 🕘 panel instead
-		// of being the thing the user has to look at (and close) before they can start over.
-		const restored = Array.isArray(persisted.sessions) && persisted.sessions.length
-			? persisted.sessions.map(s => ({
-				id: s.id || newSessionId(),
-				title: s.title || '',
-				messages: Array.isArray(s.messages) ? s.messages : [],
-				streaming: false,
-				pending: null,
-				queue: Array.isArray(s.queue) ? s.queue : [],
-			}))
-			: (Array.isArray(persisted.messages) && persisted.messages.length
-				// Migrate the single-conversation state from before chat tabs existed.
-				? [{ id: newSessionId(), title: '', messages: persisted.messages, streaming: false, pending: null, queue: [] }]
-				: []);
-		for (const s of restored) {
-			archiveSession(s);
-		}
-	}
-	if (!sessions.length) {
-		const s = { id: newSessionId(), title: '', messages: [], streaming: false, pending: null, queue: [] };
-		sessions = [s];
-		activeSessionId = s.id;
-	}
-	/**
-	 * Total base64 image data kept in persisted state, newest first.
-	 *
-	 * Attachments live in `messages` as base64, and `saveState` serializes every session on
-	 * every commit — so a few 5MB screenshots turned each save into a multi-megabyte
-	 * synchronous write, dozens of times a run. Recent images are the ones still worth
-	 * restoring; older ones are replaced by a marker so the transcript still shows that an
-	 * image was there. In-memory `messages` are untouched, so nothing changes for the
-	 * current session — only what survives a reload.
-	 */
-	const MAX_PERSISTED_IMAGE_BYTES = 2 * 1024 * 1024;
 
 	/**
-	 * Copies `messages` for persistence, keeping image data only while under the budget.
-	 * `budget` is threaded through the caller so the cap is global, not per session.
-	 * @param {Msg[]} messages
-	 * @param {{ left: number }} budget
+	 * Version stamp for `vscode.setState()`'s shape, and the migration marker: once it's
+	 * present, the one-time legacy `adopt` below has already run (or never needed to), so
+	 * that branch can never fire a second time. Bump this if the minimal shape below changes
+	 * in a way an older build's bootstrap check would misread.
 	 */
-	function messagesForState(messages, budget) {
-		const out = [];
-		// Newest first: the tail of the conversation is what a reload most needs intact.
-		for (let i = messages.length - 1; i >= 0; i--) {
-			const m = messages[i];
-			if (!m.images?.length) {
-				out.push(m);
-				continue;
-			}
-			const bytes = m.images.reduce((sum, img) => sum + img.data.length, 0);
-			if (bytes <= budget.left) {
-				budget.left -= bytes;
-				out.push(m);
-			} else {
-				const count = m.images.length;
-				const note = `\n\n_[${count} image${count === 1 ? '' : 's'} not kept after reload]_`;
-				out.push({ role: m.role, content: (m.content || '') + note, kind: m.kind });
-			}
-		}
-		return out.reverse();
-	}
+	const UI_STATE_VERSION = 1;
 
+	/**
+	 * Persists UI-only preferences across reloads — no session/message/history state, which
+	 * is the host's job now (`SessionStore`, kept in `workspaceState`); mirroring a copy here
+	 * would let a stale local cache race the host's authoritative one, exactly what this phase
+	 * exists to stop.
+	 */
 	function saveState() {
-		const budget = { left: MAX_PERSISTED_IMAGE_BYTES };
-		// The budget is spent in order, so spend it on the tab the user is actually looking
-		// at before any background one — otherwise the visible conversation could lose its
-		// screenshot to a tab nobody has open. `sessions` order (and thus the tab strip) is
-		// untouched; only the order the budget is *allocated* in changes.
-		const byPriority = [...sessions].sort((a, b) =>
-			(a.id === activeSessionId ? 0 : 1) - (b.id === activeSessionId ? 0 : 1));
-		/** @type {Map<string, Msg[]>} */
-		const kept = new Map();
-		for (const s of byPriority) {
-			kept.set(s.id, messagesForState(s.messages, budget));
-		}
 		vscode.setState({
-			sessions: sessions.map(s => ({
-				id: s.id,
-				title: s.title,
-				messages: kept.get(s.id) ?? s.messages,
-				queue: s.queue,
-				compactSummary: s.compactSummary,
-				compactedUpTo: s.compactedUpTo,
-			})),
-			activeSessionId,
-			mode,
+			uiStateVersion: UI_STATE_VERSION,
 			selectedProvider,
-			// Archived conversations are never re-sent to a model, so their image bytes buy
-			// nothing at all and are dropped outright.
-			history: history.map(h => ({ ...h, messages: messagesForState(h.messages, { left: 0 }) })),
 		});
 	}
+
+	/**
+	 * One-time migration for a build from before session ownership moved to the host: its
+	 * `vscode.getState()` still has the pre-Phase-2 `{sessions, activeSessionId, mode,
+	 * selectedProvider, history}` shape (see `media/main.js`'s old bootstrap, before this
+	 * rewrite, and `adoptLegacyState` on the host, which knows how to import exactly this
+	 * shape). Hand it to the host once via `adopt` — its reply is the normal `sessions` +
+	 * `transcript` push, so nothing else here needs to touch `sessions`/`history` directly —
+	 * then immediately stamp `vscode.setState()` with the new minimal shape so this branch
+	 * can never fire again. A fresh install or an already-migrated build has no legacy shape
+	 * to find, so nothing is posted and the webview just waits for the `ready`-triggered
+	 * pushes the host already sends.
+	 */
+	const persisted = vscode.getState();
+	if (persisted) {
+		selectedProvider = persisted.selectedProvider || '';
+		if (!persisted.uiStateVersion &&
+			(Array.isArray(persisted.sessions) || Array.isArray(persisted.messages) || Array.isArray(persisted.history))) {
+			vscode.postMessage({ type: 'adopt', state: persisted });
+		}
+	}
+	saveState();
 
 	// ---- Markdown ---------------------------------------------------------------
 
@@ -464,6 +426,12 @@
 		activeAssistantBody = null;
 		toolEls.clear();
 		renderTodos();
+		if (!s) {
+			// Bootstrap window: the host's first `sessions` + `transcript` push hasn't landed
+			// yet (see the doc on `sessions` near the top of this file). Nothing to draw —
+			// `els.messages` is already cleared above — rather than fabricate a local session.
+			return;
+		}
 		const isEmpty = s.messages.length === 0 && s.pending === null;
 		els.messages.classList.toggle('is-empty', isEmpty);
 		if (isEmpty) {
@@ -693,6 +661,13 @@
 		scroll: () => scrollToBottom(),
 	});
 
+	/**
+	 * Remote-control status indicator + "Pair a device" card, built in `media/pairing.js` for
+	 * the same testability reasons as `prompts` above. Lives in the Settings panel
+	 * (`#remotePanel`), not the transcript.
+	 */
+	const pairing = OpenVSPairing.create({ container: els.remotePanel, post: m => vscode.postMessage(m) });
+
 	/** Re-attaches every unanswered card for the active tab after a transcript rebuild. */
 	function renderOpenPrompts() {
 		prompts.reattach(activeSessionId);
@@ -718,27 +693,18 @@
 
 	const tabsEl = $('tabs');
 
+	/**
+	 * Opens a new chat tab. The host owns tab creation now — this just asks for one; its
+	 * reply (`sessions` + `transcript`) is what actually adds the tab and renders it, via
+	 * `case 'sessions':`/`case 'transcript':` below.
+	 */
 	function createSession(activate = true) {
-		const s = { id: newSessionId(), title: '', messages: [], streaming: false, pending: null, queue: [], todos: [] };
-		sessions.push(s);
-		if (activate) {
-			activeSessionId = s.id;
-			renderAll();
-			updateComposer();
-			els.input.focus();
-		}
-		renderTabs();
-		saveState();
-		return s;
+		vscode.postMessage({ type: 'createSession', activate, mode: curMode() });
 	}
 
 	function switchSession(id) {
 		if (id === activeSessionId || !sessions.some(s => s.id === id)) { return; }
-		activeSessionId = id;
-		renderTabs();
-		renderAll();
-		updateComposer();
-		saveState();
+		vscode.postMessage({ type: 'switchSession', sessionId: id });
 	}
 
 	/** Human-friendly relative timestamp for history entries. */
@@ -755,81 +721,33 @@
 	}
 
 	/**
-	 * Saves a session's conversation into history (skips empty / notice-only chats).
-	 * Image attachments are dropped from the archived copy: base64 payloads would bloat
-	 * the persisted state (which is re-serialized on every save) by megabytes per chat.
-	 */
-	function archiveSession(s) {
-		if (!s.messages.some(m => !m.kind)) { return; }
-		history = history.filter(h => h.id !== s.id);
-		history.unshift({
-			id: s.id,
-			title: s.title || (s.messages.find(m => m.role === 'user' && !m.kind)?.content || 'Untitled chat').slice(0, 28),
-			messages: s.messages.map(m => m.images?.length
-				? { role: m.role, content: `🖼 (image attachment not kept in history)\n${m.content}`, kind: m.kind }
-				: m),
-			savedAt: Date.now(),
-		});
-		if (history.length > HISTORY_LIMIT) { history.length = HISTORY_LIMIT; }
-		syncHistory();
-	}
-
-	/**
-	 * Mirrors history to the extension host (workspace state) so saved conversations
-	 * reliably survive window reloads and full editor restarts.
+	 * Mirrors a deletion to the extension host (workspace state) — the *only* thing this
+	 * still does. Archiving a closed/cleared tab into history is the host's own job now
+	 * (`SessionStore`, driven by `closeSession`/`clearSession` below); this is what's left
+	 * for the History panel's delete button, which removes an entry the host doesn't yet
+	 * have its own message for (see the report on this task for why that gap is left as is).
 	 */
 	function syncHistory() {
 		vscode.postMessage({ type: 'saveHistory', history });
 	}
 
-	/** Merges the host's persisted history with local state (newest copy of each chat wins). */
-	function mergeHistory(incoming) {
-		const byId = new Map();
-		for (const h of [...incoming, ...history]) {
-			if (!h || !h.id) { continue; }
-			const prev = byId.get(h.id);
-			if (!prev || (h.savedAt || 0) > (prev.savedAt || 0)) { byId.set(h.id, h); }
-		}
-		history = [...byId.values()].sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0)).slice(0, HISTORY_LIMIT);
-		saveState();
-		syncHistory();
-	}
-
-	/** Reopens a saved conversation from history as a live tab. */
+	/**
+	 * Reopens a saved conversation from history as a live tab. The host owns history and tab
+	 * creation now — this just asks for it; the reply (`sessions` + `transcript`) does the
+	 * actual work, same as `createSession`/`switchSession` above.
+	 */
 	function restoreChat(id) {
-		const index = history.findIndex(h => h.id === id);
-		if (index === -1) { return; }
-		const item = history.splice(index, 1)[0];
-		syncHistory();
-		const s = { id: item.id, title: item.title, messages: item.messages, streaming: false, pending: null, queue: [], todos: [] };
-		sessions.push(s);
-		activeSessionId = s.id;
 		els.historyPanel.classList.add('hidden');
-		renderTabs(); renderAll(); updateComposer(); saveState();
+		vscode.postMessage({ type: 'restoreSession', historyId: id, mode: curMode() });
 		els.input.focus();
 	}
 
+	/**
+	 * Closes a chat tab. The host owns archiving and stopping a streaming run now
+	 * (`SessionStore.closeSession`'s `abortSessionId`) — this just asks for it.
+	 */
 	function closeSession(id) {
-		const index = sessions.findIndex(s => s.id === id);
-		if (index === -1) { return; }
-		// Stop any run still streaming in that tab before dropping it.
-		if (sessions[index].streaming) {
-			vscode.postMessage({ type: 'stop', sessionId: id });
-		}
-		// Closing never loses a conversation: it moves to History (🕘) instead.
-		archiveSession(sessions[index]);
-		sessions.splice(index, 1);
-		if (!sessions.length) {
-			createSession();
-			return;
-		}
-		if (activeSessionId === id) {
-			activeSessionId = sessions[Math.min(index, sessions.length - 1)].id;
-			renderAll();
-			updateComposer();
-		}
-		renderTabs();
-		saveState();
+		vscode.postMessage({ type: 'closeSession', sessionId: id });
 	}
 
 	function renderTabs() {
@@ -1408,7 +1326,6 @@
 			row.querySelector('.history-delete')?.addEventListener('click', (e) => {
 				e.stopPropagation();
 				history = history.filter(x => x.id !== h.id);
-				saveState();
 				syncHistory();
 				renderHistoryPanel();
 			});
@@ -1425,20 +1342,35 @@
 				? 'Agent is running — type here to steer it live (Enter to send)…'
 				: 'Streaming — type here to queue your next message (Enter to add)…';
 		}
-		return mode === 'plan'
+		const m = curMode();
+		return m === 'plan'
 			? 'Describe the requirement to plan (no changes are made)…'
-			: mode === 'agent'
+			: m === 'agent'
 				? 'Give the agent a task (it can read/write/edit files and run commands)…'
 				: 'Ask about your open files… (Enter to send, Shift+Enter for newline)';
 	}
 
-	function setMode(next) {
-		mode = next;
-		els.modeSelect.value = mode;
+	/**
+	 * Reflects the active session's mode in the mode picker and composer without posting a
+	 * change — used whenever something other than the user's own mode pick may have changed
+	 * which session (and thus which mode) is on screen: `switchSession`, `createSession`,
+	 * `restoreSession`, or a `sessions` push from a remote client's own `setMode`.
+	 */
+	function syncModeUI() {
+		const m = curMode();
+		els.modeSelect.value = m;
 		// The permissions pill only matters in Agent mode; keep the bar clean otherwise.
-		els.approvalSelect?.classList.toggle('hidden', mode !== 'agent');
+		els.approvalSelect?.classList.toggle('hidden', m !== 'agent');
 		els.input.placeholder = placeholderFor();
-		saveState();
+	}
+
+	/** Sets the active session's mode: updates locally (optimistic — same-machine, effectively
+	 * synchronous) and tells the host, which is what's authoritative on the next `sessions` push. */
+	function setMode(next) {
+		const s = cur();
+		if (s) { s.mode = next; }
+		syncModeUI();
+		if (s) { vscode.postMessage({ type: 'setMode', sessionId: s.id, mode: next }); }
 	}
 
 	// ---- Context ----------------------------------------------------------------
@@ -1469,7 +1401,8 @@
 
 	function enhance() {
 		const text = els.input.value.trim();
-		if (!text || cur().streaming || enhancing) { return; }
+		const s = cur();
+		if (!text || !s || s.streaming || enhancing) { return; }
 		enhancing = true;
 		els.enhanceButton.disabled = true;
 		els.enhanceButton.classList.add('busy');
@@ -1489,7 +1422,8 @@
 	 * or steer the live agent run.
 	 */
 	function updateComposer() {
-		const on = !!cur().streaming;
+		const s = cur();
+		const on = !!(s && s.streaming);
 		els.sendButton.classList.toggle('hidden', on);
 		els.stopButton.classList.toggle('hidden', !on);
 		els.enhanceButton.disabled = on || enhancing;
@@ -1502,7 +1436,7 @@
 		if (!els.queueChips) { return; }
 		const s = cur();
 		els.queueChips.innerHTML = '';
-		if (!s.queue.length) {
+		if (!s || !s.queue.length) {
 			els.queueChips.classList.add('hidden');
 			return;
 		}
@@ -1941,19 +1875,12 @@
 		saveState();
 	}
 
-	/** The messages actually sent as history: compacted summary (if any) + the un-compacted tail. */
-	function sendableMessages(s) {
-		const real = s.messages.filter(m => !m.kind && !(m.role === 'assistant' && m.content === ''));
-		const tail = real.slice(s.compactedUpTo || 0);
-		return s.compactSummary ? [{ role: 'user', content: s.compactSummary }, ...tail] : tail;
-	}
-
 	function sendText(text, opts, target) {
 		const s = target || cur();
-		if ((!text && !pendingImages.length) || s.streaming) { return; }
+		if (!s || (!text && !pendingImages.length) || s.streaming) { return; }
 		// Inline code actions run in the internal 'edit' mode without changing the
-		// user's selected mode — they pass it as an override instead.
-		const sendMode = (opts && opts.mode) || mode;
+		// session's own mode — they pass it as an override instead.
+		const sendMode = (opts && opts.mode) || s.mode || 'ask';
 		const images = pendingImages.length ? pendingImages.slice() : undefined;
 		s.messages.push({ role: 'user', content: text, images });
 		if (!s.title && text) {
@@ -1990,6 +1917,9 @@
 		// Stamped on every message the host posts back, so a superseded run's stragglers
 		// can be ignored instead of ending the run that replaced it.
 		s.runId = newRunId();
+		// `text`/`images` are the new turn itself — the host appends it to the session store
+		// before reading history back out, since `send` no longer carries the whole
+		// conversation. Must match what was just pushed into `s.messages` above.
 		vscode.postMessage({
 			type: 'send',
 			sessionId: s.id,
@@ -1998,14 +1928,16 @@
 			provider: selectedProvider,
 			model: els.modelSelect.value,
 			context: currentContext || undefined,
-			messages: sendableMessages(s),
 			inline: !!(opts && opts.inline),
+			text: text,
+			images: images,
 		});
 	}
 
 	function send() {
 		hideSlashMenu();
 		const s = cur();
+		if (!s) { return; }
 		const text = els.input.value.trim();
 		if (!text && !pendingImages.length) { return; }
 		if (text.startsWith('/') && handleSlash(text)) { els.input.value = ''; autoSize(); return; }
@@ -2030,57 +1962,6 @@
 		sendText(text);
 	}
 
-	/** Clears the active chat tab (other tabs are untouched); the conversation is kept in History. */
-	function clearChat() {
-		const s = cur();
-		if (s.streaming) {
-			vscode.postMessage({ type: 'stop', sessionId: s.id });
-			s.streaming = false;
-		}
-		archiveSession(s);
-		// Fresh id so the archived copy stays its own history entry — otherwise the
-		// next archive of this tab (same id) would overwrite the pre-clear conversation.
-		s.id = newSessionId();
-		activeSessionId = s.id;
-		s.messages = [];
-		s.title = '';
-		s.pending = null;
-		s.todos = [];
-		s.compactSummary = undefined;
-		s.compactedUpTo = 0;
-		currentContext = null;
-		pendingImages = [];
-		saveState();
-		renderTabs(); renderAll(); renderContext(); renderImageChips(); updateComposer();
-		els.input.focus();
-	}
-
-	const SLASH_INLINE = ['explain', 'fix', 'doc', 'optimize', 'tests'];
-
-	/**
-	 * Every slash command `handleSlash` recognizes, with a one-line description — the
-	 * catalog the composer's autocomplete menu filters and shows. Kept as its own list
-	 * (rather than derived from `handleSlash`'s branches) because a command's *description*
-	 * has no natural home inside that dispatch logic.
-	 */
-	const SLASH_COMMANDS = [
-		{ cmd: 'ask', desc: 'Switch to Ask mode (optionally with a message)' },
-		{ cmd: 'plan', desc: 'Switch to Plan mode' },
-		{ cmd: 'agent', desc: 'Switch to Agent mode' },
-		{ cmd: 'auto', desc: 'Use Auto — role-routed plan → implement → review' },
-		{ cmd: 'explain', desc: 'Explain the current editor selection' },
-		{ cmd: 'fix', desc: 'Fix the current editor selection' },
-		{ cmd: 'doc', desc: 'Document the current editor selection' },
-		{ cmd: 'optimize', desc: 'Optimize the current editor selection' },
-		{ cmd: 'tests', desc: 'Write tests for the current editor selection' },
-		{ cmd: 'enhance', desc: 'Rewrite your draft into a sharper prompt' },
-		{ cmd: 'skills', desc: 'List available skills' },
-		{ cmd: 'skill', desc: 'Activate a skill — "off" clears all, "new" creates one' },
-		{ cmd: 'mcp', desc: 'MCP server status — "add" registers, "reconnect" retries' },
-		{ cmd: 'history', desc: 'Reopen a previous conversation' },
-		{ cmd: 'clear', desc: 'Clear this chat tab (saved to History)' },
-		{ cmd: 'help', desc: 'Show all slash commands' },
-	];
 	/** Filtered matches currently shown in the slash menu, and which one is highlighted. */
 	let slashMatches = [];
 	let slashIndex = 0;
@@ -2128,7 +2009,7 @@
 		const m = /^\/(\w*)$/.exec(els.input.value);
 		if (!m) { hideSlashMenu(); return; }
 		const partial = m[1].toLowerCase();
-		slashMatches = SLASH_COMMANDS.filter(c => c.cmd.startsWith(partial));
+		slashMatches = slashCommands.filter(c => c.cmd.startsWith(partial));
 		if (!slashMatches.length) { hideSlashMenu(); return; }
 		slashIndex = 0;
 		renderSlashMenu();
@@ -2153,81 +2034,43 @@
 		els.input.setSelectionRange(len, len);
 	}
 
-	/** Handles a leading slash command. Returns true if it consumed the input. */
+	/**
+	 * Handles a leading slash command. `/history` and `/enhance` are the two the host has no
+	 * business acting on — opening a UI panel and filling the composer are inherently
+	 * client-owned (see `src/session/slash.ts`'s `runSlash` doc) — so they stay fully local.
+	 * Everything else forwards the whole line to the host via `slash`, which owns mode/
+	 * provider switches, clearing/archiving the session, skills, and MCP (Phase 6a of
+	 * "remote control"); `/clear` and `/auto` additionally touch composer-attachment state and
+	 * the still-webview-global provider/model pickers respectively, neither of which the host
+	 * can reach into, so those stay mirrored locally alongside the host round trip. Returns
+	 * true if `text` was consumed as a slash command — an unrecognized one (a typo like
+	 * `/foo`) is still forwarded and still consumes the input; the host's own "unrecognized —
+	 * treat as a normal message" fallback sends it back exactly as before.
+	 */
 	function handleSlash(text) {
 		const m = /^\/(\w+)\s*([\s\S]*)$/.exec(text);
 		if (!m) { return false; }
+		const s = cur();
+		if (!s) { return false; }
 		const cmd = m[1].toLowerCase();
-		const rest = m[2].trim();
-		if (cmd === 'help') { showHelp(); return true; }
-		if (cmd === 'clear') { clearChat(); return true; }
 		if (cmd === 'history') { openHistoryPanel(); return true; }
-		if (cmd === 'ask' || cmd === 'plan' || cmd === 'agent' || cmd === 'edit') {
-			// '/edit' is a legacy alias for the mode that Plan replaced.
-			setMode(cmd === 'edit' ? 'plan' : cmd);
-			if (rest) { sendText(rest); }
-			return true;
-		}
-		if (cmd === 'auto') {
+		if (cmd === 'enhance') { els.input.value = m[2].trim(); enhance(); return true; }
+		if (cmd === 'clear') {
+			// Composer attachments are client-only UI state; the host owns archiving/resetting
+			// the session itself (`SessionStore.clearSession`, reached via `slash` below).
+			currentContext = null;
+			pendingImages = [];
+			renderContext(); renderImageChips();
+		} else if (cmd === 'auto') {
+			// The provider/model pickers are still webview-global, not yet reactive to a
+			// session's own `provider`/`model` (see `case 'sessions':`'s doc) — mirrored
+			// locally alongside the host's own record of it.
 			selectedProvider = AUTO_PROVIDER;
 			els.providerSelect.value = AUTO_PROVIDER;
 			saveState(); applyProviderUiMode(); renderModelSelect(); updateModeAvailability();
-			vscode.postMessage({ type: 'setProvider', provider: AUTO_PROVIDER });
-			setMode('agent');
-			if (rest) { sendText(rest); }
-			return true;
 		}
-		if (SLASH_INLINE.includes(cmd)) {
-			vscode.postMessage({ type: 'slashInline', command: cmd, text: rest });
-			return true;
-		}
-		if (cmd === 'enhance') { els.input.value = rest; enhance(); return true; }
-		if (cmd === 'skills') { showSkills(); return true; }
-		if (cmd === 'skill') {
-			const id = rest.toLowerCase();
-			if (id === 'new' || id === 'create') {
-				vscode.postMessage({ type: 'createSkill' });
-				return true;
-			}
-			vscode.postMessage({ type: 'setSkill', text: (id === 'off' || id === 'none') ? '' : id });
-			return true;
-		}
-		if (cmd === 'mcp') {
-			if (rest === 'add') { vscode.postMessage({ type: 'mcpAdd' }); return true; }
-			if (rest === 'reconnect') { vscode.postMessage({ type: 'mcpReconnect' }); return true; }
-			els.settingsPanel.classList.remove('hidden');
-			renderSettings();
-			return true;
-		}
-		return false; // unknown — treat as a normal message
-	}
-
-	function showSkills() {
-		const lines = ['**Skills** — activate with `/skill <id>`; several can be active at once (`/skill off` clears all)'];
-		for (const s of skillsList) {
-			const mark = activeSkills.includes(s.id) ? ' ✓ active' : '';
-			lines.push(`\`${s.id}\` — ${s.name}${s.description ? ': ' + s.description : ''}${mark}`);
-		}
-		appendMessageEl('assistant', lines.join('\n')).parentElement?.classList.add('info');
-		scrollToBottom();
-	}
-
-	function showHelp() {
-		const help = [
-			'**Slash commands**',
-			'`/ask` `/plan` `/agent` — switch mode (optionally with a message)',
-			'`/auto` — use Auto (role-routed plan → implement → review)',
-			'`/explain` `/fix` `/doc` `/optimize` `/tests` — act on the current editor selection',
-			'`/enhance` — rewrite your draft into a sharper prompt',
-			'`/skills` — list skills   ·   `/skill <id>` — activate (stackable; `/skill off` clears all, `/skill new` creates)',
-			'`/mcp` — MCP server status   ·   `/mcp add` — register a server   ·   `/mcp reconnect`',
-			'`/history` — reopen a previous conversation (also the 🕘 button; closed tabs are saved there)',
-			'`/clear` — clear this chat tab (saved to History)   ·   `/help` — show this help',
-			'',
-			'**While a run is streaming**: keep typing! In Agent mode, Enter **steers** the live run; otherwise your message is **queued** and sent when the run finishes. The **+** tab button opens parallel chats.',
-		].join('\n');
-		appendMessageEl('assistant', help).parentElement?.classList.add('info');
-		scrollToBottom();
+		vscode.postMessage({ type: 'slash', sessionId: s.id, command: text });
+		return true;
 	}
 
 	function appendPhaseHeader(label, provider, model, source) {
@@ -2288,7 +2131,7 @@
 		applyProviderUiMode();
 		renderModelSelect(); updateModeAvailability();
 		// Already in Agent mode? Keep the invariant: the selected model must do tools.
-		if (mode === 'agent' && !isAuto()) { ensureAgentModel(); }
+		if (curMode() === 'agent' && !isAuto()) { ensureAgentModel(); }
 		vscode.postMessage({ type: 'setProvider', provider: selectedProvider });
 		// Ask for the live model list the first time this provider is selected.
 		if (!isAuto() && !fetchedModels[selectedProvider]) {
@@ -2535,11 +2378,26 @@
 	 * Chat-stream messages the host broadcasts to every webview. The detached Settings tab
 	 * shares no live conversation, so it must ignore these — otherwise they would mutate a
 	 * phantom session and race the sidebar over persisted history.
+	 *
+	 * `'remote'` deliberately does NOT belong here, even though it looks like it fits the
+	 * "session-ownership traffic" group below: connection status, pairing replies, device
+	 * lists and errors are the desktop's one global remote-control state, not chat/session
+	 * data, and the "Remote control" section lives inside the Settings panel itself — which
+	 * IS the detached tab whenever it's opened via the gear icon (`requestOpenSettings` →
+	 * `openSettingsWindow`). Filtering it out here left that tab's status dot stuck at "off"
+	 * forever regardless of the real connection state, and silently dropped every pairing
+	 * reply and error `media/pairing.js` needed to show — see `scripts/test-webview.mjs`'s
+	 * assertion on this list for the guard against it recurring.
 	 */
 	const CHAT_ONLY_MESSAGES = [
 		'token', 'agentStepStart', 'agentStepEnd', 'toolStart', 'toolEnd',
 		'done', 'newChat', 'inline', 'autoPhase', 'autoSummary', 'editProposal', 'compacted', 'steerable', 'steerRejected',
 		'approvalRequest', 'askRequest', 'promptCancel',
+		// Session-ownership traffic (see i-need-your-help-unified-scott.md's "remote control"
+		// plan): the detached Settings tab shares no live conversation, so a `sessions`/
+		// `transcript` push (or a run announcing itself via `runStart`) has nothing to attach
+		// to there.
+		'sessions', 'transcript', 'runStart', 'commands',
 	];
 
 	window.addEventListener('message', (event) => {
@@ -2558,10 +2416,21 @@
 				if (typeof msg.rules === 'string') { generalConfig.rules = msg.rules; }
 				if (typeof msg.maxSteps === 'number') { generalConfig.maxSteps = msg.maxSteps; }
 				if (typeof msg.maxRunMinutes === 'number') { generalConfig.maxRunMinutes = msg.maxRunMinutes; }
-				// Keep a valid selection: honour the persisted choice (incl. Auto) when it still exists.
-				const valid = selectedProvider === AUTO_PROVIDER || providers.some(p => p.id === selectedProvider);
-				if (!valid) {
-					selectedProvider = msg.selectedProvider || (providers[0] && providers[0].id) || '';
+				// Auto stays local-only (the host never persists it as `defaultProvider`), so it's
+				// never touched here. Otherwise, always follow the host's `selectedProvider`: it's
+				// the one shared setting every connected client (this tab, a detached Settings
+				// window, a paired phone) can change, and a change made anywhere — including a
+				// remote client's own `setProvider` — has to reach every other one, not just get
+				// picked up once this tab's own selection happens to have gone invalid (e.g. its
+				// provider's key was removed). Falling back to "keep the invalid selection" here
+				// used to mean a provider switch made on a phone silently never showed up in the
+				// desktop panel.
+				if (selectedProvider !== AUTO_PROVIDER) {
+					if (typeof msg.selectedProvider === 'string' && providers.some(p => p.id === msg.selectedProvider)) {
+						selectedProvider = msg.selectedProvider;
+					} else if (!providers.some(p => p.id === selectedProvider)) {
+						selectedProvider = (providers[0] && providers[0].id) || '';
+					}
 				}
 				renderProviderSelect();
 				if (!els.settingsPanel.classList.contains('hidden')) { renderSettings(); }
@@ -2584,7 +2453,7 @@
 				if (msg.provider === selectedProvider) {
 					renderModelSelect(); updateModeAvailability();
 					// The live catalog may reveal the current model can't do tools.
-					if (mode === 'agent' && !isAuto()) { ensureAgentModel(); }
+					if (curMode() === 'agent' && !isAuto()) { ensureAgentModel(); }
 				}
 				// Refresh any already-rendered Auto-Routing role datalist for this provider in
 				// place — not a full renderAutoRouting(), which would blow away an in-progress
@@ -2739,7 +2608,7 @@
 				break;
 			}
 			case 'promptCancel':
-				prompts.cancel(msg.id);
+				prompts.cancel(msg.id, msg.reason);
 				break;
 			case 'compacted': {
 				const s = sessionFor(msg);
@@ -2794,9 +2663,11 @@
 				if (!els.settingsPanel.classList.contains('hidden')) { renderSkillList(); }
 				break;
 			case 'history': {
-				// Host-persisted archive (survives restarts); merge with what this webview has.
+				// Host-persisted archive (survives restarts). Nothing populates `history`
+				// locally anymore — closing/clearing a tab archives on the host now — so this
+				// is a plain replace rather than the old client/host merge.
 				const emptyBefore = !cur()?.messages.length;
-				mergeHistory(Array.isArray(msg.history) ? msg.history : []);
+				history = Array.isArray(msg.history) ? msg.history : [];
 				if (!els.historyPanel.classList.contains('hidden')) { renderHistoryPanel(); }
 				if (emptyBefore) { renderAll(); }
 				break;
@@ -2860,12 +2731,55 @@
 				// The + button opens a fresh tab; existing chats keep running in parallel.
 				createSession();
 				break;
+			case 'sessions': {
+				// Metadata for every tab — never a transcript (see `SessionSummary`, which
+				// excludes `messages`). Merge by id so a metadata-only update (e.g. after a
+				// `setMode`/`toggleSkill` round trip) doesn't blank every open tab's transcript;
+				// a session this cache has never seen yet starts with an empty one until its
+				// own `transcript` push arrives.
+				const prevById = new Map(sessions.map(s => [s.id, s]));
+				sessions = (msg.sessions || []).map(s => ({ ...s, messages: prevById.get(s.id)?.messages || [] }));
+				activeSessionId = msg.activeSessionId;
+				syncModeUI();
+				renderTabs();
+				renderAll();
+				updateComposer();
+				break;
+			}
+			case 'transcript': {
+				// For this phase always the full transcript (`truncated` is always false) —
+				// windowing is a later phase's work.
+				const s = sessions.find(x => x.id === msg.sessionId);
+				if (!s) { break; }
+				s.messages = Array.isArray(msg.messages) ? msg.messages : [];
+				if (s.id === activeSessionId) { renderAll(); }
+				break;
+			}
+			case 'runStart': {
+				// Not `sessionFor`: this message is what *sets* `runId` in the first place, so
+				// fencing on it matching would reject the very run it announces.
+				const s = sessions.find(x => x.id === msg.sessionId);
+				if (!s) { break; }
+				s.runId = msg.runId;
+				s.runMode = msg.mode;
+				break;
+			}
+			case 'commands':
+				slashCommands = Array.isArray(msg.commands) ? msg.commands : [];
+				if (slashMenuOpen()) { updateSlashMenu(); }
+				break;
+			case 'remote':
+				pairing.update(msg);
+				break;
 		}
 	});
 
 	// ---- Init -------------------------------------------------------------------
 
-	setMode(mode);
+	// `sessions`/`activeSessionId` start empty (see their own doc) — nothing to reflect in
+	// the mode picker yet, so this just applies the 'ask' default rather than a real session's
+	// mode. The host's first `sessions` push (see `case 'sessions':` above) is what replaces it.
+	syncModeUI();
 	renderTabs();
 	renderAll();
 	renderContext();
