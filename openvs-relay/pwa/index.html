@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>OpenVS Remote</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#111318">
+<!-- iOS Safari ignores the manifest's "display": "standalone" entirely — without this meta tag
+     an "Add to Home Screen" install still opens inside Safari chrome (URL bar, tab switcher),
+     which also silently breaks Web Push (iOS only allows it from an actually-standalone launch). -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="OpenVS">
+<!-- iOS also ignores the manifest's icons array — needs its own link. -->
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<div id="pairScreen" class="pair-screen">
+	<h1>OpenVS Remote</h1>
+	<p>Enter the pairing code shown in the OpenVS Chat panel.</p>
+	<form id="pairForm">
+		<input id="pairCode" type="text" inputmode="text" autocapitalize="characters" placeholder="8-character code" maxlength="8">
+		<button type="submit">Pair</button>
+	</form>
+	<p id="pairError" class="pair-error"></p>
+	<p class="pair-note">iOS: add this page to your Home Screen first — Web Push notifications only work from the installed app, not a Safari tab.</p>
+</div>
+
+<div id="app" hidden>
+	<header class="topbar">
+		<div id="status" class="status">Connecting…</div>
+		<button id="newSessionBtn" class="icon-btn" title="New chat"><span aria-hidden="true">＋</span><span class="icon-label">New</span></button>
+	</header>
+	<nav id="tabs" class="tabs"></nav>
+	<main id="messages" class="messages"></main>
+	<div id="todos" class="todos"></div>
+	<footer class="composer-bar">
+		<div class="controls-row">
+			<select id="modeSelect">
+				<option value="ask">Ask</option>
+				<option value="plan">Plan</option>
+				<option value="agent">Agent</option>
+			</select>
+			<select id="providerSelect"></select>
+			<select id="modelSelect"></select>
+		</div>
+		<div id="skillsList" class="skills-list"></div>
+		<div id="contextChip" class="context-chip" hidden></div>
+		<div id="queueChips" class="queue-chips" hidden></div>
+		<div class="compose-row">
+			<textarea id="composer" rows="2" placeholder="Message…"></textarea>
+			<input id="attachImageInput" type="file" accept="image/*" hidden>
+			<button id="attachImageBtn" class="icon-btn" title="Attach image"><span aria-hidden="true">📎</span><span class="icon-label">Image</span></button>
+			<button id="attachActiveBtn" class="icon-btn" title="Attach active editor"><span aria-hidden="true">🖥️</span><span class="icon-label">File</span></button>
+			<button id="enhanceBtn" class="icon-btn" title="Enhance prompt"><span aria-hidden="true">✨</span><span class="icon-label">Enhance</span></button>
+			<button id="stopBtn" class="icon-btn" title="Stop" hidden><span aria-hidden="true">■</span><span class="icon-label">Stop</span></button>
+			<button id="sendBtn" class="icon-btn" title="Send"><span aria-hidden="true">➤</span><span class="icon-label">Send</span></button>
+		</div>
+	</footer>
+</div>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

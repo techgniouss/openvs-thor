@@ -24,8 +24,35 @@ import fs from 'node:fs';
 const url = p => new URL(p, import.meta.url);
 const main = fs.readFileSync(url('../media/main.js'), 'utf8');
 const promptsJs = fs.readFileSync(url('../media/prompts.js'), 'utf8');
-const host = fs.readFileSync(url('../src/chatViewProvider.ts'), 'utf8');
+// The host's message dispatcher is expected to move out of chatViewProvider.ts over time,
+// into src/session/ and src/remote/. hostSends and hostHandles below are the whole contract
+// check between the two sides — a handler that moved to a new file without joining this
+// read would silently weaken hostSends (fewer messages the webview is required to handle)
+// and hard-fail hostHandles (a real case regex-invisible to this file, reported as "the
+// webview posts this but the host ignores it"). So this reads a *set* of files, not one.
+const host = readSourceSet(['../src/chatViewProvider.ts'], ['../src/session', '../src/remote']);
 const { CHAT_APP_HTML } = await import(url('../out/webviewHtml.js'));
+
+/**
+ * Concatenates `fixed` files with every `.ts` file directly under each of `dirs`, joined by
+ * `'\n'`. Directories that do not exist yet (a later phase has not created them) are skipped
+ * rather than throwing.
+ */
+function readSourceSet(fixed, dirs) {
+	const parts = fixed.map(p => fs.readFileSync(url(p), 'utf8'));
+	for (const dir of dirs) {
+		const dirUrl = url(dir + '/');
+		if (!fs.existsSync(dirUrl)) {
+			continue;
+		}
+		for (const entry of fs.readdirSync(dirUrl).sort()) {
+			if (entry.endsWith('.ts')) {
+				parts.push(fs.readFileSync(new URL(entry, dirUrl), 'utf8'));
+			}
+		}
+	}
+	return parts.join('\n');
+}
 
 /** All matches of `re`'s first capture group, deduped. */
 function captures(text, re) {
@@ -63,7 +90,12 @@ function captures(text, re) {
 	assert.deepStrictEqual(missing, [], 'the host serves these media files but they do not exist');
 }
 
-/** Message `type` values the host sends to the webview, from its `post({ type: … })` calls. */
+/**
+ * Message `type` values the host sends to the webview, from its `post({ type: … })` calls.
+ * The regex only matches that literal shape — `post({ type: 'x', … })` written out, not a
+ * variable or a spread — so any host file in the scanned set (see `readSourceSet` above)
+ * must keep sending messages that way for this extraction to see them.
+ */
 const hostSends = new Set([
 	...captures(host, /post\(\{\s*type:\s*'([a-zA-Z]+)'/g),
 	// Blocking prompts go out through promptUser rather than post, but they are still
@@ -111,6 +143,14 @@ const hostHandles = new Set(captures(host, /^\s*case '([a-zA-Z]+)':/gm));
 	for (const type of ['approvalRequest', 'askRequest', 'promptCancel', 'token', 'done']) {
 		assert.ok(list[1].includes(`'${type}'`), `${type} must not reach the Settings tab`);
 	}
+	// 'remote' must NOT be in this list: unlike sessions/transcript/commands, connection
+	// status/pairing/device/error payloads are not chat-scoped — they are the desktop's one
+	// global remote-control state, and the "Remote control" section lives inside the Settings
+	// panel itself. Filtering it out here silently blinded the detached Settings tab (which is
+	// what the gear icon always opens — see `requestOpenSettings`/`openSettingsWindow`) to
+	// every status update, pairing reply and error `media/pairing.js` ever needed to show,
+	// leaving the status dot stuck at "off" regardless of the real connection state.
+	assert.ok(!list[1].includes(`'remote'`), 'remote status/pairing/device updates must reach the Settings tab — it is where the Remote control panel lives');
 }
 
 // 5. The prompt round-trip has to name the same fields on both sides. These are read out
@@ -147,7 +187,10 @@ const hostHandles = new Set(captures(host, /^\s*case '([a-zA-Z]+)':/gm));
 	assert.match(main, /m\.kind === 'auto'[\s\S]{0,120}appendAutoSummary\(m\.phases\)/,
 		'and re-rendered from it');
 	// `kind` is what keeps notices out of the history sent to the model; the summary is one.
-	assert.match(main, /function sendableMessages[\s\S]{0,200}filter\(m => !m\.kind/,
+	// This used to be `main.js`'s own `sendableMessages` — Phase 2's ownership flip moved it
+	// to the host's `SessionStore` (the webview no longer assembles what to send at all, see
+	// assertion 9b), so the filter is checked there now instead.
+	assert.match(host, /sendableMessages\(sessionId: string\)[\s\S]{0,300}filter\(m => !m\.kind/,
 		'entries carrying a kind are never sent back as conversation');
 	for (const field of ['label', 'provider', 'model', 'source']) {
 		assert.ok(main.includes(`phase.${field}`), `the summary row renders "${field}"`);
@@ -185,26 +228,51 @@ const hostHandles = new Set(captures(host, /^\s*case '([a-zA-Z]+)':/gm));
 {
 	assert.match(main, /prompts\.render\(msg\)/, 'visible prompts are drawn');
 	assert.match(main, /prompts\.track\(msg\)/, 'background-tab prompts are remembered');
-	assert.match(main, /prompts\.cancel\(msg\.id\)/, 'cancellation reaches the card');
+	assert.match(main, /prompts\.cancel\(msg\.id, msg\.reason\)/,
+		'cancellation reaches the card, along with why (e.g. answered on another sink first)');
 	assert.match(main, /function renderOpenPrompts\(\)[\s\S]{0,120}prompts\.reattach/,
 		'open cards are re-attached after a transcript rebuild');
 	assert.ok(main.includes('renderOpenPrompts()'), 'and renderAll actually calls it');
 }
 
-// 6b. Both webview scripts are served, in the order prompts.js must load first.
+// 6b. All four webview scripts are served, in dependency order: qr.js (no deps) before
+// pairing.js (uses OpenVSQr), pairing.js before prompts.js (no dependency between the two,
+// but this pins them anyway so a reorder is a deliberate edit, not an accident), prompts.js
+// before main.js, which calls both `OpenVSPrompts.create` and `OpenVSPairing.create` at startup.
 {
-	const promptsAt = host.search(/mediaUri\('prompts\.js'\)/);
-	const mainAt = host.search(/mediaUri\('main\.js'\)/);
-	assert.ok(promptsAt > 0, 'prompts.js is served');
-	assert.ok(mainAt > promptsAt, 'prompts.js loads before main.js, which calls it at startup');
+	const positions = ['qr.js', 'pairing.js', 'prompts.js', 'main.js'].map(file => {
+		const at = host.search(new RegExp(`mediaUri\\('${file.replace('.', '\\.')}'\\)`));
+		assert.ok(at > 0, `${file} is served`);
+		return at;
+	});
+	for (let i = 1; i < positions.length; i++) {
+		assert.ok(positions[i] > positions[i - 1],
+			`scripts are served in the right order: …${['qr.js', 'pairing.js', 'prompts.js', 'main.js'][i - 1]} before ${['qr.js', 'pairing.js', 'prompts.js', 'main.js'][i]}`);
+	}
 }
 
-// 7. The host must settle waiting prompts when the webview goes away, in both directions:
-// a reload (`ready`) and a disposal. Either leak parks a run on an unanswerable question.
+// 7. The host must never strand a run on an unanswerable question, across the sink
+// lifecycle: a reload (`ready`) rebinds the card to whichever sink reconnected rather than
+// flushing it, a disposal that leaves no chat-capable sink arms an escalation instead of
+// settling immediately, and only extension deactivate ever settles everything unconditionally
+// (Phase 3's "remote control" prompt arbitration — see PromptRegistry.settleAllUnanswered's
+// doc for why `ready` must not do this anymore).
 {
-	assert.match(host, /case 'ready':[\s\S]{0,400}this\.flushPrompts\(\)/, 'a reloaded webview settles its prompts');
-	assert.match(host, /onDidDispose\(\(\) => \{[\s\S]{0,600}this\.flushPrompts\(\)/, 'a disposed view settles its prompts');
+	assert.match(host, /case 'ready':[\s\S]{0,400}rebindPrompts\(/, 'a reloaded/reconnected sink has its prompts rebound');
+	assert.ok(!/case 'ready':[\s\S]{0,400}this\.(flushPrompts|promptRegistry\.settleAllUnanswered)\(\)/.test(host),
+		'ready no longer flushes/settles prompts unconditionally');
+	assert.match(host, /onDidDispose\(\(\) => \{[\s\S]{0,800}armEscalations\(\)/,
+		'losing a sink arms an escalation instead of settling immediately');
+	assert.ok(!/onDidDispose\(\(\) => \{[\s\S]{0,800}this\.(flushPrompts|promptRegistry\.settleAllUnanswered)\(\)/.test(host),
+		'disposal no longer flushes/settles prompts unconditionally');
 	assert.match(host, /this\.view = undefined/, 'the disposed view handle is dropped');
+	// Only the extension's own deactivate — never a reload, never a disposed sink — is allowed
+	// to settle every prompt unconditionally.
+	const extensionSrc = fs.readFileSync(url('../src/extension.ts'), 'utf8');
+	assert.match(extensionSrc, /function deactivate\(\)[\s\S]{0,400}\.dispose\(\)/,
+		'extension deactivate disposes the chat view provider');
+	assert.match(host, /dispose\(\): void \{[\s\S]{0,300}promptRegistry\.settleAllUnanswered\(\)/,
+		'and that is what finally settles every unanswered prompt');
 }
 
 // 8. Tool names the webview labels must be tools the agent can actually call, or the
@@ -238,6 +306,16 @@ const hostHandles = new Set(captures(host, /^\s*case '([a-zA-Z]+)':/gm));
 	// The host has to actually use it, not just accept it: steering is drained per run.
 	assert.match(host, /drainSteering\(sessionId, runId\)/, 'steering is drained for the current run only');
 	assert.match(host, /entry\.runId === runId/, 'a steer left behind by an ended run is discarded');
+}
+
+// 9b. The load-bearing statement that the Phase 2 ownership flip is complete: `send`'s payload
+// no longer includes `messages` — the host computes history from its own `SessionStore` now
+// (falling back to whatever the webview sends only while it isn't yet tracking a session, see
+// `chatViewProvider.ts`'s `handleSend`), so the webview has nothing left to assemble.
+{
+	const post = /vscode\.postMessage\(\{[^}]*type: 'send'[\s\S]{0,400}?\}\)/.exec(main);
+	assert.ok(post, 'the webview still posts "send"');
+	assert.ok(!/messages:/.test(post[0]), '"send" must not carry a client-assembled message history');
 }
 
 // 10. Streaming repaints must stay coalesced. Painting per token re-renders the whole

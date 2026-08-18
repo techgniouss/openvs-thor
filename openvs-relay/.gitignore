@@ -1,0 +1,13 @@
+node_modules/
+.wrangler/
+.env
+.env.*
+!.env.example
+# Wrangler's own local-secrets convention (RELAY_PEPPER, VAPID keys, etc. for `wrangler dev`) —
+# not covered by the .env* rule above since it's a different filename by Cloudflare's own
+# convention, not this project's.
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+*.pem
+*.key

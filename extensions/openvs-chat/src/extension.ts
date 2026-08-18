@@ -3,6 +3,8 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import * as fs from 'fs';
+import * as path from 'path';
 import * as vscode from 'vscode';
 import { WebAuthManager } from './auth';
 import { ChatViewProvider, InlineKind } from './chatViewProvider';
@@ -11,6 +13,9 @@ import { McpManager } from './mcp/manager';
 import { loadEnvFile } from './oauth';
 import { ProviderRegistry } from './providers/registry';
 import { setStreamIdleTimeout } from './providers/types';
+import { getRelayUrl, isRemoteEnabled } from './remote/config';
+import { deployRelay } from './remote/deploy';
+import { RemoteService } from './remote/remoteService';
 import { SkillRegistry } from './skills';
 
 /**
@@ -24,6 +29,13 @@ function applyStreamIdleTimeout(): void {
 	}
 }
 
+/**
+ * The active {@link ChatViewProvider}, held at module scope only so {@link deactivate} can
+ * reach it — `activate` otherwise keeps every other collaborator as a local, wired together
+ * once and never referenced again outside the closures registered on `context.subscriptions`.
+ */
+let activeViewProvider: ChatViewProvider | undefined;
+
 export function activate(context: vscode.ExtensionContext): void {
 	loadEnvFile(context.extensionPath);
 	applyStreamIdleTimeout();
@@ -36,7 +48,10 @@ export function activate(context: vscode.ExtensionContext): void {
 	const auth = new WebAuthManager(registry);
 	const mcp = new McpManager();
 	const viewProvider = new ChatViewProvider(context, registry, auth, mcp);
+	activeViewProvider = viewProvider;
 	context.subscriptions.push(mcp);
+	const remoteService = new RemoteService(context, viewProvider);
+	context.subscriptions.push(remoteService);
 
 	context.subscriptions.push(
 		vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, viewProvider, {
@@ -69,6 +84,9 @@ export function activate(context: vscode.ExtensionContext): void {
 		vscode.commands.registerCommand('openvsChat.createSkill', () => createSkill(viewProvider)),
 		vscode.commands.registerCommand('openvsChat.mcpAdd', () => mcpAdd(mcp)),
 		vscode.commands.registerCommand('openvsChat.mcpOpenConfig', () => mcpOpenConfig()),
+		vscode.commands.registerCommand('openvsChat.remoteEnable', () => remoteEnable()),
+		vscode.commands.registerCommand('openvsChat.remoteStatus', () => remoteStatus(remoteService)),
+		vscode.commands.registerCommand('openvsChat.remoteDeployRelay', () => remoteDeployRelay(context, registry)),
 		vscode.commands.registerCommand('openvsChat.generateCommitMessage', (rootUri?: vscode.Uri, _resourceGroups?: unknown, token?: vscode.CancellationToken) => {
 			// The scm/inputBox toolbar always supplies a token; only the Command Palette (no
 			// args) needs one made up here, and that one must be disposed once done with it.
@@ -104,6 +122,62 @@ export function activate(context: vscode.ExtensionContext): void {
 			{ providedCodeActionKinds: [vscode.CodeActionKind.QuickFix, vscode.CodeActionKind.RefactorRewrite] },
 		),
 	);
+
+	// Covers every path that can reach the misconfigured state, not just this activation's
+	// starting settings: the Settings UI (or a hand edit of settings.json) can flip
+	// `remote.enabled` on, or clear `relayUrl`, without ever going through `remoteEnable()`.
+	context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
+		if (e.affectsConfiguration('openvsChat.remote.enabled') || e.affectsConfiguration('openvsChat.remote.relayUrl')) {
+			void warnIfRemoteMisconfigured(context);
+		}
+	}));
+	void warnIfRemoteMisconfigured(context);
+}
+
+/**
+ * `globalState` key recording that the user dismissed the nudge below via "Don't Ask Again".
+ * `remote.enabled` is written at `ConfigurationTarget.Global` (see `remoteEnable`), so it's the
+ * same everywhere — without this flag the nudge would re-fire on every window's activation until
+ * the user deploys a relay, even for someone who's already seen it and is getting to it later.
+ * Cleared as soon as the misconfiguration itself resolves (relay deployed, or remote disabled),
+ * so a *future* re-enable-without-relay prompts fresh rather than staying silenced forever from
+ * one old dismissal.
+ */
+const REMOTE_DEPLOY_NUDGE_DISMISSED_KEY = 'openvsChat.remote.deployNudgeDismissed';
+
+/**
+ * Nudges the user to finish relay setup when `remote.enabled` is on but `relayUrl` is still
+ * empty — e.g. a settings sync/import, or the setting flipped by hand — without ever going
+ * through {@link remoteEnable}'s prompt. `RemoteService.status()` already reports this case, but
+ * nothing surfaced it: the host would sit silently unpaired until the user thought to run
+ * "OpenVS Thor: Remote: Status". Gives the same one-click "Deploy Your Own Relay"
+ * `remoteEnable()` gives on first ask. Called at activation and on every relevant config change
+ * — see the `onDidChangeConfiguration` listener in {@link activate}.
+ *
+ * Skipped in a folderless window: remote pairing is workspace-keyed (`getWorkspaceKey()`
+ * in `remote/config.ts`), so a window with nothing to pair has nothing this nudge would unblock.
+ */
+async function warnIfRemoteMisconfigured(context: vscode.ExtensionContext): Promise<void> {
+	if (!isRemoteEnabled() || getRelayUrl()) {
+		// Resolved, or no longer enabled — reset so a later re-enable-without-relay nudges again.
+		await context.globalState.update(REMOTE_DEPLOY_NUDGE_DISMISSED_KEY, false);
+		return;
+	}
+	if (!vscode.workspace.workspaceFolders?.length && !vscode.workspace.workspaceFile) {
+		return;
+	}
+	if (context.globalState.get<boolean>(REMOTE_DEPLOY_NUDGE_DISMISSED_KEY)) {
+		return;
+	}
+	const action = await vscode.window.showWarningMessage(
+		'OpenVS remote control is enabled, but no relay is deployed yet — pairing won\'t work until you do. '
+		+ 'Run "OpenVS Thor: Remote: Deploy Your Own Relay" to do that in one step.',
+		'Deploy Your Own Relay', 'Don\'t Ask Again');
+	if (action === 'Deploy Your Own Relay') {
+		await vscode.commands.executeCommand('openvsChat.remoteDeployRelay');
+	} else if (action === 'Don\'t Ask Again') {
+		await context.globalState.update(REMOTE_DEPLOY_NUDGE_DISMISSED_KEY, true);
+	}
 }
 
 /** Offers OpenVS AI actions as editor quick-fixes / refactors. */
@@ -133,7 +207,11 @@ class InlineCodeActions implements vscode.CodeActionProvider {
 }
 
 export function deactivate(): void {
-	// no-op
+	// Settles every prompt still waiting for a reply — the one place that is allowed to
+	// happen unconditionally; see PromptRegistry.settleAllUnanswered's doc for why a reload
+	// must not do this.
+	activeViewProvider?.dispose();
+	activeViewProvider = undefined;
 }
 
 async function pickProvider(registry: ProviderRegistry, placeHolder: string): Promise<string | undefined> {
@@ -378,6 +456,144 @@ async function mcpOpenConfig(): Promise<void> {
 		await vscode.workspace.fs.writeFile(file, new TextEncoder().encode(JSON.stringify(scaffold, null, '\t') + '\n'));
 	}
 	await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(file));
+}
+
+/**
+ * `openvsChat.remoteEnable`: flips `openvsChat.remote.enabled` on, or — if no relay URL is
+ * configured yet — explains what's missing instead. There is no default relay; the user
+ * deploys their own via `wrangler deploy` first.
+ */
+async function remoteEnable(): Promise<void> {
+	if (!getRelayUrl()) {
+		const action = await vscode.window.showWarningMessage(
+			'Set "openvsChat.remote.relayUrl" to your own deployed relay before enabling remote control — there is no default relay. '
+			+ 'Run "OpenVS Thor: Remote: Deploy Your Own Relay" to do that in one step.',
+			'Deploy Your Own Relay');
+		if (action) {
+			await vscode.commands.executeCommand('openvsChat.remoteDeployRelay');
+		}
+		return;
+	}
+	await vscode.workspace.getConfiguration('openvsChat').update('remote.enabled', true, vscode.ConfigurationTarget.Global);
+	vscode.window.showInformationMessage(
+		'OpenVS remote control is enabled. Open ⚙ Providers & settings → Remote control to pair a device.');
+}
+
+/**
+ * `openvsChat.remoteStatus`: shows the current connection state (disabled / connecting / connected / …).
+ * The in-panel status indicator (`media/pairing.js`, in Settings → Remote control) shows this
+ * live; this command remains as a keyboard-only / Command Palette alternative.
+ */
+function remoteStatus(remoteService: RemoteService): void {
+	vscode.window.showInformationMessage(`OpenVS remote control: ${remoteService.status()}.`);
+}
+
+/**
+ * `openvsChat.remoteDeployRelay`: turns the manual "deploy your own relay" steps this
+ * extension has always required (see `remoteEnable`'s warning) into one click — installs
+ * `openvs-relay/`'s dependencies if needed, mints and uploads a `RELAY_PEPPER` secret, runs
+ * `wrangler deploy`, and saves the resulting URL into `openvsChat.remote.relayUrl`. Only works
+ * from a full source checkout: `openvs-relay/` is a sibling of `extensions/` in this repo, not
+ * something a normally-installed extension carries with it — this extension ships built-in
+ * only (a packaged VSIX is refused, see `chatViewProvider.ts`'s `search_files` doc), so anyone
+ * running it at all is, by construction, running it from a checkout of this monorepo.
+ *
+ * Authenticates `wrangler` non-interactively via `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID`
+ * rather than the `wrangler login` browser flow — reusing the exact credential the Cloudflare
+ * Workers AI *chat provider* already asks for (`registry.getApiKey('cloudflare')`, the same
+ * secret `ENV_VARS.cloudflare = 'CLOUDFLARE_API_TOKEN'` names in `providers/registry.ts`, plus
+ * `openvsChat.cloudflare.accountId`). One Cloudflare credential serves both features instead of
+ * this command inventing a second, parallel place to paste the same token. When either half is
+ * missing this refuses up front with a pointer to where to add it, rather than letting
+ * `wrangler` fail deep into the pipeline with a login prompt that has nothing to attach to in a
+ * non-interactive spawn.
+ */
+async function remoteDeployRelay(context: vscode.ExtensionContext, registry: ProviderRegistry): Promise<void> {
+	const relayDir = vscode.Uri.joinPath(context.extensionUri, '..', '..', 'openvs-relay').fsPath;
+	if (!fs.existsSync(relayDir)) {
+		vscode.window.showErrorMessage(
+			'Could not find openvs-relay/ next to this extension — this command only works from a full source checkout of the OpenVS Thor repo. '
+			+ 'From a checkout: cd openvs-relay && npm install && npx wrangler deploy, then paste the printed URL into "openvsChat.remote.relayUrl".');
+		return;
+	}
+
+	const cloudflareToken = await registry.getApiKey('cloudflare');
+	const cloudflareAccountId = vscode.workspace.getConfiguration('openvsChat').get<string>('cloudflare.accountId')?.trim();
+	if (!cloudflareToken || !cloudflareAccountId) {
+		const missing = !cloudflareToken && !cloudflareAccountId ? 'API token and Account ID'
+			: !cloudflareToken ? 'API token' : 'Account ID';
+		const action = await vscode.window.showWarningMessage(
+			`Deploying your own relay needs a Cloudflare ${missing} first — add ${missing === 'API token and Account ID' ? 'both' : 'it'} `
+			+ 'under ⚙ Providers & settings → Providers → Cloudflare, then retry this command.',
+			'Open Settings');
+		if (action) {
+			await vscode.commands.executeCommand('openvsChat.openSettings');
+		}
+		return;
+	}
+
+	const channel = vscode.window.createOutputChannel('OpenVS Chat: Deploy Relay');
+	channel.show(true);
+	channel.appendLine(`Deploying your own OpenVS relay from ${relayDir} …`);
+
+	const skipInstall = fs.existsSync(path.join(relayDir, 'node_modules'));
+	// `withProgress`'s CancellationToken has no native relationship to `deployRelay`'s
+	// AbortSignal (it predates AbortController in the vscode API) — bridged by hand so Cancel
+	// actually kills the in-flight `npm`/`wrangler` process instead of merely hiding the
+	// notification while the deploy keeps running unattended.
+	const controller = new AbortController();
+	let cancelled = false;
+	const result = await vscode.window.withProgress(
+		{ location: vscode.ProgressLocation.Notification, title: 'Deploying OpenVS relay…', cancellable: true },
+		(_progress, token) => {
+			token.onCancellationRequested(() => { cancelled = true; controller.abort(); });
+			return deployRelay({
+				relayDir,
+				skipInstall,
+				env: { CLOUDFLARE_API_TOKEN: cloudflareToken, CLOUDFLARE_ACCOUNT_ID: cloudflareAccountId },
+				signal: controller.signal,
+			});
+		},
+	);
+	channel.appendLine(result.output);
+
+	if (!result.ok || !result.url) {
+		if (cancelled) {
+			channel.appendLine('\n[Cancelled by user]');
+			vscode.window.showInformationMessage('Relay deploy cancelled.');
+			return;
+		}
+		channel.appendLine(`\n[FAILED at step: ${result.step ?? 'unknown'}]`);
+		const stepHint = result.step === 'install' ? 'npm install failed — check your network connection and retry.'
+			: result.step === 'secret' ? 'Check that the Cloudflare API token under ⚙ Providers & settings → Providers → Cloudflare has "Edit Cloudflare Workers" permission, then retry.'
+			: 'wrangler deploy failed, or its output did not contain a *.workers.dev URL — see the output for the real reason.';
+		const action = await vscode.window.showErrorMessage(`Relay deploy failed. ${stepHint}`, 'Show Output');
+		if (action) {
+			channel.show();
+		}
+		return;
+	}
+
+	const existingRelayUrl = getRelayUrl();
+	if (existingRelayUrl && existingRelayUrl !== result.url) {
+		const decision = await vscode.window.showWarningMessage(
+			`openvsChat.remote.relayUrl is already set to ${existingRelayUrl}. Replace it with the newly deployed ${result.url}?`,
+			'Replace', 'Keep Existing');
+		if (decision !== 'Replace') {
+			channel.appendLine(`\nDeployed to ${result.url}, but kept the existing relayUrl (${existingRelayUrl}) — update it yourself if you want to switch.`);
+			return;
+		}
+	}
+
+	await vscode.workspace.getConfiguration('openvsChat').update('remote.relayUrl', result.url, vscode.ConfigurationTarget.Global);
+	channel.appendLine(`\nRelay deployed: ${result.url}`);
+	channel.appendLine('Note: push notifications need VAPID_PUBLIC/VAPID_PRIVATE/VAPID_SUBJECT secrets set separately (see openvs-relay/wrangler.jsonc) — remote control itself works without them.');
+
+	const choice = await vscode.window.showInformationMessage(
+		`OpenVS relay deployed at ${result.url}. Enable remote control now?`, 'Enable Remote Control');
+	if (choice) {
+		await remoteEnable();
+	}
 }
 
 async function clearKey(registry: ProviderRegistry, view: ChatViewProvider): Promise<void> {

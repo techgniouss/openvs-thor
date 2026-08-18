@@ -80,6 +80,10 @@ export const CHAT_APP_HTML = `
 			<label class="review-toggle"><input type="checkbox" id="enableReview" /> Run a review pass after Agent runs</label>
 			<label class="review-toggle" title="Splits the plan into steps and runs a sub-agent per step instead of one continuous Agent run.">
 				<input type="checkbox" id="enableDecompose" /> Decompose Agent runs into per-step sub-agents</label>
+
+			<div class="settings-header"><h2>Remote control</h2></div>
+			<p class="hint">Pair a phone or another device to drive this chat panel remotely — send messages, steer runs, and answer approval prompts from anywhere. Requires <code>openvsChat.remote.enabled</code> and your own deployed relay (<code>openvsChat.remote.relayUrl</code>) — run <strong>OpenVS Thor: Remote: Deploy Your Own Relay</strong> from the Command Palette to set one up in one step, then <strong>OpenVS Thor: Remote: Enable Remote Control</strong>.</p>
+			<div id="remotePanel"></div>
 		</section>
 
 		<section id="historyPanel" class="hidden">
