@@ -157,6 +157,63 @@ Turn the review pass off with `openvsChat.auto.enableReview: false` (or the chec
 panel). The toolbar shows a compact summary of the current routing, with a ⚠ next to any
 role that can't run yet.
 
+## Inline completions
+
+As you type, OpenVS suggests the rest of the line (or a few lines) as dimmed **ghost
+text** — Copilot-style — from whichever model backend you have credentials for. Accept
+with **Tab**, or invoke it explicitly with **Alt+\\**.
+
+**The completion model is chosen separately from your chat model**, on its own role
+(`complete`) in the same router that drives 🤖 Auto — but ranked the opposite way: Auto
+prefers larger, more capable checkpoints, while completions prefer **small and fast**
+ones, because a suggestion that arrives after the cursor has moved on is worthless no
+matter how good it is. Reasoning models (anything that thinks before answering) are
+excluded outright — the few seconds a reasoning pass takes is fatal for a feature that
+fires on every typing pause. Leave it on *Auto-select* and OpenVS picks the fastest
+coder-tagged model from whatever you've configured, or pin one yourself — either from
+the editor's own inline-suggestion model picker (in the ghost-text UI itself), or by setting
+`openvsChat.completions.model` directly (VS Code's own Settings UI or `settings.json`) as
+`provider:model`. This is deliberately not a row in ⚙ → **Auto routing**, which only ever
+lists the three Auto pipeline roles — either way, pinning a completion model never touches
+your chat model's own setting.
+
+Four independent ways to turn it on or off:
+
+- The **`openvsChat.completions.enabled`** setting.
+- The **status bar item** (bottom right, sparkle/circle-slash icon) — click it to toggle.
+- The **`OpenVS Thor: Toggle Inline Completions`** command from the Command Palette.
+- The checkbox in ⚙ → **Settings**: *Inline completions — suggest code as you type*.
+
+Turning it off tears down the provider registration entirely rather than leaving it
+subscribed and silent — no completions feature keeps reading your keystrokes once it's
+off.
+
+**Safety:**
+
+- Files that can hold credentials — `.env*`, `*.pem`/`*.key`/`*.jks`/`*.p12`, SSH private
+  keys, `.npmrc`/`.pypirc`/`.netrc`, `credentials.json`, `service-account*.json` — are
+  never sent, and this isn't a setting you can turn off. A line that merely *looks* like a
+  secret (an `sk-…` key, a GitHub token, a JWT, a private-key header) blocks the request
+  too, wherever it appears.
+- Completions are **off by default in untrusted workspaces**, same as Agent-mode writes;
+  opt back in per-workspace with `openvsChat.completions.untrusted` if you've reviewed the
+  code.
+- Nothing about this feature calls out anywhere but the provider you've already
+  configured — no separate telemetry, no separate endpoint.
+
+**The fastest and cheapest option is a local fill-in-the-middle model** — point the
+**Custom** provider at [Ollama](https://ollama.com) (its default) and pull
+`qwen2.5-coder`, which OpenVS suggests out of the box. A local endpoint answers in
+roughly 100 ms with no quota to spend, so — unlike every other role — it's automatically
+considered for auto-selection once a quick reachability check confirms it's actually
+running; other roles leave `custom` out of auto-selection because there's no cheap way
+to know in advance whether a local server is even up. On a real FIM-capable backend
+(Ollama/LM Studio's legacy completions endpoint, or Mistral's `codestral`/`devstral`) the
+request goes out as a genuine prefix/suffix fill-in-the-middle call; on everything else it
+falls back to a small, stateless chat prompt with strict stop sequences, and the model's
+reply is run through a sanitizer that strips fences, restated prefix/suffix, and
+commentary before anything is shown as ghost text.
+
 ## Prompt enhancement
 
 Type a rough idea, click the **✨** button (or `/enhance`), and the model rewrites your draft

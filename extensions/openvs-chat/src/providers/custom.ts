@@ -31,5 +31,10 @@ export class CustomProvider extends OpenAICompatibleProvider {
 		toolModelPatterns: [],
 		// Same reasoning for vision (matches the NVIDIA provider's approach).
 		visionModelPatterns: [],
+		// Local runners serve the legacy completions endpoint with `suffix`, so any model
+		// whose name marks it as FIM-trained can use it. Named rather than left open,
+		// because a non-FIM model on that endpoint continues the prompt with no awareness
+		// of the suffix at all, which is worse than offering no completion.
+		fimModelPatterns: ['coder', 'codellama', 'starcoder', 'codegemma', 'codestral', 'deepseek-coder', 'stable-code'],
 	};
 }

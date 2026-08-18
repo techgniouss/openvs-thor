@@ -187,6 +187,43 @@ const headers = obj => new Headers(obj);
 	}
 }
 
+// `rateLimitRetries` overrides the default 429 retry budget outright — COMPLETION_FETCH_OPTS
+// sets it to 0 so a completion never sleeps out a rate-limit window, while every existing
+// caller (which never sets the field) keeps retrying 429s exactly as before. A before/after
+// contrast in one test: same stubbed 429-then-200 sequence, only `rateLimitRetries` differs.
+{
+	const { apiFetch, COMPLETION_FETCH_OPTS } = await import(new URL('../out/providers/types.js', import.meta.url));
+	const realFetch = globalThis.fetch;
+	try {
+		// Default behaviour (no override): a 429 is retried and the eventual 200 is returned.
+		let calls = 0;
+		globalThis.fetch = async () => {
+			calls++;
+			return new Response('{}', { status: calls === 1 ? 429 : 200, headers: { 'retry-after': '0' } });
+		};
+		const defaultResponse = await apiFetch('https://example.invalid/v1/chat',
+			{ method: 'POST', body: 'x' }, new AbortController().signal, { retries: 0 });
+		assert.deepStrictEqual([calls, defaultResponse.status], [2, 200],
+			'unset rateLimitRetries keeps the existing default 429 retry behaviour');
+
+		// COMPLETION_FETCH_OPTS's rateLimitRetries: 0 must stop retrying immediately — the
+		// first 429 is returned as-is rather than retried, so a stale completion never sleeps
+		// out a backoff and a metered backend (Groq) is never charged for a retry that can no
+		// longer matter.
+		calls = 0;
+		globalThis.fetch = async () => {
+			calls++;
+			return new Response('{}', { status: 429, headers: { 'retry-after': '0' } });
+		};
+		const completionResponse = await apiFetch('https://example.invalid/v1/chat',
+			{ method: 'POST', body: 'x' }, new AbortController().signal, COMPLETION_FETCH_OPTS);
+		assert.deepStrictEqual([calls, completionResponse.status], [1, 429],
+			'COMPLETION_FETCH_OPTS.rateLimitRetries: 0 stops retrying a 429 outright');
+	} finally {
+		globalThis.fetch = realFetch;
+	}
+}
+
 // The 413 message and the detector that reads it are one contract across two modules: the
 // wording here is what lets the agent loop shrink and retry instead of ending the run. A
 // backend that sends an empty 413 body must still produce a message the detector matches.

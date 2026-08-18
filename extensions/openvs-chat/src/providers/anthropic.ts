@@ -4,9 +4,9 @@
  *--------------------------------------------------------------------------------------------*/
 
 import {
-	AgentRequest, AgentStep, ChatMessage, ChatProvider, ChatRequest, FinishReason, ModelEntry,
-	ProviderInfo, STREAM_FETCH_OPTS, StreamChatResult, ToolCall, apiFetch, describeHttpError,
-	normalizeFinishReason, readSSE, retryNotice,
+	AgentRequest, AgentStep, ApiFetchOptions, ChatMessage, ChatProvider, ChatRequest, COMPLETION_FETCH_OPTS,
+	FinishReason, ModelEntry, ProviderInfo, STREAM_FETCH_OPTS, StreamChatResult, ToolCall, apiFetch,
+	describeHttpError, normalizeFinishReason, readSSE, retryNotice,
 } from './types';
 import { RateLimitSnapshot, RateLimitTracker } from './rateLimits';
 import { parseToolArgs } from './toolCalls';
@@ -92,6 +92,17 @@ export class AnthropicProvider implements ChatProvider {
 
 	async streamChat(request: ChatRequest): Promise<StreamChatResult> {
 		const { system, messages } = splitSystem(request.messages);
+		// A completion must apply the same tight budget completeFim-style callers use — see
+		// COMPLETION_FETCH_OPTS's doc comment — rather than the normal chat transport's 150s
+		// timeout, extra retry and pace hook. No onRetry in that branch either: a completion
+		// should not narrate a retry notice, since completions have no retries to narrate.
+		const opts: ApiFetchOptions = request.isCompletion
+			? { ...COMPLETION_FETCH_OPTS, ...this.rateLimits.noteOnlyOpts(request.model) }
+			: {
+				...STREAM_FETCH_OPTS,
+				onRetry: info => request.onNotice?.(retryNotice(this.info.label, info)),
+				...this.rateLimits.fetchOpts(request.model),
+			};
 		const response = await apiFetch(this.url(request.baseUrl, '/messages'), {
 			method: 'POST',
 			headers: this.headers(request.apiKey),
@@ -102,11 +113,7 @@ export class AnthropicProvider implements ChatProvider {
 				messages: withCacheBreakpoint(toAnthropicMessages(messages)),
 				stream: true,
 			}),
-		}, request.signal, {
-			...STREAM_FETCH_OPTS,
-			onRetry: info => request.onNotice?.(retryNotice(this.info.label, info)),
-			...this.rateLimits.fetchOpts(request.model),
-		});
+		}, request.signal, opts);
 
 		if (!response.ok) {
 			throw new Error(await describeHttpError(this.info.label, response));

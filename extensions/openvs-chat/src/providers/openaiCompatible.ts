@@ -4,9 +4,9 @@
  *--------------------------------------------------------------------------------------------*/
 
 import {
-	AgentRequest, AgentStep, ApiFetchOptions, ChatMessage, ChatProvider, ChatRequest, FinishReason,
-	ModelEntry, ProviderInfo, RetryInfo, STREAM_FETCH_OPTS, StreamChatResult, ToolCall, apiFetch,
-	describeHttpError, normalizeFinishReason, readSSE, retryNotice,
+	AgentRequest, AgentStep, ApiFetchOptions, ChatMessage, ChatProvider, ChatRequest, COMPLETION_FETCH_OPTS,
+	FimRequest, FinishReason, ModelEntry, ProviderInfo, RetryInfo, STREAM_FETCH_OPTS, StreamChatResult, ToolCall,
+	apiFetch, describeHttpError, modelSupportsFim, normalizeFinishReason, readSSE, retryNotice,
 } from './types';
 import { normalizeToolCallId, parseToolArgs } from './toolCalls';
 import { RateLimitSnapshot, RateLimitTracker } from './rateLimits';
@@ -163,6 +163,23 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 	}
 
 	/**
+	 * Fetch options for a `streamChat` request, branching on {@link ChatRequest.isCompletion}.
+	 *
+	 * A completion request must apply the same tight budget {@link completeFim} already uses
+	 * — {@link COMPLETION_FETCH_OPTS} plus never-pace rate-limit recording — rather than
+	 * inheriting the normal chat transport's 150s timeout, extra retry and `pace` hook (which
+	 * can sleep up to 30s waiting out a rate-limit window). Without this branch the
+	 * chat-fallback path taken by every provider without a real FIM endpoint would silently
+	 * violate the completions non-interference contract one layer below where
+	 * `test-completion-isolation.mjs`'s scan of `src/completions/` can see it.
+	 */
+	private effectiveFetchOpts(request: ChatRequest): ApiFetchOptions {
+		return request.isCompletion
+			? { ...COMPLETION_FETCH_OPTS, ...this.rateLimits.noteOnlyOpts(request.model) }
+			: this.streamFetchOpts(request.model, request.onNotice);
+	}
+
+	/**
 	 * What this backend has said about its own token allowances, per model.
 	 *
 	 * Held on the provider because providers are long-lived singletons in the registry, so
@@ -183,6 +200,56 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 		return /^(o[1-9]|gpt-5)/i.test(model) ? 'max_completion_tokens' : 'max_tokens';
 	}
 
+	/**
+	 * Where this backend serves fill-in-the-middle. The OpenAI-compatible default is the
+	 * legacy `/completions` endpoint, which takes a `suffix` alongside `prompt` — that is
+	 * what Ollama, LM Studio and vLLM all expose, so the local runners come free with this.
+	 */
+	protected fimUrl(baseUrl: string): string {
+		return this.url(baseUrl, '/completions');
+	}
+
+	/** The request body for {@link fimUrl}. Non-streaming: a 96-token reply is one chunk. */
+	protected fimBody(request: FimRequest): string {
+		return JSON.stringify({
+			model: request.model,
+			prompt: request.prefix,
+			suffix: request.suffix,
+			max_tokens: request.maxTokens,
+			// Near-greedy. A completion is a prediction of what the user was about to type,
+			// not a creative act; sampling variance here reads to the user as flakiness.
+			temperature: 0.1,
+			stream: false,
+			stop: request.stop,
+		});
+	}
+
+	/**
+	 * Complete between prefix and suffix using this backend's FIM endpoint.
+	 *
+	 * Uses {@link COMPLETION_FETCH_OPTS} rather than the streaming options, and
+	 * `noteOnlyOpts` rather than `fetchOpts` — a completion records what the headers say but
+	 * never sleeps waiting for a window, because by the time the window refills the cursor
+	 * has moved. See the non-interference contract in the design spec.
+	 */
+	async completeFim(request: FimRequest): Promise<string> {
+		if (!modelSupportsFim(this.info, request.model)) {
+			throw new Error(`${this.info.label} has no FIM endpoint for ${request.model}`);
+		}
+		const response = await apiFetch(
+			this.fimUrl(request.baseUrl),
+			{ method: 'POST', headers: this.authHeaders(request.apiKey), body: this.fimBody(request) },
+			request.signal,
+			{ ...COMPLETION_FETCH_OPTS, ...this.rateLimits.noteOnlyOpts(request.model) },
+		);
+		if (!response.ok) {
+			throw new Error(await describeHttpError(this.info.label, response));
+		}
+		const json = await response.json() as { choices?: { text?: string; message?: { content?: string } }[] };
+		const choice = json.choices?.[0];
+		return choice?.text ?? choice?.message?.content ?? '';
+	}
+
 	async streamChat(request: ChatRequest): Promise<StreamChatResult> {
 		const response = await this.postWithNarrationFallback(
 			this.url(request.baseUrl, '/chat/completions'),
@@ -195,7 +262,7 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 				...this.extraBody(),
 			}),
 			request.signal,
-			this.streamFetchOpts(request.model, request.onNotice),
+			this.effectiveFetchOpts(request),
 		);
 
 		if (!response.ok) {

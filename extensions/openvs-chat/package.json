@@ -12,7 +12,8 @@
   "main": "./out/extension",
   "enabledApiProposals": [
     "findTextInFiles",
-    "contribSourceControlInputBoxMenu"
+    "contribSourceControlInputBoxMenu",
+    "inlineCompletionsAdditions"
   ],
   "categories": [
     "AI",
@@ -185,6 +186,21 @@
         "command": "openvsChat.remoteDeployRelay",
         "title": "%commands.remoteDeployRelay%",
         "category": "OpenVS Thor"
+      },
+      {
+        "command": "openvsChat.completions.toggle",
+        "title": "%commands.completionsToggle%",
+        "category": "OpenVS Thor"
+      },
+      {
+        "command": "openvsChat.completions.trigger",
+        "title": "%commands.completionsTrigger%",
+        "category": "OpenVS Thor"
+      },
+      {
+        "command": "openvsChat.completions.showStats",
+        "title": "%commands.completionsShowStats%",
+        "category": "OpenVS Thor"
       }
     ],
     "submenus": [
@@ -272,6 +288,13 @@
         }
       ]
     },
+    "keybindings": [
+      {
+        "command": "openvsChat.completions.trigger",
+        "key": "alt+\\",
+        "when": "editorTextFocus"
+      }
+    ],
     "configuration": {
       "title": "OpenVS Thor",
       "properties": {
@@ -778,6 +801,77 @@
           "type": "number",
           "default": 8192,
           "description": "%config.maxTokens%"
+        },
+        "openvsChat.completions.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "%config.completions.enabled%"
+        },
+        "openvsChat.completions.model": {
+          "type": "string",
+          "default": "",
+          "description": "%config.completions.model%"
+        },
+        "openvsChat.completions.debounceMs": {
+          "type": "number",
+          "default": 250,
+          "description": "%config.completions.debounceMs%"
+        },
+        "openvsChat.completions.maxLines": {
+          "type": "number",
+          "default": 6,
+          "description": "%config.completions.maxLines%"
+        },
+        "openvsChat.completions.prefixChars": {
+          "type": "number",
+          "default": 2000,
+          "description": "%config.completions.prefixChars%"
+        },
+        "openvsChat.completions.suffixChars": {
+          "type": "number",
+          "default": 1000,
+          "description": "%config.completions.suffixChars%"
+        },
+        "openvsChat.completions.maxTokens": {
+          "type": "number",
+          "default": 96,
+          "description": "%config.completions.maxTokens%"
+        },
+        "openvsChat.completions.quotaReserve": {
+          "type": "number",
+          "default": 0.15,
+          "description": "%config.completions.quotaReserve%"
+        },
+        "openvsChat.completions.slowMs": {
+          "type": "number",
+          "default": 3000,
+          "description": "%config.completions.slowMs%"
+        },
+        "openvsChat.completions.disabledLanguages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "%config.completions.disabledLanguages%"
+        },
+        "openvsChat.completions.excludeFiles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "%config.completions.excludeFiles%"
+        },
+        "openvsChat.completions.inComments": {
+          "type": "boolean",
+          "default": true,
+          "description": "%config.completions.inComments%"
+        },
+        "openvsChat.completions.untrusted": {
+          "type": "boolean",
+          "default": false,
+          "description": "%config.completions.untrusted%"
         }
       }
     }

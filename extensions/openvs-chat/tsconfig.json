@@ -19,6 +19,7 @@
 		"src/**/*",
 		"../../src/vscode-dts/vscode.d.ts",
 		"../../src/vscode-dts/vscode.proposed.findTextInFiles.d.ts",
-		"../../src/vscode-dts/vscode.proposed.textSearchProvider.d.ts"
+		"../../src/vscode-dts/vscode.proposed.textSearchProvider.d.ts",
+		"../../src/vscode-dts/vscode.proposed.inlineCompletionsAdditions.d.ts"
 	]
 }

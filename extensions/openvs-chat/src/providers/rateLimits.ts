@@ -153,6 +153,19 @@ export class RateLimitTracker {
 		};
 	}
 
+	/**
+	 * The recording half of {@link fetchOpts} without the pacing half.
+	 *
+	 * {@link fetchOpts} deliberately keeps the two together so a caller cannot record under
+	 * one model while pacing against another. Inline completions need the split anyway, and
+	 * for a reason that does not apply to chat: pacing means "send this later", and a
+	 * completion has no later — the cursor will have moved. It skips the request instead.
+	 * Readings are still recorded, because a real header beats a stale one for every caller.
+	 */
+	noteOnlyOpts(model: string): { onResponse: (response: Response) => void } {
+		return { onResponse: response => this.note(model, response) };
+	}
+
 	delayFor(model: string, estimatedTokens: number, now = Date.now()): number {
 		const snapshot = this.byModel.get(model);
 		if (!snapshot || snapshot.remainingTokens === undefined || snapshot.resetMs === undefined) {

@@ -16,18 +16,27 @@ export type AutoRole = 'plan' | 'code' | 'review';
 
 export const AUTO_ROLES: AutoRole[] = ['plan', 'code', 'review'];
 
+/**
+ * Roles the router can resolve. {@link AutoRole} is the Auto *pipeline*'s set and must stay
+ * as it is — {@link AUTO_ROLES} drives `resolveAll()` and the Auto settings rows, so adding
+ * a member there would put a completion entry in both. `complete` is resolved on its own.
+ */
+export type RoutedRole = AutoRole | 'complete';
+
 /** Human-facing labels for the roles. */
-export const ROLE_LABELS: Record<AutoRole, string> = {
+export const ROLE_LABELS: Record<RoutedRole, string> = {
 	plan: 'Planning',
 	code: 'Implementation',
 	review: 'Review',
+	complete: 'Inline Completions',
 };
 
 /** The settings key (under `openvsChat.auto`) that stores each role's `provider:model`. */
-const ROLE_SETTING: Record<AutoRole, string> = {
+const ROLE_SETTING: Record<RoutedRole, string> = {
 	plan: 'auto.planModel',
 	code: 'auto.codeModel',
 	review: 'auto.reviewModel',
+	complete: 'completions.model',
 };
 
 /**
@@ -35,7 +44,7 @@ const ROLE_SETTING: Record<AutoRole, string> = {
  * decision came from, whether it can actually run, and (if not) why.
  */
 export interface RoleAssignment {
-	readonly role: AutoRole;
+	readonly role: RoutedRole;
 	readonly roleLabel: string;
 	/** '' when nothing could be resolved. */
 	readonly providerId: string;
@@ -68,6 +77,29 @@ const NOT_AUTO_INFERRED = new Set(['custom', 'antigravity']);
 const NOT_AUTO_SELECTED_MODELS: RegExp[] = [/fable/i, /opus/i, /\bo[13]-pro\b/i, /gpt-[0-9.]+-pro\b/i];
 
 /**
+ * Models never used for inline completion, however capable.
+ *
+ * Reasoning models emit their thinking before any code, which for a completion means
+ * seconds of latency and then a suggestion for a cursor position that no longer exists.
+ * The {@link NOT_AUTO_SELECTED_MODELS} set is folded in for its own reason as well: this
+ * endpoint fires on every typing pause, making it the worst possible place to spend a
+ * user's credits without being asked.
+ */
+const NOT_COMPLETION_MODELS: RegExp[] = [
+	/-?r1\b/i, /think/i, /qwq/i, /\bo[1-9]\b/i, /reason/i, ...NOT_AUTO_SELECTED_MODELS,
+];
+
+/** Whether `model` is barred from serving inline completions. See {@link NOT_COMPLETION_MODELS}. */
+export function isCompletionExcluded(model: string): boolean {
+	return NOT_COMPLETION_MODELS.some(pattern => pattern.test(model));
+}
+
+/** The settings key holding a role's `provider:model` pin. */
+export function roleSettingKey(role: RoutedRole): string {
+	return ROLE_SETTING[role];
+}
+
+/**
  * How many inferred candidates are evaluated per role. Each costs a credential read and
  * becomes a runtime fallback link; a handful is enough to survive a bad model id without
  * turning one failing role into a long chain of doomed requests.
@@ -94,15 +126,34 @@ const MAX_PER_PROVIDER = 2;
  * fail with a 404 for every user whose account could not actually serve the exact id that
  * table named. Ranking by capability keeps the choice inside whatever the user really has.
  */
-const ROLE_AFFINITY: Record<AutoRole, RegExp[]> = {
+const ROLE_AFFINITY: Record<RoutedRole, RegExp[]> = {
 	// Planning and review are reasoning passes: prefer larger/thinking checkpoints.
 	plan: [/sonnet|gpt-5|gpt-4|\bo[1-4]\b|large|max\b|reason|think|-r1|deepseek|nemotron|glm|235b|120b|70b/i],
 	code: [/coder|-code|sonnet|gpt-5|gpt-4|devstral|codestral|qwen3|llama-3\.3|llama-4|gpt-oss|kimi|glm|deepseek|nemotron|120b|70b/i],
 	review: [/sonnet|gpt-5|gpt-4|\bo[1-4]\b|large|max\b|reason|think|-r1|deepseek|nemotron|glm|120b|70b/i],
+	// Deliberately NOT a copy of `code`, which matches deepseek/-r1/think and 70b/120b: every
+	// one of those is wrong for a model that must answer in under a second.
+	// Also deliberately excludes small/fast marketing terms (instant, flash, a bare
+	// single-digit-b size on their own) that LIGHTWEIGHT already rewards on their own via
+	// LIGHTWEIGHT_WEIGHT below — without this a model with no real coder specialization could
+	// win purely for sounding fast (llama-3.1-8b-instant) over a genuine FIM/coder model that
+	// doesn't happen to have a fast-sounding name (codestral-latest). This does not fully
+	// separate the two signals: a name that is genuinely both coder-specific and small (e.g.
+	// qwen2.5-coder:7b, codegemma:2b) still matches both tables and gets both bonuses — which
+	// is correct here, since such a model really does have both properties, unlike the
+	// marketing-only case this exclusion exists to prevent.
+	complete: [/codestral|devstral|coder|-code|starcoder|codegemma|ministral/i],
 };
 
 /** Small/fast checkpoints — usable, but ranked under a larger sibling from the same key. */
 const LIGHTWEIGHT = /mini|lite|small|tiny|instant|haiku|flash|\b[1-9]b\b|-[1-9]b\b|1[0-9]b\b/i;
+
+/**
+ * Magnitude of the lightweight-checkpoint adjustment to a candidate's score. Auto roles
+ * subtract this (a small checkpoint ranks under its larger sibling); `complete` adds it
+ * (latency dominates quality there) — see {@link scoreForRole}.
+ */
+const LIGHTWEIGHT_WEIGHT = 2;
 
 /** Extra requirements this particular run puts on a role's model. */
 export interface RoleNeeds {
@@ -140,7 +191,7 @@ export class RoleRouter {
 	}
 
 	/** Reads the raw `provider:model` setting for a role (empty string if unset). */
-	getConfigured(role: AutoRole): { providerId: string; model: string } | undefined {
+	getConfigured(role: RoutedRole): { providerId: string; model: string } | undefined {
 		const raw = vscode.workspace.getConfiguration('openvsChat').get<string>(ROLE_SETTING[role])?.trim();
 		if (!raw) {
 			return undefined;
@@ -154,7 +205,7 @@ export class RoleRouter {
 	}
 
 	/** Persists a role assignment, or clears it (revert to auto-infer) when providerId is empty. */
-	async setConfigured(role: AutoRole, providerId: string, model: string): Promise<void> {
+	async setConfigured(role: RoutedRole, providerId: string, model: string): Promise<void> {
 		const value = providerId && model ? `${providerId}:${model}` : '';
 		await vscode.workspace.getConfiguration('openvsChat').update(
 			ROLE_SETTING[role], value, vscode.ConfigurationTarget.Global);
@@ -169,9 +220,17 @@ export class RoleRouter {
 		return vscode.workspace.getConfiguration('openvsChat').get<boolean>('auto.decompose') ?? false;
 	}
 
-	/** Resolves a single role to a concrete assignment (configured or inferred). */
-	async resolveRole(role: AutoRole, needs: RoleNeeds = {}, memo: CredentialMemo = new Map()): Promise<RoleAssignment> {
-		return (await this.resolveRoleCandidates(role, needs, memo))[0];
+	/**
+	 * Resolves a single role to a concrete assignment (configured or inferred).
+	 *
+	 * `localReachable` defaults to `false`, keeping every existing 3-argument call site
+	 * (the Auto pipeline, the settings panel) exactly as it behaved before this role — the
+	 * `custom` provider stays excluded for them. Only a caller that has confirmed the local
+	 * endpoint answers (the completion resolver) passes `true`, and it only ever matters for
+	 * `role === 'complete'` — see {@link inferable}.
+	 */
+	async resolveRole(role: RoutedRole, needs: RoleNeeds = {}, memo: CredentialMemo = new Map(), localReachable = false): Promise<RoleAssignment> {
+		return (await this.resolveRoleCandidates(role, needs, memo, localReachable))[0];
 	}
 
 	/**
@@ -180,13 +239,13 @@ export class RoleRouter {
 	 * actually serve). A configured role yields exactly one entry — it is honoured as-is and
 	 * never substituted. An unset role yields the ranked inferred candidates.
 	 */
-	async resolveRoleCandidates(role: AutoRole, needs: RoleNeeds = {}, memo: CredentialMemo = new Map()): Promise<RoleAssignment[]> {
+	async resolveRoleCandidates(role: RoutedRole, needs: RoleNeeds = {}, memo: CredentialMemo = new Map(), localReachable = false): Promise<RoleAssignment[]> {
 		const configured = this.getConfigured(role);
 		if (configured) {
 			return [await this.evaluate(role, configured.providerId, configured.model, 'configured', needs, memo)];
 		}
 		const ready: RoleAssignment[] = [];
-		for (const candidate of await this.inferredPool(role, needs, memo)) {
+		for (const candidate of await this.inferredPool(role, needs, memo, localReachable)) {
 			const assignment = await this.evaluate(role, candidate.providerId, candidate.model, 'inferred', needs, memo);
 			if (assignment.ready) {
 				ready.push(assignment);
@@ -221,13 +280,14 @@ export class RoleRouter {
 	 * role's requirements, which used to disqualify the whole provider.
 	 */
 	private async inferredPool(
-		role: AutoRole,
+		role: RoutedRole,
 		needs: RoleNeeds,
 		memo: CredentialMemo,
+		localReachable: boolean,
 	): Promise<Array<{ providerId: string; model: string }>> {
 		const pool: Array<{ providerId: string; model: string; score: number }> = [];
 		for (const providerId of this.registry.ids) {
-			if (NOT_AUTO_INFERRED.has(providerId)) {
+			if (!this.inferable(role, providerId, localReachable)) {
 				continue;
 			}
 			const provider = this.registry.getProvider(providerId);
@@ -246,7 +306,7 @@ export class RoleRouter {
 				if (!this.selectable(role, providerId, provider.info, entries, model, needs)) {
 					return;
 				}
-				pool.push({ providerId, model, score: score(role, model, model === chosen, index) });
+				pool.push({ providerId, model, score: scoreForRole(role, model, model === chosen, index) });
 			});
 		}
 		pool.sort((a, b) => b.score - a.score);
@@ -260,9 +320,28 @@ export class RoleRouter {
 			.map(({ providerId, model }) => ({ providerId, model }));
 	}
 
+	/**
+	 * Which providers may be inferred for `role`.
+	 *
+	 * `custom` is kept out of the Auto roles because a local endpoint may not be running.
+	 * For completion that reasoning inverts: a local FIM model answers in ~100 ms and costs
+	 * no quota, which makes it the best backend available — and unlike the Auto case the
+	 * premise is cheaply testable, so it is admitted when a reachability probe succeeds.
+	 * `antigravity` stays out of every role.
+	 */
+	private inferable(role: RoutedRole, providerId: string, localReachable: boolean): boolean {
+		if (providerId === 'antigravity') {
+			return false;
+		}
+		if (providerId === 'custom') {
+			return role === 'complete' && localReachable;
+		}
+		return !NOT_AUTO_INFERRED.has(providerId);
+	}
+
 	/** Whether a model may be *auto-selected* for a role (a pinned model skips this entirely). */
 	private selectable(
-		role: AutoRole,
+		role: RoutedRole,
 		providerId: string,
 		info: ProviderInfo,
 		entries: ModelEntry[] | undefined,
@@ -270,6 +349,9 @@ export class RoleRouter {
 		needs: RoleNeeds,
 	): boolean {
 		if (NOT_AUTO_SELECTED_MODELS.some(pattern => pattern.test(model))) {
+			return false;
+		}
+		if (role === 'complete' && isCompletionExcluded(model)) {
 			return false;
 		}
 		// When the catalog has been fetched it is the account's own answer to "does this model
@@ -292,7 +374,7 @@ export class RoleRouter {
 
 	/** Builds (and validates) an assignment for an explicit provider+model choice. */
 	private async evaluate(
-		role: AutoRole,
+		role: RoutedRole,
 		providerId: string,
 		model: string,
 		source: 'configured' | 'inferred',
@@ -337,7 +419,7 @@ export class RoleRouter {
 	}
 
 	/** The placeholder returned when nothing the user has configured can serve a role. */
-	private noCandidate(role: AutoRole, needs: RoleNeeds): RoleAssignment {
+	private noCandidate(role: RoutedRole, needs: RoleNeeds): RoleAssignment {
 		// Both requirements are named when both apply: told only about tools, a user who
 		// attached an image goes looking for a tool-capable model they already have.
 		const wanted = [role === 'code' ? 'tool-capable' : '', needs.vision ? 'vision-capable' : ''].filter(Boolean);
@@ -362,10 +444,16 @@ export class RoleRouter {
  * that a provider's headline model outranks its long tail. The user's own selected model
  * for that provider gets a bonus because it is the one choice here they actually made.
  */
-function score(role: AutoRole, model: string, isUserChoice: boolean, index: number): number {
+export function scoreForRole(role: RoutedRole, model: string, isUserChoice: boolean, index: number): number {
 	let value = ROLE_AFFINITY[role].some(pattern => pattern.test(model)) ? 3 : 0;
-	if (LIGHTWEIGHT.test(model)) {
-		value -= 2;
+	// For the Auto roles a small checkpoint ranks below its larger sibling. For completion
+	// the trade reverses: latency is the dominant quality term, because a suggestion that
+	// arrives after the cursor moved scores zero no matter how good it is.
+	const lightweight = LIGHTWEIGHT.test(model);
+	if (role === 'complete') {
+		value += lightweight ? LIGHTWEIGHT_WEIGHT : 0;
+	} else if (lightweight) {
+		value -= LIGHTWEIGHT_WEIGHT;
 	}
 	if (isUserChoice) {
 		// Outranks role affinity deliberately: of everything in this pool it is the one model
