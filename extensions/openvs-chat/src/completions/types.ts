@@ -19,15 +19,16 @@ export interface CompletionWindow {
 	readonly eol: '\n' | '\r\n';
 }
 
-/** Why a completion attempt produced nothing, for the status bar and the log. */
+/**
+ * Why a completion attempt produced nothing, for the status bar and the log.
+ *
+ * Limited to the outcomes `OpenVSInlineCompletionProvider` actually emits — the enabled/
+ * disabled resting state is `CompletionStatusBar.setEnabled`'s own concern, not an outcome.
+ */
 export type CompletionOutcome =
 	| 'shown'
-	| 'empty'
-	| 'cancelled'
 	| 'excluded'
-	| 'disabled'
 	| 'no-model'
 	| 'paused-quota'
 	| 'paused-slow'
-	| 'timeout'
 	| 'error';

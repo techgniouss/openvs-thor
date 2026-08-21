@@ -12,6 +12,28 @@ export type ExclusionReason =
 	| 'language'
 	| 'untrusted';
 
+/** Status-bar tooltip wording for each {@link ExclusionReason}. */
+const EXCLUSION_DETAIL: Record<ExclusionReason, string> = {
+	'secret-file': 'this file looks like a credential store',
+	'secret-line': 'the current line looks like it contains a credential',
+	'scheme': 'this editor is not a saved file',
+	'user-glob': 'excluded by openvsChat.completions.excludeFiles',
+	'language': 'disabled for this language in Settings',
+	'untrusted': 'this workspace is not trusted',
+};
+
+/**
+ * Human-readable detail for {@link ExclusionReason}, for the status bar tooltip.
+ *
+ * `isExcluded`'s reason used to be computed and then discarded by its only production
+ * caller, which checked it as a plain boolean — the status bar's own doc comment names an
+ * example tooltip ("this file is excluded because it looks like a credential store") that no
+ * caller could actually produce. This is what lets that example be true.
+ */
+export function describeExclusion(reason: ExclusionReason): string {
+	return EXCLUSION_DETAIL[reason];
+}
+
 /** The document and position facts the guard needs. */
 export interface ExclusionTarget {
 	/** Workspace-relative path, forward slashes. */

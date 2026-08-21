@@ -29,10 +29,16 @@ export class CompletionCache {
 	 *
 	 * Includes the model, because the same position answered by a different backend is a
 	 * different answer, and the suffix, because an edit below the cursor changes what a
-	 * correct completion is even when everything above it is untouched.
+	 * correct completion is even when everything above it is untouched. Also includes the
+	 * imports block — sent to the model separately from `prefix` and capable of changing what
+	 * a correct completion is on its own (a new import in scope) even when the cursor's
+	 * immediate surroundings did not change — and `invoked`, because an explicit request asks
+	 * for more lines than an automatic one and must not be answered from a shorter entry an
+	 * automatic request left behind at the same position.
 	 */
-	keyFor(model: string, prefix: string, suffix: string): string {
-		return [model, prefix.slice(-KEY_PREFIX_CHARS), suffix.slice(0, KEY_SUFFIX_CHARS)].join(KEY_SEPARATOR);
+	keyFor(model: string, prefix: string, suffix: string, imports = '', invoked = false): string {
+		return [model, prefix.slice(-KEY_PREFIX_CHARS), suffix.slice(0, KEY_SUFFIX_CHARS), imports, invoked ? '1' : '0']
+			.join(KEY_SEPARATOR);
 	}
 
 	get(key: string): string | undefined {

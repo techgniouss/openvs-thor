@@ -238,9 +238,17 @@ export class RoleRouter {
 	 * fall back if the first model fails at runtime (e.g. a model id this account cannot
 	 * actually serve). A configured role yields exactly one entry — it is honoured as-is and
 	 * never substituted. An unset role yields the ranked inferred candidates.
+	 *
+	 * `ignorePin` defaults to `false`, keeping every existing call site's behavior (pin
+	 * honoured as-is) unchanged. The one caller that needs the full ranked pool even while a
+	 * role is pinned is the completions model *picker* — `resolve()`'s own path still calls
+	 * this with `ignorePin: false` so the pin keeps governing which model actually serves a
+	 * request; only the list shown to the user for switching away from it uses `true`.
 	 */
-	async resolveRoleCandidates(role: RoutedRole, needs: RoleNeeds = {}, memo: CredentialMemo = new Map(), localReachable = false): Promise<RoleAssignment[]> {
-		const configured = this.getConfigured(role);
+	async resolveRoleCandidates(
+		role: RoutedRole, needs: RoleNeeds = {}, memo: CredentialMemo = new Map(), localReachable = false, ignorePin = false,
+	): Promise<RoleAssignment[]> {
+		const configured = ignorePin ? undefined : this.getConfigured(role);
 		if (configured) {
 			return [await this.evaluate(role, configured.providerId, configured.model, 'configured', needs, memo)];
 		}

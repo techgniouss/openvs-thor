@@ -8,8 +8,16 @@ import { RateLimitSnapshot } from '../providers/rateLimits';
 /** How long a rate-limit reading is trusted before it is treated as no information. */
 const SNAPSHOT_TTL_MS = 300_000;
 
-/** Whether a completion request may proceed, and if not, why it is standing down. */
-export type GateResult = 'ok' | 'paused-quota' | 'paused-slow';
+/**
+ * Whether a completion request may proceed, and if not, why it is standing down.
+ *
+ * Only the quota reason belongs here — latency is `HealthTracker`'s concern, checked at a
+ * separate call site, so `'paused-slow'` is deliberately not a member: a discriminant this
+ * function can never produce would leave the caller unable to tell "the real reason" from
+ * "whatever this collapses unhandled values to", which is exactly the failure a caller
+ * collapsing everything non-`'ok'` to one hardcoded label would otherwise hide.
+ */
+export type GateResult = 'ok' | 'paused-quota';
 
 /**
  * Serializes completion requests and decides when not to send one at all.

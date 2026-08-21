@@ -36,14 +36,22 @@ export class HealthTracker {
 	/**
 	 * Whether the backend is currently too slow. Requires a full window of samples, so the
 	 * breaker cannot trip on a cold start, and clears itself as soon as latency recovers.
+	 *
+	 * Trips on a majority of the window, not any single sample — with the default window of
+	 * 5, a percentile-based verdict (e.g. p95) degenerates to the plain maximum and one cold
+	 * request would trip it alone, exactly what the class-level doc comment above says must
+	 * not happen.
+	 *
+	 * `slowMs` defaults to the constructor's value but should be passed fresh by the caller
+	 * (`openvsChat.completions.slowMs` is meant to apply immediately, not only once this
+	 * tracker is next rebuilt).
 	 */
-	isSlow(): boolean {
+	isSlow(slowMs: number = this.slowMs): boolean {
 		if (this.samples.length < this.window) {
 			return false;
 		}
-		const sorted = [...this.samples].sort((a, b) => a - b);
-		const p95 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))];
-		return p95 > this.slowMs;
+		const slow = this.samples.filter(ms => ms > slowMs).length;
+		return slow > this.samples.length / 2;
 	}
 
 	/** Forgets history — used when the model changes, since the old latency says nothing. */

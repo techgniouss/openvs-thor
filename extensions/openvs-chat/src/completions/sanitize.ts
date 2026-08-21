@@ -42,10 +42,20 @@ export function sanitizeCompletion(raw: string, window: SanitizeWindow, limits: 
 	return text;
 }
 
-/** Removes an inline reasoning block. `reasoning_content` is dropped at the provider layer;
- *  this catches models that write the same thing into ordinary content instead. */
+/**
+ * Removes an inline reasoning block. `reasoning_content` is dropped at the provider layer;
+ * this catches models that write the same thing into ordinary content instead.
+ *
+ * Falls back to end-of-text when there is no closing tag, not just a matched pair — unlike
+ * `persona/thinking.ts`'s `stripThinkingTags` (case-sensitive, `<thinking>` only, no
+ * unclosed-tag fallback), which exists for a full agent turn that is never deliberately cut
+ * short. A completion request is: `COMPLETION_FETCH_OPTS` gives it a 2500ms timeout with no
+ * retry, so a reasoning model's `<think>` block cut off mid-thought is an expected outcome,
+ * not a rare one, and without the fallback the unclosed tag and its contents would pass
+ * straight through as ghost text instead of being stripped to nothing.
+ */
 function stripThinking(text: string): string {
-	return text.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '');
+	return text.replace(/<think(?:ing)?>[\s\S]*?(?:<\/think(?:ing)?>|$)/gi, '');
 }
 
 /**
@@ -85,18 +95,30 @@ function looksLikeCode(line: string, prefix: string): boolean {
 }
 
 /**
+ * Length of the longest overlap where a suffix of `a` equals a prefix of `b` (0 when there
+ * is none). The shared scan behind both {@link stripRestatedPrefix} and
+ * {@link stripRestatedSuffix} — they are the same overlap in opposite directions, and used
+ * to be two independent copies that had already drifted (only one carried an empty-input
+ * guard, itself redundant here: when either string is empty `max` is 0 and the loop below
+ * never runs regardless).
+ */
+function overlapLength(a: string, b: string): number {
+	const max = Math.min(a.length, b.length);
+	for (let n = max; n > 0; n--) {
+		if (a.endsWith(b.slice(0, n))) {
+			return n;
+		}
+	}
+	return 0;
+}
+
+/**
  * Drops a restated prefix. Models frequently echo the code they were given before adding
  * to it; inserted verbatim that duplicates whatever is already on screen. The longest
  * suffix of the prefix that the output opens with is the overlap to remove.
  */
 function stripRestatedPrefix(text: string, prefix: string): string {
-	const max = Math.min(prefix.length, text.length);
-	for (let n = max; n > 0; n--) {
-		if (text.startsWith(prefix.slice(-n))) {
-			return text.slice(n);
-		}
-	}
-	return text;
+	return text.slice(overlapLength(prefix, text));
 }
 
 /**
@@ -104,16 +126,7 @@ function stripRestatedPrefix(text: string, prefix: string): string {
  * closes the block the editor has already closed below the cursor.
  */
 function stripRestatedSuffix(text: string, suffix: string): string {
-	if (!suffix) {
-		return text;
-	}
-	const max = Math.min(suffix.length, text.length);
-	for (let n = max; n > 0; n--) {
-		if (text.endsWith(suffix.slice(0, n))) {
-			return text.slice(0, text.length - n);
-		}
-	}
-	return text;
+	return text.slice(0, text.length - overlapLength(text, suffix));
 }
 
 /** Hard cap on length. A model asked for one line will sometimes write a module. */

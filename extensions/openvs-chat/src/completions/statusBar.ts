@@ -34,6 +34,10 @@ export class CompletionStatusBar {
 	/** Renders the outcome of the most recent attempt. */
 	setOutcome(outcome: CompletionOutcome, detail?: string): void {
 		switch (outcome) {
+			case 'excluded':
+				this.item.text = '$(circle-slash) Thor';
+				this.item.tooltip = `Not offered here${detail ? `: ${detail}` : ''}.`;
+				return;
 			case 'paused-quota':
 				this.item.text = '$(watch) Thor';
 				this.item.tooltip = 'Paused: this provider\'s token window is nearly spent, leaving the remainder for Agent runs.';

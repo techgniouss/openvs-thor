@@ -16,7 +16,7 @@ import { CompletionStatusBar } from './statusBar';
 import { CompletionWindow } from './types';
 import { HealthTracker } from './health';
 import { applyEol, buildWindow } from './context';
-import { isExcluded } from './exclusions';
+import { describeExclusion, isExcluded } from './exclusions';
 import { sanitizeCompletion } from './sanitize';
 
 /** Settings read fresh per request, so a change takes effect without a reload. */
@@ -71,7 +71,7 @@ export class OpenVSInlineCompletionProvider implements vscode.InlineCompletionIt
 	) {
 		this.router = router;
 		this.resolver = new CompletionModelResolver(router, registry);
-		this.health = new HealthTracker(readSettings().slowMs);
+		this.health = new HealthTracker();
 		void this.refreshModelCandidates().catch(() => { });
 		this.configListener = vscode.workspace.onDidChangeConfiguration(e => {
 			if (e.affectsConfiguration('openvsChat.completions') || e.affectsConfiguration('openvsChat.auto')) {
@@ -90,7 +90,7 @@ export class OpenVSInlineCompletionProvider implements vscode.InlineCompletionIt
 		const invoked = context.triggerKind === vscode.InlineCompletionTriggerKind.Invoke;
 		const relativePath = vscode.workspace.asRelativePath(document.uri, false).replace(/\\/g, '/');
 
-		if (isExcluded({
+		const exclusion = isExcluded({
 			relativePath,
 			scheme: document.uri.scheme,
 			languageId: document.languageId,
@@ -100,7 +100,9 @@ export class OpenVSInlineCompletionProvider implements vscode.InlineCompletionIt
 			trusted: vscode.workspace.isTrusted,
 			allowUntrusted: settings.allowUntrusted,
 			disabledLanguages: settings.disabledLanguages,
-		})) {
+		});
+		if (exclusion) {
+			this.status.setOutcome('excluded', describeExclusion(exclusion));
 			return undefined;
 		}
 
@@ -111,18 +113,6 @@ export class OpenVSInlineCompletionProvider implements vscode.InlineCompletionIt
 		}
 		const provider = this.registry.getProvider(resolved.providerId);
 		if (!provider) {
-			return undefined;
-		}
-
-		// Both breakers govern automatic requests only. An explicit Alt+\ is the user saying
-		// they will wait, and refusing it would leave no way to use a slow or nearly-spent
-		// backend deliberately.
-		if (!invoked && this.health.isSlow()) {
-			this.status.setOutcome('paused-slow');
-			return undefined;
-		}
-		if (!invoked && this.scheduler.gate(provider.rateLimit?.(resolved.model), settings.quotaReserve) !== 'ok') {
-			this.status.setOutcome('paused-quota');
 			return undefined;
 		}
 
@@ -137,8 +127,25 @@ export class OpenVSInlineCompletionProvider implements vscode.InlineCompletionIt
 			importChars: IMPORT_CHARS,
 		});
 
-		const key = this.cache.keyFor(resolved.model, window.prefix, window.suffix);
+		const key = this.cache.keyFor(resolved.model, window.prefix, window.suffix, window.imports, invoked);
 		const cached = this.cache.get(key);
+
+		// Both breakers govern live requests only — a cache hit costs nothing (no network
+		// call at all), so it must never be gated behind either. Checked here, after the
+		// cache lookup, rather than before it. An explicit Alt+\ additionally always bypasses
+		// both: the user is saying they will wait, and refusing it would leave no way to use a
+		// slow or nearly-spent backend deliberately.
+		if (cached === undefined) {
+			if (!invoked && this.health.isSlow(settings.slowMs)) {
+				this.status.setOutcome('paused-slow');
+				return undefined;
+			}
+			if (!invoked && this.scheduler.gate(provider.rateLimit?.(resolved.model), settings.quotaReserve) !== 'ok') {
+				this.status.setOutcome('paused-quota');
+				return undefined;
+			}
+		}
+
 		const text = cached ?? await this.request(provider, resolved, window, settings, invoked, token);
 		if (!text) {
 			return undefined;
@@ -316,14 +323,43 @@ export class OpenVSInlineCompletionProvider implements vscode.InlineCompletionIt
 	 * keeps {@link currentModelId} pointing at a model that is actually in that list — falling
 	 * back to the router's own top pick when the previous selection dropped out (e.g. its
 	 * credential was cleared), so the picker never shows a phantom current model.
+	 *
+	 * Passes `ignorePin: true` — {@link resolveRoleCandidates} honours a configured
+	 * `openvsChat.completions.model` by returning exactly that one entry, which is correct
+	 * for `resolve()` (a pin must govern which model actually serves a request) but wrong
+	 * here: it would collapse this picker to a single, unswitchable option the moment any
+	 * model is ever picked from it. The pin still wins for real requests; it is only not
+	 * allowed to hide the rest of the pool from the UI that lets the user change it. If the
+	 * pin names a model outside the ranked pool (e.g. one a provider doesn't suggest), it is
+	 * still resolved and prepended so the picker's "current" entry never disagrees with what
+	 * is actually serving completions.
 	 */
 	private async refreshModelCandidates(): Promise<void> {
 		const assignments: RoleAssignment[] = await this.router.resolveRoleCandidates(
-			'complete', {}, new Map(), this.resolver.localReachable);
+			'complete', {}, new Map(), this.resolver.localReachable, true);
 		this.candidates = assignments
 			.filter(a => a.ready)
 			.map(a => ({ id: `${a.providerId}:${a.model}`, name: `${a.model} (${a.providerLabel})` }));
-		if (!this.candidates.some(c => c.id === this.currentModelId)) {
+
+		const pinned = this.router.getConfigured('complete');
+		if (pinned) {
+			// A configured pin is the sole source of truth for what actually serves a request
+			// (see resolve(), which always honours it) — the picker's "current" entry must
+			// track it unconditionally, not just when the *previous* currentModelId became
+			// invalid. Sticking with "still a valid candidate" here would let a pin changed
+			// underneath this provider (a settings.json edit, Settings Sync) leave the picker
+			// showing the old selection, since that old model can easily still be a live,
+			// ready candidate in the unpinned ranked pool above — just no longer the one
+			// actually routing completions.
+			const pinnedId = `${pinned.providerId}:${pinned.model}`;
+			if (!this.candidates.some(c => c.id === pinnedId)) {
+				const assignment = await this.router.resolveRole('complete', {}, new Map(), this.resolver.localReachable);
+				if (assignment.ready) {
+					this.candidates = [{ id: pinnedId, name: `${assignment.model} (${assignment.providerLabel})` }, ...this.candidates];
+				}
+			}
+			this.currentModelId = this.candidates.some(c => c.id === pinnedId) ? pinnedId : (this.candidates[0]?.id ?? '');
+		} else if (!this.candidates.some(c => c.id === this.currentModelId)) {
 			this.currentModelId = this.candidates[0]?.id ?? '';
 		}
 		this.onDidChangeModelInfoEmitter.fire();
