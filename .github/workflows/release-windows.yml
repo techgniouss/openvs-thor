@@ -32,6 +32,21 @@ jobs:
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      - name: Exclude build workspace from Windows Defender
+        # GH-hosted windows-latest runners' real-time AV has been observed quarantining
+        # freshly-downloaded unsigned native .node binaries mid-npm-install (this repo
+        # pulls several, e.g. extensions/copilot's @github/copilot sdk prebuilds) -
+        # npm still exits 0 since the file was written successfully at the time, so this
+        # fails silently many steps later instead of here. Exclude the whole runner
+        # workspace parent (covers the checkout dir and the sibling VSCode-win32-x64
+        # output dir the packaging step writes next to it).
+        shell: pwsh
+        run: |
+          $parent = Split-Path -Parent $env:GITHUB_WORKSPACE
+          Add-MpPreference -ExclusionPath $parent -ErrorAction SilentlyContinue
+          Add-MpPreference -ExclusionProcess "node.exe" -ErrorAction SilentlyContinue
+          Write-Host "Excluded $parent from Windows Defender real-time scanning"
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -62,6 +77,28 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Verify Copilot SDK native prebuilds installed
+        # Fails fast here (with a clear message) instead of ~6 minutes into the build,
+        # where a missing prebuilds dir surfaces as an opaque
+        # "Copilot SDK directory not found" from prepareBuiltInCopilotRipgrepShim.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sdkPrebuilds = "extensions\copilot\node_modules\@github\copilot\sdk\prebuilds\win32-x64"
+          function HasFiles($path) {
+            (Test-Path $path) -and ((Get-ChildItem $path -File -ErrorAction SilentlyContinue).Count -gt 0)
+          }
+          if (-not (HasFiles $sdkPrebuilds)) {
+            Write-Warning "Copilot SDK native prebuilds missing/empty at $sdkPrebuilds - reinstalling extensions/copilot"
+            Remove-Item -Recurse -Force "extensions\copilot\node_modules\@github\copilot" -ErrorAction SilentlyContinue
+            npm install --prefix extensions/copilot
+            if (-not (HasFiles $sdkPrebuilds)) {
+              throw "Copilot SDK native prebuilds still missing after reinstall at $sdkPrebuilds"
+            }
+          }
+          Write-Host "Copilot SDK native prebuilds present:"
+          Get-ChildItem $sdkPrebuilds -File | ForEach-Object { Write-Host "  $($_.Name)" }
 
       - name: Build client (compile, mangle, minify, package)
         run: npm run gulp vscode-win32-x64-min
