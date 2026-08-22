@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import type { PermissionRequest } from '@github/copilot-sdk';
+import type { JsonValue, PermissionRequest } from '@github/copilot-sdk';
 import { hasKey } from '../../../../base/common/types.js';
 import { URI } from '../../../../base/common/uri.js';
 import { appendEscapedMarkdownInlineCode, escapeMarkdownLinkLabel, MarkdownString } from '../../../../base/common/htmlContent.js';
@@ -977,8 +977,8 @@ export interface ITypedPermissionRequest {
 	serverName?: string;
 	/** Tool name — set for `mcp` and `custom-tool` permission requests. */
 	toolName?: string;
-	/** Tool arguments — set for `custom-tool` permission requests. */
-	args?: Record<string, unknown>;
+	/** Tool arguments — set for `custom-tool` permission requests. Typed as the SDK's `JsonValue` (not `Record<string, unknown>`) because the SDK's own field admits `null`/arrays/primitives; the read site narrows it with a runtime object check. */
+	args?: JsonValue;
 	/** URL — set for `url` permission requests. */
 	url?: string;
 	/** Unified diff of the proposed change — set for `write` permission requests. */

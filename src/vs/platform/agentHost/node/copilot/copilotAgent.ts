@@ -889,7 +889,10 @@ export class CopilotAgent extends Disposable implements IAgent {
 
 	private _createModelConfigSchema(m: ModelInfo): ConfigSchema | undefined {
 		const properties: ConfigSchema['properties'] = {};
-		const thinkingLevel = this._createThinkingLevelConfigSchemaProperty(m.supportedReasoningEfforts, m.defaultReasoningEffort);
+		// The SDK's `Model` (from `rpc.models.list()`) carries `supportedReasoningEfforts`
+		// but has no explicit default-effort field — unlike its unrelated, differently-shaped
+		// `ModelInfo` type used elsewhere. Fall back to the first supported effort.
+		const thinkingLevel = this._createThinkingLevelConfigSchemaProperty(m.supportedReasoningEfforts, m.supportedReasoningEfforts?.[0]);
 		if (thinkingLevel) {
 			properties[ThinkingLevelConfigKey] = thinkingLevel;
 		}

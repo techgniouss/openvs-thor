@@ -45,6 +45,21 @@ jobs:
         with:
           python-version: '3.x'
 
+      - name: Locate Visual Studio (for build/npm/preinstall.ts's toolchain check)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            throw "vswhere.exe not found at $vswhere - runner image changed, update this step"
+          }
+          $vsPath = & $vswhere -latest -products * -property installationPath
+          if (-not $vsPath) {
+            throw "vswhere found no Visual Studio installation"
+          }
+          Write-Host "Found Visual Studio at: $vsPath"
+          echo "vs2022_install=$vsPath" >> $env:GITHUB_ENV
+
       - name: Install dependencies
         run: npm ci
 
