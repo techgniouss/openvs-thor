@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import type { CopilotSession, ExitPlanModeRequest, MessageOptions, PermissionRequestResult, SessionConfig, Tool, ToolResultObject, McpServerStatus as SdkMcpServerStatus } from '@github/copilot-sdk';
+import type { CopilotSession, ExitPlanModeRequest, JsonValue, MessageOptions, PermissionRequestResult, SessionConfig, Tool, ToolResultObject, McpServerStatus as SdkMcpServerStatus } from '@github/copilot-sdk';
 import { DeferredPromise } from '../../../../base/common/async.js';
 import { encodeBase64, VSBuffer } from '../../../../base/common/buffer.js';
 import { Emitter } from '../../../../base/common/event.js';
@@ -1409,7 +1409,8 @@ export class CopilotAgentSession extends Disposable {
 					throw new Error(`tools/call missing 'name' parameter`);
 				}
 				const rawArgs = params ? params['arguments'] : undefined;
-				const args = isObject(rawArgs) ? rawArgs as Record<string, unknown> : undefined;
+				// `rawArgs` comes off the wire as plain JSON, so it is safe to narrow into the SDK's `JsonValue`.
+				const args = isObject(rawArgs) ? rawArgs as JsonValue as { [k: string]: JsonValue | undefined } : undefined;
 				return apps.callTool({ serverName, toolName: name, arguments: args, originServerName: serverName });
 			}
 			case 'resources/read': {

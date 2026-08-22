@@ -35,8 +35,11 @@ suite('MCP - Sampling Log', () => {
 		// background schedulers) instead of emitting a `console.warn` that would
 		// fail the renderer's no-console-output assertion. The option exists in
 		// @sinonjs/fake-timers but is missing from the @types/sinon typings, so
-		// we widen the config type locally.
-		const fakeTimerOpts: Partial<sinon.SinonFakeTimersConfig> & { shouldClearNativeTimers: boolean } = { shouldClearNativeTimers: true };
+		// we widen the config type locally — derived from `useFakeTimers`'s own
+		// signature rather than a named export, since that export's name has
+		// already moved once (`SinonFakeTimersConfig` -> `FakeTimerInstallOpts`).
+		type FakeTimerOpts = Extract<NonNullable<Parameters<typeof sinon.useFakeTimers>[0]>, object>;
+		const fakeTimerOpts: Partial<FakeTimerOpts> & { shouldClearNativeTimers: boolean } = { shouldClearNativeTimers: true };
 		clock = sinon.useFakeTimers(fakeTimerOpts);
 		clock.setSystemTime(new Date('2023-10-01T00:00:00Z').getTime());
 	});
