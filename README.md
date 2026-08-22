@@ -121,11 +121,42 @@ npm test --prefix extensions/openvs-chat
 
 ### Continuous integration
 
-There is none, deliberately. The workflows inherited from `microsoft/vscode` all targeted
-Microsoft's own infrastructure — self-hosted `1ES.Pool` runners, `vscode-large-runners`,
-internal secrets, telemetry extraction, Monaco publishing — so none of them could ever run
-in this fork, and they have been removed rather than left to fail. Verification is the local
-commands above.
+There is no GitHub Actions CI on pushes or PRs, deliberately. The `build/azure-pipelines/`
+definitions inherited from `microsoft/vscode` all target Microsoft's own infrastructure —
+self-hosted `1ES.Pool` runners, `vscode-large-runners`, internal Key Vault secrets, ESRP code
+signing, telemetry extraction, Monaco publishing — so none of them can run outside Microsoft
+and are left in place unused rather than deleted (they're Azure Pipelines YAML, and this repo
+has no `.github/workflows/` wired to trigger any of them). Verification is the local commands
+above.
+
+The one workflow this fork does run is [`.github/workflows/release-windows.yml`](.github/workflows/release-windows.yml),
+which builds a Windows installer whenever a GitHub Release is published — see "Release builds"
+below.
+
+## Release builds
+
+Publishing a GitHub Release triggers
+[`release-windows.yml`](.github/workflows/release-windows.yml): a `windows-latest` runner
+installs dependencies, runs the same `gulp` tasks a local Windows build would
+(`vscode-win32-x64-min` → `vscode-win32-x64-inno-updater` → `vscode-win32-x64-system-setup`),
+and uploads the resulting installer to that release as `OpenVSSetup-x64-<version>.exe`. It
+also always publishes the exe as a workflow artifact, so a manual run (`workflow_dispatch`,
+from the Actions tab) lets you sanity-check a build without cutting a release — leave the
+`upload_to_release` input blank to just build, or set it to an existing release's tag to
+attach the result there too.
+
+This build is **unsigned** (no ESRP/code-signing — that requires Microsoft's internal
+certificates) and **x64 only** — no arm64 or macOS/Linux packaging is wired up. To build
+locally instead (any Windows machine with the toolchain in "Building and running" above):
+
+```sh
+npm run gulp vscode-win32-x64-min           # compile, mangle, minify, package the client
+npm run gulp vscode-win32-x64-inno-updater  # brand the updater's icon
+npm run gulp vscode-win32-x64-system-setup  # -> .build/win32-x64/system-setup/OpenVSSetup.exe
+```
+
+Swap `-system-setup` for `-user-setup` for a per-user (no-admin) installer, or `x64` for
+`arm64` to cross-build the other architecture.
 
 ## Repository layout
 

@@ -124,6 +124,7 @@ export const REMOTE_DENIED: readonly string[] = [
 	'setMaxSteps',
 	'setMaxRunMinutes',
 	'setDecompose',
+	'setCompletionsEnabled',
 	'attachContext',
 	'applyEdit',
 	'insertAtCursor',

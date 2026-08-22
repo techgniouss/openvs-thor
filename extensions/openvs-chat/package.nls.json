@@ -103,5 +103,21 @@
   "config.persona.thinking": "Ask the model to reason inside a <thinking> block before answering (shown inline as \"🤔 Thinking…\"). Turn off for models that reason natively or to tighten output.",
   "config.persona.environment": "Include a workspace environment snapshot (git branch and status, platform, open files) in the system prompt so answers are grounded in your project state.",
   "config.systemPrompt": "System prompt prepended to every conversation.",
-  "config.maxTokens": "Maximum number of tokens to generate per response round. When a response hits this limit, the chat automatically continues it in place (up to 8 rounds), so long answers and big code blocks are not cut off midway. Non-inline Edit mode (which asks for a whole file back) always uses at least 8192 regardless of this setting."
+  "config.maxTokens": "Maximum number of tokens to generate per response round. When a response hits this limit, the chat automatically continues it in place (up to 8 rounds), so long answers and big code blocks are not cut off midway. Non-inline Edit mode (which asks for a whole file back) always uses at least 8192 regardless of this setting.",
+  "config.completions.enabled": "Show inline code completions as you type.",
+  "config.completions.model": "Pin the completion model as 'provider:model'. Empty selects one automatically from your configured providers.",
+  "config.completions.debounceMs": "How long to wait after you stop typing before requesting a completion.",
+  "config.completions.maxLines": "Maximum lines in an automatic completion. An explicit request allows four times this.",
+  "config.completions.prefixChars": "Characters of context sent from before the cursor.",
+  "config.completions.suffixChars": "Characters of context sent from after the cursor.",
+  "config.completions.maxTokens": "Maximum tokens a completion may generate.",
+  "config.completions.quotaReserve": "Fraction of a provider's token window kept in reserve for Agent runs. Automatic completions pause below it.",
+  "config.completions.slowMs": "Latency above which a backend is treated as too slow for inline completion, pausing automatic requests.",
+  "config.completions.disabledLanguages": "Language ids never to complete in, for example 'markdown'.",
+  "config.completions.excludeFiles": "Glob patterns never sent to a completion model. Credential files are always excluded regardless of this setting.",
+  "config.completions.inComments": "Offer completions while the cursor is in a comment.",
+  "config.completions.untrusted": "Allow inline completions in untrusted workspaces. Off by default: file contents are sent to your model provider as you type.",
+  "commands.completionsToggle": "Toggle Inline Completions",
+  "commands.completionsTrigger": "Trigger Inline Completion",
+  "commands.completionsShowStats": "Show Inline Completion Stats"
 }

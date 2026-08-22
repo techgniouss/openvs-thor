@@ -295,6 +295,66 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   merely drawn: after a runtime fallback the phase header no longer names the model that answered,
   and `test-auto-router.mjs` is what keeps the routing itself honest (nothing else exercises
   the real router — `test-agent-loop.mjs` drives the orchestrator against a stub).
+- `src/completions/` — Copilot-style inline ghost-text completions, twelve small modules
+  glued together by `inlineProvider.ts`'s `OpenVSInlineCompletionProvider`: `context.ts`
+  (windows the prefix/suffix around the cursor, LF-normalized, with the file's import block
+  extracted separately so a window that has slid past the top doesn't lose it),
+  `exclusions.ts` (credential-file and secret-line denylist, scheme allowlist, trust and
+  language gates — see below), `prompt.ts` (the FIM stop sequences and the chat-fallback
+  two-turn prompt), `sanitize.ts` (repairs a chat model's reply into insertable text — see
+  below), `cache.ts` (position → suggestion, covers backspacing over a rejected suggestion
+  or undoing, which the editor's own `enableForwardStability` does not), `health.ts` (a
+  p95-latency breaker so a backend that queues for twenty seconds stands down instead of
+  reading as "the feature is broken"), `scheduler.ts` (one in-flight request at a time, plus
+  a token-budget gate that gives way to a running Agent step), `completionModel.ts`
+  (resolves the `complete` role to a provider+model, including a debounced, never-awaited
+  reachability probe for the local endpoint), `statusBar.ts` and `stats.ts` (why the feature
+  is silent right now, and whether what it *does* show is actually being accepted — the
+  only measurement that says the feature works, since the model pool here is whatever
+  free-tier backend the user happens to hold a key for and quality varies enormously), and
+  `types.ts` (the shared `CompletionWindow`/`CompletionOutcome` shapes).
+  **FIM vs. chat is a real fork, not a fallback formality**: a genuine fill-in-the-middle
+  endpoint (Ollama/LM Studio's legacy completions endpoint with `suffix`, or Mistral's
+  `codestral`/`devstral`) is a different wire format with different stop sequences
+  (`FIM_STOP`, a single blank line — a fence would never fire there) from the two-turn chat
+  prompt every other backend gets (`COMPLETION_STOP`, a fence or a triple newline), because
+  none of the free-tier chat backends this extension targets are completion models: asked to
+  continue code, they narrate, fence, and frequently echo back the prefix and suffix they
+  were just given. **The sanitizer in `sanitize.ts` is load-bearing, not cosmetic** — every
+  rule in it (strip an inline reasoning block, unwrap or reject a fence, drop a restated
+  prefix/suffix by longest-overlap, cap lines, cut at the first line that both dedents and
+  closes a bracket) corresponds to a failure mode actually observed from those backends, runs
+  in a fixed order because later rules assume earlier ones already fired, and is what stands
+  between a raw completion and a user seeing "sure, here's the completion:" as ghost text or
+  a doubled closing brace. Stating the constraints in the prompt (`prompt.ts`'s `SYSTEM`)
+  measurably reduces how often the sanitizer has to act, but does not make it optional.
+  **Routing for `complete` inverts several rules the Auto roles rely on.** It is a fourth
+  member of `RoutedRole` (`AutoRole | 'complete'`) resolved on its own — deliberately never
+  added to `AUTO_ROLES`, which drives `resolveAll()` and the Auto settings rows, so a
+  completion entry can't leak into the Auto pipeline's phases. `scoreForRole` rewards a
+  small/fast checkpoint for `complete` (`LIGHTWEIGHT_WEIGHT` is *added*) where every Auto
+  role penalizes one (*subtracted*), because latency is the dominant quality term when a
+  suggestion that arrives after the cursor has moved scores zero however good it is; its own
+  `ROLE_AFFINITY` pattern looks for coder/FIM-specific names instead of the Auto roles'
+  large-model signals; and `NOT_COMPLETION_MODELS` hard-excludes anything that reasons before
+  answering (`-r1`, `think`, `qwq`, bare `o[1-9]`, `reason`), on top of the premium-billed
+  `NOT_AUTO_SELECTED_MODELS` set every role already avoids auto-selecting. The `custom`
+  provider is the other inversion: every Auto role keeps it out of inference because a local
+  endpoint may not be running, but `complete` admits it once a cheap reachability probe
+  succeeds, because a local FIM model (Ollama's `qwen2.5-coder` is the suggested default) is
+  the fastest, cheapest backend available and — unlike the Auto case — that premise is
+  actually testable in under a couple seconds.
+  **Non-interference constraints future work must preserve**, enforced statically by
+  `test-completion-isolation.mjs` rather than left to review: never call the module-global
+  `setStreamIdleTimeout` (it would change chat's stall detection too) or `ProviderRegistry`'s
+  `.setModel(` (that writes the *chat* model setting, `openvsChat.<provider>.model` — the
+  picker in `inlineProvider.ts` writes `openvsChat.completions.model` instead, so the two
+  settings can't collapse into each other); never call `agentRunner`'s `adoptRequestCeiling` (a
+  96-token completion must not tighten a budget an Agent run is relying on); and use
+  `rateLimits.noteOnlyOpts()`, never the streaming path's `fetchOpts()`, when recording a
+  completion response's rate-limit headers — `fetchOpts` bundles a `pace` hook that sleeps
+  out a refill window, which is correct for a step that can afford to wait and wrong for a
+  request whose cursor position may no longer exist by the time it would resolve.
 - `src/mcp/` — Model Context Protocol client (`client.ts`) and multi-server lifecycle
   manager (`manager.ts`); merges global (`openvsChat.mcp.servers`) and per-project
   (`.openvs/mcp.json` / `.vscode/mcp.json`) server configs; project overrides global; stdio

@@ -7,7 +7,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { WebAuthManager } from './auth';
+import { RoleRouter } from './auto/router';
 import { ChatViewProvider, InlineKind } from './chatViewProvider';
+import { registerInlineCompletions } from './completions/inlineProvider';
+import { StatsRow } from './completions/stats';
 import { generateCommitMessage } from './git/commitMessage';
 import { McpManager } from './mcp/manager';
 import { loadEnvFile } from './oauth';
@@ -45,6 +48,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		}
 	}));
 	const registry = new ProviderRegistry(context.secrets);
+	const router = new RoleRouter(registry);
 	const auth = new WebAuthManager(registry);
 	const mcp = new McpManager();
 	const viewProvider = new ChatViewProvider(context, registry, auth, mcp);
@@ -52,6 +56,25 @@ export function activate(context: vscode.ExtensionContext): void {
 	context.subscriptions.push(mcp);
 	const remoteService = new RemoteService(context, viewProvider);
 	context.subscriptions.push(remoteService);
+
+	const completions = registerInlineCompletions(registry, router);
+	context.subscriptions.push(completions);
+	context.subscriptions.push(vscode.commands.registerCommand('openvsChat.completions.toggle', async () => {
+		const cfg = vscode.workspace.getConfiguration('openvsChat.completions');
+		await cfg.update('enabled', !(cfg.get<boolean>('enabled') ?? true), vscode.ConfigurationTarget.Global);
+	}));
+	context.subscriptions.push(vscode.commands.registerCommand('openvsChat.completions.trigger', async () => {
+		await vscode.commands.executeCommand('editor.action.inlineSuggest.trigger');
+	}));
+	context.subscriptions.push(vscode.commands.registerCommand('openvsChat.completions.showStats', () => {
+		const provider = completions.getActiveProvider();
+		if (!provider) {
+			vscode.window.showInformationMessage('OpenVS Thor inline completions are currently off — there is nothing to report.');
+			return;
+		}
+		completions.channel.appendLine(formatStatsReport(provider.report()));
+		completions.channel.show(true);
+	}));
 
 	context.subscriptions.push(
 		vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, viewProvider, {
@@ -212,6 +235,23 @@ export function deactivate(): void {
 	// must not do this.
 	activeViewProvider?.dispose();
 	activeViewProvider = undefined;
+}
+
+/**
+ * Renders {@link StatsRow}s for `openvsChat.completions.showStats`'s output-channel dump —
+ * highest shown count first, since that is the model with the most evidence behind its rate.
+ */
+function formatStatsReport(rows: StatsRow[]): string {
+	const header = `${new Date().toISOString()} — inline completion acceptance`;
+	if (!rows.length) {
+		return `${header}\n  No completions have been shown yet.`;
+	}
+	const sorted = [...rows].sort((a, b) => b.shown - a.shown);
+	const lines = sorted.map(r => {
+		const rate = r.rate === undefined ? 'not enough samples yet' : `${Math.round(r.rate * 100)}%`;
+		return `  ${r.model}: ${r.accepted}/${r.shown} accepted (${rate})`;
+	});
+	return [header, ...lines].join('\n');
 }
 
 async function pickProvider(registry: ProviderRegistry, placeHolder: string): Promise<string | undefined> {

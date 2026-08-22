@@ -45,6 +45,10 @@ export class MistralProvider extends OpenAICompatibleProvider {
 		// reject an image outright. Matched on the family rather than the version, so the
 		// `-latest` aliases — which is what the picker offers — are covered too.
 		visionModelPatterns: ['pixtral', 'mistral-large', 'mistral-medium', 'mistral-small', 'ministral'],
+		// Codestral is the only Mistral family served by the FIM endpoint; the instruct
+		// models reject it. Devstral is listed because the catalog serves it under both
+		// names depending on tier.
+		fimModelPatterns: ['codestral', 'devstral'],
 	};
 
 	/**
@@ -54,6 +58,14 @@ export class MistralProvider extends OpenAICompatibleProvider {
 	 */
 	protected override toolCallId(id: string): string {
 		return shortToolCallId(id);
+	}
+
+	/**
+	 * Mistral serves fill-in-the-middle at its own path rather than the legacy
+	 * `/completions` endpoint, which La Plateforme does not expose at all.
+	 */
+	protected override fimUrl(baseUrl: string): string {
+		return this.url(baseUrl, '/fim/completions');
 	}
 
 	override async listModels(apiKey: string, baseUrl: string, signal: AbortSignal): Promise<ModelEntry[]> {

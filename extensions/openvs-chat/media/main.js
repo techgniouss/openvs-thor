@@ -71,6 +71,8 @@
 	let autoConfig = { roles: [], reviewEnabled: true };
 	/** Current agent approval level (synced from `openvsChat.guardrails.approval`). */
 	let approval = 'auto-edits';
+	/** Mirrors `openvsChat.completions.enabled`, synced on every 'config'. */
+	let completionsEnabled = true;
 	/** Mirrors `openvsChat.systemPrompt` / `maxTokens` / `rules` / `agent.max*`, synced on every 'config'. */
 	let generalConfig = { systemPrompt: '', maxTokens: 8192, rules: '', maxSteps: 100, maxRunMinutes: 30 };
 	/** @type {{ label: string, content: string } | null} */
@@ -168,6 +170,7 @@
 		saveMaxRunMinutes: $('saveMaxRunMinutes'),
 		enableDecompose: /** @type {HTMLInputElement} */ ($('enableDecompose')),
 		enableReview: /** @type {HTMLInputElement} */ ($('enableReview')),
+		completionsEnabled: /** @type {HTMLInputElement} */ ($('completionsEnabled')),
 		messages: $('messages'),
 		contextChip: $('contextChip'),
 		imageChips: $('imageChips'),
@@ -1038,6 +1041,7 @@
 		if (els.maxRunMinutesInput && document.activeElement !== els.maxRunMinutesInput) {
 			els.maxRunMinutesInput.value = String(generalConfig.maxRunMinutes);
 		}
+		if (els.completionsEnabled) { els.completionsEnabled.checked = completionsEnabled; }
 		els.providerList.innerHTML = '';
 		for (const p of providers) {
 			const card = document.createElement('div');
@@ -2153,6 +2157,9 @@
 	els.enableDecompose?.addEventListener('change', () => {
 		vscode.postMessage({ type: 'setDecompose', decompose: els.enableDecompose.checked });
 	});
+	els.completionsEnabled?.addEventListener('change', () => {
+		vscode.postMessage({ type: 'setCompletionsEnabled', value: !!els.completionsEnabled.checked });
+	});
 	els.saveSystemPrompt?.addEventListener('click', () => {
 		generalConfig.systemPrompt = els.systemPromptInput.value;
 		vscode.postMessage({ type: 'setSystemPrompt', text: els.systemPromptInput.value });
@@ -2425,6 +2432,7 @@
 				if (typeof msg.rules === 'string') { generalConfig.rules = msg.rules; }
 				if (typeof msg.maxSteps === 'number') { generalConfig.maxSteps = msg.maxSteps; }
 				if (typeof msg.maxRunMinutes === 'number') { generalConfig.maxRunMinutes = msg.maxRunMinutes; }
+				if (typeof msg.completionsEnabled === 'boolean') { completionsEnabled = msg.completionsEnabled; }
 				// Auto stays local-only (the host never persists it as `defaultProvider`), so it's
 				// never touched here. Otherwise, always follow the host's `selectedProvider`: it's
 				// the one shared setting every connected client (this tab, a detached Settings

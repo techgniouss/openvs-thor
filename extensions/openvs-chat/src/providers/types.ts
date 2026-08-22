@@ -68,6 +68,21 @@ export interface ToolSpec {
 	readonly parameters: Record<string, unknown>;
 }
 
+/** One fill-in-the-middle completion request. */
+export interface FimRequest {
+	/** Text immediately before the cursor. */
+	readonly prefix: string;
+	/** Text immediately after the cursor. */
+	readonly suffix: string;
+	readonly model: string;
+	readonly apiKey: string;
+	readonly baseUrl: string;
+	readonly maxTokens: number;
+	/** Stop sequences; the caller sets these from the requested completion shape. */
+	readonly stop: string[];
+	readonly signal: AbortSignal;
+}
+
 export interface ChatRequest {
 	readonly messages: ChatMessage[];
 	readonly model: string;
@@ -82,6 +97,15 @@ export interface ChatRequest {
 	 * it renders as a UI notice instead of being spliced into the model's own answer.
 	 */
 	readonly onNotice?: (text: string) => void;
+	/**
+	 * True when this request is an inline completion, not a chat/Agent turn. Providers that
+	 * also implement {@link ChatProvider.completeFim} use this to apply the same tight
+	 * transport budget ({@link COMPLETION_FETCH_OPTS}) and never-pace rate-limit recording
+	 * ({@link RateLimitTracker.noteOnlyOpts}) on this path too — without it, the chat-fallback
+	 * branch of a completion request silently inherits the full chat timeout/retry/pace
+	 * behavior, which is exactly what the completions non-interference contract forbids.
+	 */
+	readonly isCompletion?: boolean;
 }
 
 /** An agent step: ask the model what to do next (text and/or tool calls). */
@@ -195,6 +219,12 @@ export interface ProviderInfo {
 	 * prefix — becomes something to do later rather than sooner. See `COMPACT_TRIGGER`.
 	 */
 	readonly cachesPrompts?: boolean;
+	/**
+	 * Case-insensitive regex sources marking which models this provider can serve through a
+	 * fill-in-the-middle endpoint. Absent or empty means none — see {@link modelSupportsFim}
+	 * for why this default is the opposite of {@link ProviderInfo.toolModelPatterns}.
+	 */
+	readonly fimModelPatterns?: string[];
 }
 
 /**
@@ -462,6 +492,12 @@ export interface ChatProvider {
 	 * callers fall back to learning a ceiling from the rejection when one arrives.
 	 */
 	rateLimit?(model: string): RateLimitSnapshot | undefined;
+	/**
+	 * Complete the text between `prefix` and `suffix` using a real fill-in-the-middle
+	 * endpoint. Only defined by providers that have one; callers fall back to a chat prompt.
+	 * Returns the insertion text alone — no prefix, no suffix, no fences.
+	 */
+	completeFim?(request: FimRequest): Promise<string>;
 }
 
 /**
@@ -617,6 +653,12 @@ export interface ApiFetchOptions {
 	/** Number of automatic retries on timeout / network error / 5xx (default 2). */
 	readonly retries?: number;
 	/**
+	 * Overrides the default rate-limit retry budget ({@link RATE_LIMIT_RETRIES}) that
+	 * {@link apiFetch} otherwise applies to HTTP 429 regardless of {@link retries}. For
+	 * callers — like completions — that must not wait out a 429 at all.
+	 */
+	readonly rateLimitRetries?: number;
+	/**
 	 * Called just before each automatic retry so callers can surface "retrying in Ns…"
 	 * feedback to the user. Never called for a caller-initiated abort.
 	 */
@@ -641,6 +683,26 @@ export interface ApiFetchOptions {
  * single retry, since retrying a queued request just re-enters the same queue.
  */
 export const STREAM_FETCH_OPTS = { timeoutMs: 150_000, retries: 1 } as const;
+
+/**
+ * Fetch options for an inline-completion POST. Deliberately unlike {@link STREAM_FETCH_OPTS}:
+ * a completion whose answer arrives after the cursor moved is worthless, so the first-byte
+ * window is short and there is no retry — a retried completion is stale by definition, and
+ * on backends that meter failed requests (Groq) the retry also costs budget for nothing.
+ */
+export const COMPLETION_FETCH_OPTS = { timeoutMs: 2500, retries: 0, rateLimitRetries: 0 } as const;
+
+/**
+ * Whether `model` can be served by a real fill-in-the-middle endpoint on this provider.
+ *
+ * Note the inverted default relative to {@link modelSupportsTools}: an empty or absent
+ * pattern list means *no* FIM, not "all models". A provider that has not been taught about
+ * a FIM endpoint must never be assumed to have one, because the failure is a 404 on the
+ * user's typing path rather than a degraded answer.
+ */
+export function modelSupportsFim(info: Pick<ProviderInfo, 'fimModelPatterns'>, model: string): boolean {
+	return (info.fimModelPatterns ?? []).some(pattern => new RegExp(pattern, 'i').test(model));
+}
 
 /** Wording for the "retrying in Ns…" notice shown while {@link apiFetch} backs off. */
 export function retryNotice(label: string, info: RetryInfo): string {
@@ -740,7 +802,7 @@ export async function apiFetch(
 	opts?: ApiFetchOptions,
 ): Promise<Response> {
 	const retries = opts?.retries ?? 2;
-	const rateLimitRetries = Math.max(retries, RATE_LIMIT_RETRIES);
+	const rateLimitRetries = opts?.rateLimitRetries ?? Math.max(retries, RATE_LIMIT_RETRIES);
 	const timeoutMs = opts?.timeoutMs ?? 60_000;
 	let lastError: unknown;
 	// Tracked separately so a run of 429s doesn't burn the (often smaller) network budget.
