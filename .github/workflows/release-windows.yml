@@ -1,0 +1,93 @@
+name: Release Windows build
+
+# Builds the Windows x64 installer (OpenVSSetup-x64-<version>.exe) and attaches it to
+# a published GitHub Release. There is no other CI in this fork — see README.md,
+# "Continuous integration" — the microsoft/vscode Azure Pipelines definitions under
+# build/azure-pipelines/ target Microsoft's own self-hosted infra and cannot run here.
+# This workflow is independent of those and only builds+packages, no signing/telemetry/CG.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      upload_to_release:
+        description: 'Release tag to upload the built exe to (leave empty to just build and keep it as a workflow artifact)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build OpenVS Windows x64 installer
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      npm_config_foreground_scripts: 'true'
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build client (compile, mangle, minify, package)
+        run: npm run gulp vscode-win32-x64-min
+
+      - name: Patch inno updater icon
+        run: npm run gulp vscode-win32-x64-inno-updater
+
+      - name: Build installer (Inno Setup)
+        run: npm run gulp vscode-win32-x64-system-setup
+
+      - name: Collect installer
+        id: collect
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = (node -p "require('./package.json').version")
+          $src = ".build\win32-x64\system-setup\OpenVSSetup.exe"
+          if (-not (Test-Path $src)) {
+            throw "Installer not found at $src - build did not produce an exe"
+          }
+          New-Item -ItemType Directory -Force -Path out\system-setup | Out-Null
+          $dest = "out\system-setup\OpenVSSetup-x64-$version.exe"
+          Move-Item -Force $src $dest
+          Write-Host "Installer: $dest"
+          Get-Item $dest | Select-Object Name, Length
+          echo "exe_path=$dest" >> $env:GITHUB_OUTPUT
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenVSSetup-x64-${{ steps.collect.outputs.version }}
+          path: ${{ steps.collect.outputs.exe_path }}
+          retention-days: 14
+
+      - name: Upload to GitHub Release
+        if: github.event_name == 'release' || inputs.upload_to_release != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = "${{ github.event_name == 'release' && github.event.release.tag_name || inputs.upload_to_release }}"
+          gh release upload $tag "${{ steps.collect.outputs.exe_path }}" --clobber
