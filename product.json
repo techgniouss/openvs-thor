@@ -88,8 +88,8 @@
 	],
 	"defaultChatAgent": {
 		"extensionId": "openvs.thor",
-		"chatExtensionId": "openvs.thor-chat",
-		"chatExtensionOutputId": "openvs.thor-chat.OpenVS Thor Chat.log",
+		"chatExtensionId": "openvs.openvs-chat",
+		"chatExtensionOutputId": "openvs.openvs-chat.OpenVS Thor Chat.log",
 		"chatExtensionOutputExtensionStateCommand": "",
 		"documentationUrl": "",
 		"skusDocumentationUrl": "",

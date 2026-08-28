@@ -278,6 +278,10 @@ function packageTask(platform: string, arch: string, sourceFolderName: string, d
 
 		let version = packageJson.version;
 		const quality = (product as { quality?: string }).quality;
+		// product.json in this fork carries no `quality`. Fall back to the same
+		// default build/gulpfile.vscode.win32.ts hands Inno Setup, so the launcher
+		// scripts don't get the string "undefined" stamped into them.
+		const stampedQuality = quality || 'dev';
 
 		if (quality && quality !== 'stable') {
 			version += '-' + quality;
@@ -471,7 +475,7 @@ function packageTask(platform: string, arch: string, sourceFolderName: string, d
 					.pipe(replace('@@APPNAME@@', product.applicationName))
 					.pipe(replace('@@VERSIONFOLDER@@', versionedResourcesFolder))
 					.pipe(replace('@@SERVERDATAFOLDER@@', product.serverDataFolderName || '.vscode-remote'))
-					.pipe(replace('@@QUALITY@@', quality!))
+					.pipe(replace('@@QUALITY@@', stampedQuality))
 					.pipe(rename(function (f) { f.basename = product.applicationName; f.extname = ''; })));
 			} else {
 				result = es.merge(result, gulp.src('resources/win32/bin/code.cmd', { base: 'resources/win32' })
@@ -485,7 +489,7 @@ function packageTask(platform: string, arch: string, sourceFolderName: string, d
 					.pipe(replace('@@COMMIT@@', String(commit)))
 					.pipe(replace('@@APPNAME@@', product.applicationName))
 					.pipe(replace('@@SERVERDATAFOLDER@@', product.serverDataFolderName || '.vscode-remote'))
-					.pipe(replace('@@QUALITY@@', String(quality)))
+					.pipe(replace('@@QUALITY@@', stampedQuality))
 					.pipe(rename(function (f) { f.basename = product.applicationName; f.extname = ''; })));
 			}
 
@@ -534,7 +538,17 @@ function packageTask(platform: string, arch: string, sourceFolderName: string, d
 function hasAuthenticodeSignature(filePath: string): Promise<boolean> {
 	return new Promise((resolve, reject) => {
 		const proc = cp.spawn('signtool.exe', ['verify', '/pa', filePath]);
-		proc.on('error', reject);
+		proc.on('error', err => {
+			// signtool.exe ships with the Windows SDK and is not on PATH on
+			// GitHub-hosted Windows runners. Without it nothing in the build was
+			// signed in the first place, so report "unsigned" rather than failing
+			// the whole packaging task.
+			if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+				resolve(false);
+			} else {
+				reject(err);
+			}
+		});
 		proc.on('exit', code => resolve(code === 0));
 	});
 }

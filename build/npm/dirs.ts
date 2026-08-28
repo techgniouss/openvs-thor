@@ -66,6 +66,19 @@ export const dirs = [
 	'.vscode/extensions/vscode-pr-pinger',
 ];
 
+// `extensions/copilot` vendors the GitHub Copilot Chat extension. It is excluded from
+// packaging (`excludedExtensions` in build/lib/extensions.ts) and the packaging tasks no
+// longer compile it, so a release build never needs its ~1.3GB of dependencies - only the
+// local dev flow (`npm run compile` / `npm run watch`) does. On a CI runner that install
+// costs several minutes and is by far the largest source of freshly-written unsigned
+// native prebuilds for Windows Defender to quarantine mid-install.
+if (process.env['VSCODE_SKIP_COPILOT_EXTENSION_INSTALL'] === '1') {
+	const copilotIndex = dirs.indexOf('extensions/copilot');
+	if (copilotIndex !== -1) {
+		dirs.splice(copilotIndex, 1);
+	}
+}
+
 if (existsSync(`${import.meta.dirname}/../../.build/distro/npm`)) {
 	dirs.push('.build/distro/npm');
 	dirs.push('.build/distro/npm/remote');
