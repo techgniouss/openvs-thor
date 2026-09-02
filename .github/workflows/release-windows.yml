@@ -129,7 +129,7 @@ jobs:
           echo "version=$version" >> $env:GITHUB_OUTPUT
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: OpenVSSetup-x64-${{ steps.collect.outputs.version }}
           path: ${{ steps.collect.outputs.exe_path }}
