@@ -24,6 +24,7 @@ import { OpenCodeZenProvider } from './opencodeZen';
 import { OpenRouterProvider } from './openrouter';
 import { QwenProvider } from './qwen';
 import { ChatProvider, ModelEntry } from './types';
+import { GeminiWebProvider } from './webCookie/geminiWebProvider';
 import { XkiroProvider } from './xkiro';
 import { ZaiProvider } from './zai';
 
@@ -59,7 +60,7 @@ const ENV_VARS: Record<string, string | undefined> = {
  * category of OAuth-proxy backend, each pinned to one endpoint (or, for Copilot, an
  * account-reported one) that a user-supplied base URL could not meaningfully redirect.
  */
-const NO_BASE_URL_SETTING = new Set(['antigravity', 'copilot', 'grok', 'kiro']);
+const NO_BASE_URL_SETTING = new Set(['antigravity', 'copilot', 'grok', 'kiro', 'web_gemini']);
 
 /** Per-provider runtime configuration resolved from settings + secret storage. */
 export interface ResolvedProviderConfig {
@@ -117,7 +118,7 @@ export class ProviderRegistry {
 
 	constructor(private readonly secrets: vscode.SecretStorage) {
 		this.oauth = new OAuthTokenStore(secrets);
-		for (const provider of [new NvidiaProvider(), new OpenAIProvider(), new AnthropicProvider(), new GeminiProvider(), new AntigravityProvider(), new OpenRouterProvider(), new GroqProvider(), new MistralProvider(), new CloudflareProvider(), new KimiProvider(), new QwenProvider(), new ZaiProvider(), new OpenCodeZenProvider(), new XkiroProvider(), new CopilotProvider(), new GrokProvider(), new KiroProvider(), new CustomProvider()]) {
+		for (const provider of [new NvidiaProvider(), new OpenAIProvider(), new AnthropicProvider(), new GeminiProvider(), new AntigravityProvider(), new OpenRouterProvider(), new GroqProvider(), new MistralProvider(), new CloudflareProvider(), new KimiProvider(), new QwenProvider(), new ZaiProvider(), new OpenCodeZenProvider(), new XkiroProvider(), new CopilotProvider(), new GrokProvider(), new KiroProvider(), new GeminiWebProvider(), new CustomProvider()]) {
 			this.providers.set(provider.info.id, provider);
 		}
 	}

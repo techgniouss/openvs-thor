@@ -25,6 +25,7 @@ import { GrokProvider } from './providers/grok';
 import { ProviderRegistry } from './providers/registry';
 import { withProviderResilience } from './providers/resilience';
 import { ChatImage, ChatMessage, ChatProvider, ModelEntry, entrySupportsTools, isAbortError, modelSupportsVision } from './providers/types';
+import { defaultChromeProfilePath } from './providers/webCookie/chromeCookies';
 import { AttachImageChunk, UploadAssembler } from './remote/attachments';
 import { RulesProvider } from './rules';
 import { MessageSink, SessionBus } from './session/bus';
@@ -1608,6 +1609,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				await this.registry.setApiKey(providerId, credential);
 				this.invalidateModelCache(providerId);
 				vscode.window.showInformationMessage(`${label} credential imported.`);
+			} else if (providerId === 'web_gemini') {
+				// Also not a sign-in flow — there is no credential to obtain, only a Chrome
+				// profile directory to point at. Auto-filling the DEFAULT profile's path as
+				// the primary key (rather than leaving it blank, which also works — see
+				// GeminiWebProvider.profilePath) is what makes "Additional API keys" usable
+				// for a second/third Google account: ProviderRegistry.getApiKeys only
+				// considers the backup pool once a primary key is actually stored.
+				const defaultProfile = defaultChromeProfilePath();
+				if (!defaultProfile) {
+					vscode.window.showErrorMessage('Gemini (Chrome session) has no default Chrome profile location on this platform (Windows only, for now).');
+				} else {
+					await this.registry.setApiKey(providerId, defaultProfile);
+					this.invalidateModelCache(providerId);
+					vscode.window.showInformationMessage(
+						`${label} will use the default Chrome profile (${defaultProfile}). Add more Google accounts ` +
+						'under "Additional API keys" on this card, and enable "openvsChat.webGemini.enabled" in ' +
+						'Settings before using it — read the risk in the provider\'s description first.',
+					);
+				}
 			} else if (this.registry.getAuthUrl(providerId) || supportsNativeSignIn(providerId)) {
 				// A web auth backend is configured (or the provider has a built-in
 				// account login): run the browser round-trip flow.

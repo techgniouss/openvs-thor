@@ -318,6 +318,7 @@
             "copilot",
             "grok",
             "kiro",
+            "web_gemini",
             "custom"
           ],
           "enumDescriptions": [
@@ -338,6 +339,7 @@
             "%config.provider.copilot%",
             "%config.provider.grok%",
             "%config.provider.kiro%",
+            "%config.provider.web_gemini%",
             "%config.provider.custom%"
           ],
           "default": "nvidia",
@@ -562,6 +564,16 @@
           "type": "string",
           "default": "claude-sonnet-4-5",
           "description": "%config.kiro.model%"
+        },
+        "openvsChat.web_gemini.model": {
+          "type": "string",
+          "default": "gemini-2.5-flash",
+          "description": "%config.web_gemini.model%"
+        },
+        "openvsChat.webGemini.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "%config.webGemini.enabled%"
         },
         "openvsChat.custom.model": {
           "type": "string",
@@ -972,5 +984,11 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/microsoft/vscode.git"
+  },
+  "dependencies": {
+    "sql.js": "1.14.2"
+  },
+  "devDependencies": {
+    "@types/sql.js": "1.4.11"
   }
 }

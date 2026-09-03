@@ -67,8 +67,10 @@ export interface RoleAssignment {
  */
 // copilot/grok/kiro are OAuth-proxy backends that impersonate another vendor's own client
 // identity (see their doc comments) — never something to select on a user's behalf, same
-// reasoning as antigravity. A user who wants one pins it explicitly per role.
-const NOT_AUTO_INFERRED = new Set(['custom', 'antigravity', 'copilot', 'grok', 'kiro']);
+// reasoning as antigravity. web_gemini goes further still (a real browser session replayed
+// against a consumer chat UI, off by default behind its own setting) — all barred from
+// automatic selection; a user who wants one pins it explicitly per role.
+const NOT_AUTO_INFERRED = new Set(['custom', 'antigravity', 'copilot', 'grok', 'kiro', 'web_gemini']);
 
 /**
  * Models never selected *on the user's behalf*, however well they would serve the role.

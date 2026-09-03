@@ -205,6 +205,23 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   concurrent burst onto one in-flight mint. All three sit in `auto/router.ts`'s
   `NOT_AUTO_INFERRED`, alongside `antigravity`: Auto mode must never select one of these on
   the user's behalf.
+  `providers/webCookie/` is a **fourth** category, riskier still: `geminiWebProvider.ts`'s
+  `GeminiWebProvider` (id `web_gemini`) decrypts a real signed-in Chrome profile's own Google
+  session cookies (`chromeCookies.ts` — Windows DPAPI via a `powershell.exe` one-liner to
+  unwrap Chrome's AES-256-GCM master key, then Node's built-in `crypto` per cookie; **the one
+  dependency this extension carries**, `sql.js`, reads the `Cookies` SQLite file with no
+  native build step) and replays them against `gemini.google.com`'s **consumer chat UI** via
+  its `batchexecute` wire format (`extractGeminiText`/`parseSessionTokens`, ported from a
+  companion project's verified-working implementation) — not an API-shaped backend at all.
+  Off by **default** behind its own setting (`openvsChat.webGemini.enabled`, checked on every
+  call — the extra gate `NOT_AUTO_INFERRED` membership alone doesn't give, since that only
+  stops *automatic* selection) and Windows-only (`isPlatformSupported`); on any other platform
+  or with Chrome's newer App-Bound Encryption ("v20") it fails honestly rather than guessing.
+  Single-turn (the upstream takes one prompt string, no `messages` array). Multi-account reuses
+  the ordinary key-rotation machinery from `keyRotation.ts` rather than a bespoke pool: each
+  stored "key" here is a Chrome **user-data-directory path** naming one profile, and the
+  "Sign in" button (`chatViewProvider.ts`) auto-fills the platform default rather than
+  prompting for anything, since there is nothing to paste.
 - `src/agent/` — the Agent-mode tool loop: `tools.ts` (read/list/write files, run commands,
   `fetch_url`, plus `ask_user`, which blocks the loop on a multiple-choice question).
   `fetch_url` is the agent's only route off the machine — a URL the user pasted, docs that
