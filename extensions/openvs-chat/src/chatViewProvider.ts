@@ -2062,8 +2062,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	 */
 	private async handleSlashCommand(sessionId: string, runId: string | undefined, command: string, origin: string): Promise<void> {
 		const effects = this.buildSlashEffects(sessionId, origin, await this.buildSkillsSnapshot());
-		const result = runSlash(command, effects);
+		// See `runSlash`'s own doc on why this boundary must be re-applied here, per-command,
+		// rather than trusted from `isRemoteAllowed('slash')` alone — same local/local-only
+		// check `guardrailsForRun` uses for the approval floor.
+		const result = runSlash(command, effects, origin !== WEBVIEW_SINK_ID);
 		if (result.handled) {
+			if (result.denied) {
+				this.bus.postTo(origin, { type: 'error', sessionId, message: `"${command.trim().split(/\s/, 1)[0]}" isn't available from a remote device.` });
+				return;
+			}
 			if (result.sendRest) {
 				await this.sendFollowUp(sessionId, runId, result.sendRest, origin);
 			}
