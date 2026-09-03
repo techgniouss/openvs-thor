@@ -38,6 +38,14 @@ button:active { opacity: 0.8; }
 
 input, textarea, select {
 	font: inherit;
+	/* iOS Safari zooms the whole viewport in when a form control's *computed* font-size is
+	   under 16px, on focus — the page's base 15px (inherited via `font: inherit` above) means
+	   every input/textarea/select here was silently below that threshold. The zoom is not
+	   reset on blur without a manual pinch, so every tap into the composer or pairing-code
+	   field left the app permanently zoomed in — about as far from "native feel" as a mobile
+	   text field gets. 16px is the documented floor; still visually consistent with the 15px
+	   body copy at normal viewing distance. */
+	font-size: 16px;
 	color: inherit;
 	background: var(--bg-raised);
 	border: 1px solid var(--border);

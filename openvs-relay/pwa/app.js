@@ -168,12 +168,42 @@ function loadDevice(room) {
 	}
 }
 
+/**
+ * Remembers which room this browser most recently paired to, so a launch that carries no room
+ * of its own (see {@link loadLastRoom}'s doc) can still recover an existing pairing instead of
+ * always landing back on the pairing screen.
+ */
+const LAST_ROOM_KEY = 'openvsRelay.lastRoom';
+
 function saveDevice(room, device) {
 	try {
 		localStorage.setItem(storageKey(room), JSON.stringify(device));
+		// Every successful pairing is "the most recent one" — recorded here, the one place a
+		// device actually gets persisted, rather than at each call site that happens to know a
+		// room id, so this can never drift out of sync with what {@link loadDevice} would find.
+		localStorage.setItem(LAST_ROOM_KEY, room);
 	} catch {
 		// Storage can be unavailable (private browsing, quota) — pairing simply has to be
 		// redone next visit; nothing here is safety-critical to persist.
+	}
+}
+
+/**
+ * The room this browser most recently paired to, or `''` if none/unavailable. `boot()`'s
+ * {@link parseLocation} falls back to this when the launch URL carries no room of its own —
+ * critically, the *installed* PWA's own icon: `manifest.webmanifest`'s `start_url` is the fixed
+ * `"/"`, not the `/p/<roomId>#<code>` URL pairing actually happened at, so without this every
+ * launch from the home-screen icon parsed an empty `roomId`, found nothing under `storageKey('')`
+ * and showed the pairing screen again — every single time — even though the device was already
+ * paired and its real token was sitting in storage under the room it actually paired to. A
+ * bookmarked or shared plain `/pair` link with no room is the one case this is *not* wanted; those
+ * still explicitly carry `?room=` and take precedence in `parseLocation` regardless.
+ */
+function loadLastRoom() {
+	try {
+		return localStorage.getItem(LAST_ROOM_KEY) || '';
+	} catch {
+		return '';
 	}
 }
 
@@ -366,10 +396,32 @@ function renderTabs() {
 	}
 }
 
+/**
+ * Whether the messages pane should auto-scroll to the bottom after the next render — a plain
+ * `replaceChildren()` rebuild (see `transcript.js`'s `render`) resets `scrollTop` to 0 on every
+ * single token, which without this reads as "the chat won't stay scrolled down", the opposite of
+ * every native messaging app. Tracked rather than unconditional so a user who has scrolled up to
+ * reread earlier turns mid-stream isn't yanked back down on the next token — see the `scroll`
+ * listener below, which is what keeps this honest.
+ */
+let stickToBottom = true;
+/** Distance (px) from the true bottom still counted as "at the bottom" — matches the small rubber-band slop touch scrolling leaves even when a user meant to land at the end. */
+const STICK_BOTTOM_THRESHOLD_PX = 48;
+
+if (els.messages) {
+	els.messages.addEventListener('scroll', () => {
+		const el = els.messages;
+		stickToBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= STICK_BOTTOM_THRESHOLD_PX;
+	});
+}
+
 function renderAll() {
 	const session = activeSession();
 	if (!session || !els.messages) { return; }
 	renderTranscript(els.messages, session);
+	if (stickToBottom) {
+		els.messages.scrollTop = els.messages.scrollHeight;
+	}
 	if (els.todos) {
 		renderTodos(els.todos, session.todos || []);
 	}
@@ -535,7 +587,12 @@ function setStatus(text, className) {
  */
 function echoUserTurn(session, text) {
 	(session.messages = session.messages || []).push({ role: 'user', content: text });
-	if (session.id === activeSessionId) { renderAll(); }
+	if (session.id === activeSessionId) {
+		// Sending (or steering) a turn always lands the view on it, the same as every native
+		// chat app — even if the user had scrolled up to reread something first.
+		stickToBottom = true;
+		renderAll();
+	}
 }
 
 /**
@@ -583,11 +640,47 @@ function dispatchSend(session, text, modeOverride) {
 	return true;
 }
 
+/**
+ * True if `text` was consumed as a leading-slash command, forwarded to the host's `slash`
+ * dispatch (`extensions/openvs-chat/src/session/slash.ts`'s `runSlash`) instead of an ordinary
+ * `send` — a plain-text port of `media/main.js`'s own `handleSlash`. Checked, like there, *before*
+ * the streaming steer-vs-queue decision below: `/clear`, `/mode`, `/skill`, … must act immediately
+ * even mid-run, not get queued behind whatever the current run is doing. `/history` and `/enhance`
+ * stay client-owned on the desktop (a UI panel and a composer prefill, respectively) — this shell
+ * has no history panel yet (see `case 'history':`'s own doc) and `/enhance` already has its own
+ * ✨ button, so both are simply left to fall through to the host's "unrecognized — forward as an
+ * ordinary message" fallback, exactly as an unrecognized command like `/foo` already does.
+ * @param {any} session
+ * @param {string} text
+ * @returns {boolean}
+ */
+function handleSlash(session, rawText) {
+	const text = rawText.trim();
+	if (!/^\/\w+/.test(text)) { return false; }
+	if (/^\/clear\b/i.test(text)) {
+		// Composer attachments are client-only UI state; the host owns archiving/resetting the
+		// session itself (`SessionStore.clearSession`, reached via `slash` below) — mirrors
+		// `media/main.js`'s own `/clear` handling.
+		attachedContext = null;
+		renderContextChip();
+	}
+	// The host appends this turn to the session store itself and broadcasts the resulting
+	// `sessions`/`transcript` update to every connected sink (see `sendFollowUp`/each
+	// `SlashEffects` callback in `chatViewProvider.ts`) — unlike `dispatchSend`, this must not
+	// also echo the turn locally, or it would show twice once that broadcast arrives.
+	sendApp({ type: 'slash', sessionId: session.id, command: text });
+	return true;
+}
+
 function sendMessage() {
 	const session = activeSession();
 	if (!session || !els.composer) { return; }
 	const text = els.composer.value;
 	if (!text.trim()) { return; }
+	if (handleSlash(session, text)) {
+		els.composer.value = '';
+		return;
+	}
 	if (session.streaming) {
 		// Mid-run input: steer a live agent run, queue for anything else — mirrors
 		// media/main.js's own `send()` decision (`s.runMode === 'agent' && s.steerable !== false`).
@@ -787,6 +880,12 @@ function handleAppMessage(msg) {
 			break;
 		}
 		case 'sessions': {
+			// A tab switch (including the very first snapshot) always lands at the bottom of
+			// that tab's own transcript, regardless of whatever scroll position/stickiness the
+			// previously-active tab was left in — see `stickToBottom`'s own doc.
+			if (msg.activeSessionId !== activeSessionId) {
+				stickToBottom = true;
+			}
 			const prevById = new Map(sessions.map(s => [s.id, s]));
 			sessions = (msg.sessions || []).map(s => {
 				const queue = Array.isArray(s.queue) ? s.queue : [];
@@ -1189,8 +1288,12 @@ function connect() {
 /** Reads `/p/<roomId>#<code>` — the shape the pairing QR encodes, per the plan's Auth step 3. */
 function parseLocation() {
 	const match = /^\/p\/([^/]+)/.exec(location.pathname);
+	const fromUrl = match ? decodeURIComponent(match[1]) : new URLSearchParams(location.search).get('room') || '';
 	return {
-		room: match ? decodeURIComponent(match[1]) : new URLSearchParams(location.search).get('room') || '',
+		// A launch with no room of its own (see `loadLastRoom`'s doc — chiefly the installed
+		// icon's fixed `start_url`) falls back to whichever room this browser paired to last,
+		// so it can still find that pairing's saved device token in `boot()` below.
+		room: fromUrl || loadLastRoom(),
 		code: location.hash ? decodeURIComponent(location.hash.slice(1)) : '',
 	};
 }

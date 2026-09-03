@@ -6,7 +6,14 @@
 // refetches real content from `/api/pending` and only then shows a notification.
 'use strict';
 
-const CACHE_NAME = 'openvs-relay-shell-v2';
+// Bumped from v2: this version adds the `fetch` handler below. Without one, `install` was
+// populating this cache and nothing ever read from it — every navigation and asset request
+// still went straight to the network regardless, so a phone that opened the installed app with
+// no signal got nothing (a browser network-error page), not the "offline shell" this cache's own
+// name promised. A version bump (rather than reusing v2) forces every existing install through a
+// clean `activate` — the exact moment this cache actually starts being consulted, so it should not
+// share an identity with the version that never did.
+const CACHE_NAME = 'openvs-relay-shell-v3';
 const SHELL_ASSETS = [
 	'/', '/index.html', '/app.js', '/transcript.js', '/cards.js', '/styles.css', '/manifest.webmanifest',
 	'/icon.svg', '/icon-192.png', '/icon-512.png', '/icon-512-maskable.png', '/apple-touch-icon.png',
@@ -26,6 +33,42 @@ self.addEventListener('activate', event => {
 		caches.keys().then(names => Promise.all(names.filter(name => name !== CACHE_NAME).map(name => caches.delete(name)))),
 	);
 	self.clients.claim();
+});
+
+/**
+ * Serves the cached shell so the installed app opens to *something* offline instead of a bare
+ * browser network-error page — real content (sessions, transcripts, live chat) still only ever
+ * comes from the WebSocket once connected; this only covers the static app shell itself.
+ * Deliberately narrow:
+ *  - Only GET, only same-origin — a cross-origin request (a provider's own API, a CDN) is none
+ *    of this cache's business and must never be intercepted.
+ *  - `/pair/`, `/api/`, `/ws/` are explicitly passed through untouched — pairing, push-subscribe,
+ *    pending-notification and the WebSocket upgrade must always reach the real network; serving
+ *    any of them from a cache would answer with stale or wrong data instead of failing honestly.
+ *  - A navigation (`/p/<room>`, or a plain `/` open) falls back to the cached `/index.html` when
+ *    offline — this is a single-page shell keyed entirely by the URL hash/path `app.js` parses
+ *    client-side, so the cached shell is the right answer for *any* same-origin navigation, not
+ *    just the ones literally named in `SHELL_ASSETS`.
+ *  - Everything else (the shell's own JS/CSS/icons) is cache-first, falling back to network for
+ *    anything not in `SHELL_ASSETS` (e.g. a future asset added without a matching cache bump).
+ */
+self.addEventListener('fetch', event => {
+	const request = event.request;
+	if (request.method !== 'GET') {
+		return;
+	}
+	const url = new URL(request.url);
+	if (url.origin !== self.location.origin) {
+		return;
+	}
+	if (url.pathname.startsWith('/pair/') || url.pathname.startsWith('/api/') || url.pathname.startsWith('/ws/')) {
+		return;
+	}
+	if (request.mode === 'navigate') {
+		event.respondWith(fetch(request).catch(() => caches.match('/index.html').then(cached => cached || Response.error())));
+		return;
+	}
+	event.respondWith(caches.match(request).then(cached => cached || fetch(request)));
 });
 
 // ---- Auth handoff (Phase 6b: web push triggers) -----------------------------------------------
