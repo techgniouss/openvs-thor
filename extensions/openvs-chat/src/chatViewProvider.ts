@@ -3163,6 +3163,7 @@ ${CHAT_APP_HTML}
 	<script nonce="${nonce}" src="${mediaUri('qr.js')}"></script>
 	<script nonce="${nonce}" src="${mediaUri('pairing.js')}"></script>
 	<script nonce="${nonce}" src="${mediaUri('prompts.js')}"></script>
+	<script nonce="${nonce}" src="${mediaUri('markdown.js')}"></script>
 	<script nonce="${nonce}" src="${mediaUri('main.js')}"></script>
 </body>
 </html>`;

@@ -223,3 +223,7 @@ test/unit/electron/renderer.js
 test/unit/fullJsonStreamReporter.js
 test/unit/node/index.js
 test/unit/reporter.js
+extensions/openvs-chat/media/markdown.js
+extensions/openvs-chat/scripts/test-markdown.mjs
+extensions/openvs-chat/scripts/test-mcp-http.mjs
+extensions/openvs-chat/scripts/test-fetch-url.mjs

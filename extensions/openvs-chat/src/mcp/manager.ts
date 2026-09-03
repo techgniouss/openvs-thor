@@ -5,7 +5,8 @@
 
 import * as vscode from 'vscode';
 import { ToolSpec } from '../providers/types';
-import { McpStdioClient, McpStdioConfig } from './client';
+import { McpStdioClient, McpStdioConfig, McpToolDef } from './client';
+import { McpHttpClient } from './httpClient';
 
 /** A toolset the agent loop can merge in and invoke (implemented by the MCP manager). */
 export interface McpToolset {
@@ -23,14 +24,43 @@ export interface McpToolset {
 	isReadOnly?(name: string): boolean;
 }
 
-/** Per-server configuration (stdio). `url` is reserved for a future HTTP transport. */
+/**
+ * Per-server configuration. A server is stdio (`command`) or remote (`url`) — the two are
+ * mutually exclusive, and `url` wins if both are given, since naming a URL is the more
+ * specific statement.
+ */
 interface McpServerConfig {
 	command?: string;
 	args?: string[];
 	env?: Record<string, string>;
 	cwd?: string;
 	url?: string;
+	/** Remote servers only: extra request headers, usually an `Authorization` for a hosted server. */
+	headers?: Record<string, string>;
 	disabled?: boolean;
+}
+
+/**
+ * What {@link McpManager} needs of a connection, satisfied by both transports. Declared
+ * here rather than in either client so neither has to know about the other.
+ */
+interface McpClient {
+	start(): Promise<void>;
+	listTools(): Promise<McpToolDef[]>;
+	callTool(name: string, args: Record<string, unknown>): Promise<{ text: string; isError: boolean }>;
+	dispose(): void;
+}
+
+/**
+ * Expands `${env:NAME}` in a configured header value.
+ *
+ * A hosted MCP server needs a token, and the alternative to this is the token itself
+ * sitting in `settings.json` or, worse, in a `.openvs/mcp.json` that gets committed.
+ * Only environment variables are read: no file access, no secret store lookup, nothing
+ * that a project-supplied config could aim at something it should not reach.
+ */
+function expandEnv(value: string): string {
+	return value.replace(/\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g, (_m, name) => process.env[name] ?? '');
 }
 
 const NAMESPACE = 'mcp__';
@@ -92,7 +122,7 @@ export function safeToolName(serverId: string, toolName: string, taken: Readonly
  * the agent under namespaced names. stdio servers only start in a trusted workspace.
  */
 export class McpManager implements McpToolset, vscode.Disposable {
-	private readonly clients = new Map<string, McpStdioClient>();
+	private readonly clients = new Map<string, McpClient>();
 	private readonly toolSpecs: ToolSpec[] = [];
 	/** namespaced tool name -> { server, tool, readOnly } */
 	private readonly routes = new Map<string, { server: string; tool: string; readOnly: boolean }>();
@@ -132,28 +162,37 @@ export class McpManager implements McpToolset, vscode.Disposable {
 			if (cfg.disabled) {
 				continue;
 			}
-			if (!cfg.command) {
-				this.status.push(`${id}: skipped (no "command"; only stdio servers are supported).`);
+			if (!cfg.command && !cfg.url) {
+				this.status.push(`${id}: skipped (needs a "command" for a local server, or a "url" for a remote one).`);
 				continue;
 			}
+			// The trust gate covers remote servers too, not only spawned ones: a `url` in a
+			// project's own mcp.json points the agent's tool calls — and whatever ends up in
+			// their arguments — at an endpoint the workspace chose.
 			if (!vscode.workspace.isTrusted) {
 				this.status.push(`${id}: skipped (workspace not trusted).`);
 				continue;
 			}
-			await this.startServer(id, cfg as McpStdioConfig, generation);
+			await this.startServer(id, cfg, generation);
 		}
 		if (this.generation === generation) {
 			this.started = true;
 		}
 	}
 
-	private async startServer(id: string, cfg: McpStdioConfig, generation: number): Promise<void> {
-		const client = new McpStdioClient({
-			command: cfg.command,
-			args: cfg.args,
-			env: cfg.env,
-			cwd: cfg.cwd ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
-		});
+	private async startServer(id: string, cfg: McpServerConfig, generation: number): Promise<void> {
+		const remote = !!cfg.url;
+		const client: McpClient = remote
+			? new McpHttpClient({
+				url: cfg.url!,
+				headers: Object.fromEntries(Object.entries(cfg.headers ?? {}).map(([k, v]) => [k, expandEnv(String(v))])),
+			})
+			: new McpStdioClient({
+				command: cfg.command!,
+				args: cfg.args,
+				env: cfg.env,
+				cwd: cfg.cwd ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+			} satisfies McpStdioConfig);
 		try {
 			await client.start();
 			const tools = await client.listTools();
@@ -180,7 +219,7 @@ export class McpManager implements McpToolset, vscode.Disposable {
 					parameters: isSchemaObject(tool.inputSchema) ? tool.inputSchema : { type: 'object', properties: {} },
 				});
 			}
-			this.status.push(`${id}: connected (${tools.length} tools${renamed ? `, ${renamed} renamed to fit provider limits` : ''}).`);
+			this.status.push(`${id}: connected over ${remote ? 'HTTP' : 'stdio'} (${tools.length} tools${renamed ? `, ${renamed} renamed to fit provider limits` : ''}).`);
 		} catch (err) {
 			client.dispose();
 			this.status.push(`${id}: failed — ${err instanceof Error ? err.message : String(err)}`);

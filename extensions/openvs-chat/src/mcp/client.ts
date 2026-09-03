@@ -38,6 +38,39 @@ export interface McpToolDef {
 	readonly annotations?: { readonly readOnlyHint?: boolean };
 }
 
+/**
+ * Flattens a `tools/call` result's content blocks to text. Lives here so both transports
+ * summarize a result identically.
+ *
+ * Non-text blocks are described, never inlined. A server that returns a screenshot sends
+ * base64 in `data`, and serializing the block whole put megabytes of it into the
+ * conversation — which is not merely wasteful: a tool result is re-sent on every later
+ * step, so on a small per-request allowance one such result ends the run.
+ */
+export function flattenContent(content: unknown): string {
+	const blocks: Array<Record<string, any>> = Array.isArray(content) ? content : [];
+	const text = blocks.map(block => {
+		if (block?.type === 'text' && typeof block.text === 'string') {
+			return block.text;
+		}
+		if (block?.type === 'image' || block?.type === 'audio') {
+			const bytes = typeof block.data === 'string' ? Math.round(block.data.length * 0.75) : 0;
+			return `(${block.type} returned${block.mimeType ? ` as ${block.mimeType}` : ''}`
+				+ `${bytes ? `, ~${Math.round(bytes / 1024)}KB` : ''} — not shown; this conversation carries text only)`;
+		}
+		if (block?.type === 'resource' || block?.type === 'resource_link') {
+			const resource = block.resource ?? block;
+			if (typeof resource?.text === 'string') {
+				return resource.text;
+			}
+			return `(resource ${resource?.uri ?? 'without a uri'}`
+				+ `${resource?.mimeType ? ` (${resource.mimeType})` : ''} — binary content not shown)`;
+		}
+		return JSON.stringify(block);
+	}).join('\n').trim();
+	return text || '(no output)';
+}
+
 export interface McpStdioConfig {
 	readonly command: string;
 	readonly args?: string[];
@@ -107,12 +140,7 @@ export class McpStdioClient {
 	/** Calls a tool and returns its content flattened to text, with an error flag. */
 	async callTool(name: string, args: Record<string, unknown>): Promise<{ text: string; isError: boolean }> {
 		const result = await this.request('tools/call', { name, arguments: args }, CALL_TIMEOUT_MS);
-		const blocks: Array<{ type?: string; text?: string }> = Array.isArray(result?.content) ? result.content : [];
-		const text = blocks
-			.map(b => (b.type === 'text' && typeof b.text === 'string' ? b.text : JSON.stringify(b)))
-			.join('\n')
-			.trim();
-		return { text: text || '(no output)', isError: result?.isError === true };
+		return { text: flattenContent(result?.content), isError: result?.isError === true };
 	}
 
 	dispose(): void {

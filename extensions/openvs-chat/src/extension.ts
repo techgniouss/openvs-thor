@@ -435,6 +435,19 @@ async function mcpAdd(mcp: McpManager): Promise<void> {
 	if (!target) {
 		return;
 	}
+	// A hosted server is configured by URL alone, which is most of why anyone reaches for
+	// one; asking for a launch command first and only accepting stdio made that whole class
+	// of server unreachable from the UI.
+	const kind = await vscode.window.showQuickPick(
+		[
+			{ label: '$(cloud) Remote server', description: 'A hosted MCP server you connect to by URL', id: 'url' },
+			{ label: '$(terminal) Local server', description: 'A command this machine runs (stdio)', id: 'stdio' },
+		],
+		{ placeHolder: 'What kind of MCP server is this?' },
+	);
+	if (!kind) {
+		return;
+	}
 	const id = await vscode.window.showInputBox({
 		title: 'MCP server (1/2): id',
 		prompt: 'Short name; the agent sees tools as mcp__<id>__<tool>',
@@ -445,17 +458,32 @@ async function mcpAdd(mcp: McpManager): Promise<void> {
 	if (!id) {
 		return;
 	}
-	const commandLine = await vscode.window.showInputBox({
-		title: 'MCP server (2/2): launch command',
-		prompt: 'The stdio command to start the server (arguments separated by spaces)',
-		placeHolder: 'e.g. npx -y @modelcontextprotocol/server-github',
-		ignoreFocusOut: true,
-	});
-	if (!commandLine?.trim()) {
-		return;
+	let entry: Record<string, unknown>;
+	if (kind.id === 'url') {
+		const url = await vscode.window.showInputBox({
+			title: 'MCP server (2/2): URL',
+			prompt: 'The server\'s endpoint. Add an Authorization header afterwards in the config if it needs a token.',
+			placeHolder: 'e.g. https://mcp.example.com/mcp',
+			ignoreFocusOut: true,
+			validateInput: v => /^https?:\/\/\S+$/.test(v.trim()) ? undefined : 'Enter an http:// or https:// URL.',
+		});
+		if (!url?.trim()) {
+			return;
+		}
+		entry = { url: url.trim() };
+	} else {
+		const commandLine = await vscode.window.showInputBox({
+			title: 'MCP server (2/2): launch command',
+			prompt: 'The stdio command to start the server (arguments separated by spaces)',
+			placeHolder: 'e.g. npx -y @modelcontextprotocol/server-github',
+			ignoreFocusOut: true,
+		});
+		if (!commandLine?.trim()) {
+			return;
+		}
+		const [command, ...args] = commandLine.trim().split(/\s+/);
+		entry = { command, ...(args.length ? { args } : {}) };
 	}
-	const [command, ...args] = commandLine.trim().split(/\s+/);
-	const entry = { command, ...(args.length ? { args } : {}) };
 
 	if (target.id === 'project' && root) {
 		const file = vscode.Uri.joinPath(root, '.openvs', 'mcp.json');

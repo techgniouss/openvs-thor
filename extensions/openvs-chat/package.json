@@ -724,6 +724,17 @@
               "cwd": {
                 "type": "string"
               },
+              "url": {
+                "type": "string",
+                "description": "URL of a remote MCP server (Streamable HTTP, or the older HTTP+SSE transport — whichever the server speaks). Use instead of \"command\"."
+              },
+              "headers": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "markdownDescription": "Extra request headers for a remote server, e.g. `{\"Authorization\": \"Bearer ${env:MY_TOKEN}\"}`. `${env:NAME}` is replaced with that environment variable, so a token need not be written into settings."
+              },
               "disabled": {
                 "type": "boolean"
               }
@@ -880,7 +891,7 @@
     "compile": "gulp compile-extension:openvs-chat",
     "watch": "gulp watch-extension:openvs-chat",
     "typecheck": "tsc -p ./tsconfig.json --noEmit && npm run typecheck-webview",
-    "typecheck-webview": "tsc --noEmit --ignoreConfig --allowJs --checkJs --noImplicitAny false --strictNullChecks --target es2022 --lib es2022,dom media/main.js media/prompts.js media/qr.js media/pairing.js media/webview.d.ts",
+    "typecheck-webview": "tsc --noEmit --ignoreConfig --allowJs --checkJs --noImplicitAny false --strictNullChecks --target es2022 --lib es2022,dom media/main.js media/prompts.js media/markdown.js media/qr.js media/pairing.js media/webview.d.ts",
     "pretest": "tsc -p ./tsconfig.json",
     "test": "node ./scripts/run-tests.mjs",
     "vscode:prepublish": "npm run build-ext",

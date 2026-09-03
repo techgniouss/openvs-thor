@@ -92,6 +92,17 @@ interface OpenVSDeviceInfo {
 	revokedAt: number | null;
 }
 
+/**
+ * The transcript's markdown renderer, provided by `media/markdown.js`, which the host loads
+ * before `media/main.js`. Pure string → HTML: no DOM, so `scripts/test-markdown.mjs` drives
+ * it directly.
+ */
+declare const OpenVSMarkdown: {
+	render(text: string): string;
+	escapeHtml(text: string): string;
+	THOR_BOLT_PATH: string;
+};
+
 /** Byte-mode QR encoder (ECC level L, versions 1-6), provided by `media/qr.js`. */
 declare const OpenVSQr: {
 	encode(text: string): { size: number; modules: boolean[][] };

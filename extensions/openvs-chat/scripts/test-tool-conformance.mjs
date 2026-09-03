@@ -227,6 +227,29 @@ await equivalent('edit_file replaceAll', { name: 'edit_file', args: { path: 'src
 		]);
 }
 
+// 8b. fetch_url — the vocabulary other products use for "read this URL", and the two
+//     rejections that must happen before anything leaves the machine. No case here reaches
+//     the network: a conformance suite that needed a live host would be a flaky suite.
+{
+	reset();
+	covered.add('fetch_url');
+	const notAUrl = await run('fetch_url', { url: 'example.com/docs' });
+	assert.match(notAUrl.result, /is not a URL/);
+	// Name and argument synonyms land on the same tool, so they fail the same way rather
+	// than as "there is no tool called web_fetch".
+	for (const call of [
+		{ name: 'web_fetch', args: { url: 'file:///etc/passwd' } },
+		{ name: 'fetch', args: { link: 'file:///etc/passwd' } },
+		{ name: 'read_url', args: { uri: 'file:///etc/passwd' } },
+		{ name: 'open_url', args: { href: 'file:///etc/passwd' } },
+	]) {
+		const got = await run(call.name, call.args);
+		assert.deepStrictEqual({ isError: got.isError, result: got.result },
+			{ isError: true, result: 'fetch_url only speaks http and https, not "file:". To read a local file use read_file.' },
+			`fetch_url: ${JSON.stringify(call)} -> ${got.result}`);
+	}
+}
+
 // 9. A call whose intent genuinely cannot be recovered still fails — but the message must
 //    name what arrived, or the model has nothing to correct and repeats itself.
 {
@@ -239,7 +262,7 @@ await equivalent('edit_file replaceAll', { name: 'edit_file', args: { path: 'src
 	assert.deepStrictEqual(cases.map(c => c.isError), [true, true, true]);
 	assert.match(cases[0].result, /"content" belongs to write_file/);
 	assert.match(cases[1].result, /supplied no arguments besides the path/);
-	assert.match(cases[2].result, /read_file, list_dir, glob_files, search_files, write_file, edit_file, run_command/);
+	assert.match(cases[2].result, /read_file, list_dir, glob_files, search_files, write_file, edit_file, fetch_url, run_command/);
 }
 
 // 10. Completeness: a tool added later without a case here fails this suite rather than

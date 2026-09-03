@@ -63,6 +63,17 @@ active development unless told otherwise; everything else is upstream VS Code.
   createElement/textContent and direct child references — **no `innerHTML`, no
   `querySelector`** — which is what lets the stand-in stay faithful without an HTML parser
   or a selector engine. Keep it that way when editing it.
+- `test-markdown.mjs` drives `media/markdown.js`, the renderer every transcript message
+  passes through, as pure string → HTML (no DOM at all — that is why it is its own file
+  rather than part of main.js's IIFE). It pins the constructs models actually emit —
+  tables, nested lists, emphasis, blockquotes, task lists — and the two rules that keep it
+  safe: model text is escaped exactly once, and inline constructs resolve through a token
+  table so a later rule can never reach inside an earlier one's output (which is what kept
+  emphasis out of code spans and the autolinker off its own href).
+- `test-mcp-http.mjs` and `test-fetch-url.mjs` both drive a real local HTTP server rather
+  than a stubbed `fetch`. Everything hard about those two modules is on the wire — which
+  content type a reply arrives as, where it arrives at all, what status came back — and a
+  stubbed fetch only asserts our own assumptions back at us.
 - Rendering *appearance* still has to be checked by hand in the Extension Development Host
   (`F5` from this repo, or launch VS Code with
   `--extensionDevelopmentPath=extensions/openvs-chat`).
@@ -175,7 +186,15 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   one-click PKCE sign-in via `signInOpenRouter`), refreshing tokens transparently near
   expiry.
 - `src/agent/` — the Agent-mode tool loop: `tools.ts` (read/list/write files, run commands,
-  plus `ask_user`, which blocks the loop on a multiple-choice question),
+  `fetch_url`, plus `ask_user`, which blocks the loop on a multiple-choice question).
+  `fetch_url` is the agent's only route off the machine — a URL the user pasted, docs that
+  postdate the model, an API the task is about — and it is shaped by two facts: egress is a
+  side effect chosen by the *model*, so it asks for approval per host under exactly the
+  policies that ask before a command and never under Full Auto; and a fetched page is
+  untrusted input, so it comes back labelled as data with HTML reduced to text and clipped
+  to the run's own budget (raw markup is re-sent on every later step). It counts as
+  read-only (`READ_ONLY_TOOL_NAMES`) because it writes nothing — which is also what gives
+  Ask/Plan and read-only sub-agents web access,
   `guardrails.ts` (protected paths, denied/allowed command regexes, approval policy, and
   `normalizeWorkspacePath` — the *single* place a model-supplied path is cleaned; both the
   guardrail check and the filesystem resolution must go through it or they validate one
@@ -355,10 +374,22 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   completion response's rate-limit headers — `fetchOpts` bundles a `pace` hook that sleeps
   out a refill window, which is correct for a step that can afford to wait and wrong for a
   request whose cursor position may no longer exist by the time it would resolve.
-- `src/mcp/` — Model Context Protocol client (`client.ts`) and multi-server lifecycle
-  manager (`manager.ts`); merges global (`openvsChat.mcp.servers`) and per-project
-  (`.openvs/mcp.json` / `.vscode/mcp.json`) server configs; project overrides global; stdio
-  servers only start in a trusted workspace.
+- `src/mcp/` — Model Context Protocol clients and multi-server lifecycle manager
+  (`manager.ts`); merges global (`openvsChat.mcp.servers`) and per-project
+  (`.openvs/mcp.json` / `.vscode/mcp.json`) server configs; project overrides global.
+  **Two transports, chosen per server by its config shape**: `client.ts` spawns a local
+  `command` over stdio, `httpClient.ts` connects to a `url`. The HTTP one covers both wires
+  in the wild — Streamable HTTP (reply on the POST's own response, as JSON or a short SSE
+  stream) and the older HTTP+SSE (replies on a long-lived GET, requests POSTed to the
+  endpoint that stream names) — failing over to the second when a POST is refused with
+  405/404/501. That fallback is not optional politeness: hosted MCP servers, the ones that
+  make "add a tool" a URL rather than a toolchain, are split across the two. `headers`
+  expands `${env:NAME}`, so a token need not be written into settings. Both transports flow
+  through the same `flattenContent`, which *describes* image/audio/binary blocks rather
+  than inlining them — a screenshot's base64 serialized whole is re-sent on every later
+  agent step and ends the run on a small per-request allowance. The trust gate covers
+  remote servers as well as spawned ones: a `url` in a project's own mcp.json aims the
+  agent's tool calls, and their arguments, at an endpoint the workspace chose.
 - `src/rules.ts` — loads always-on "soft steering" instructions from `openvsChat.rules` plus
   **every** present file in `openvsChat.ruleFiles` (default `.openvs/rules.md`, `AGENTS.md`,
   `.github/copilot-instructions.md`, `.cursorrules`), each labelled with its source and

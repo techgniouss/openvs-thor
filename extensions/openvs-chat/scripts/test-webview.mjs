@@ -255,20 +255,25 @@ for (const excluded of EXCLUDED_FROM_WEBVIEW) {
 	assert.ok(main.includes('renderOpenPrompts()'), 'and renderAll actually calls it');
 }
 
-// 6b. All four webview scripts are served, in dependency order: qr.js (no deps) before
+// 6b. All five webview scripts are served, in dependency order: qr.js (no deps) before
 // pairing.js (uses OpenVSQr), pairing.js before prompts.js (no dependency between the two,
-// but this pins them anyway so a reorder is a deliberate edit, not an accident), prompts.js
-// before main.js, which calls both `OpenVSPrompts.create` and `OpenVSPairing.create` at startup.
+// but this pins them anyway so a reorder is a deliberate edit, not an accident), and both
+// prompts.js and markdown.js before main.js, which reads `OpenVSPrompts.create`,
+// `OpenVSPairing.create` and `OpenVSMarkdown` at startup — the last at the top level of its
+// IIFE, so a wrong order is not a degraded transcript, it is a ReferenceError that leaves
+// the whole panel blank.
 {
-	const positions = ['qr.js', 'pairing.js', 'prompts.js', 'main.js'].map(file => {
+	const order = ['qr.js', 'pairing.js', 'prompts.js', 'markdown.js', 'main.js'];
+	const positions = order.map(file => {
 		const at = host.search(new RegExp(`mediaUri\\('${file.replace('.', '\\.')}'\\)`));
 		assert.ok(at > 0, `${file} is served`);
 		return at;
 	});
 	for (let i = 1; i < positions.length; i++) {
 		assert.ok(positions[i] > positions[i - 1],
-			`scripts are served in the right order: …${['qr.js', 'pairing.js', 'prompts.js', 'main.js'][i - 1]} before ${['qr.js', 'pairing.js', 'prompts.js', 'main.js'][i]}`);
+			`scripts are served in the right order: …${order[i - 1]} before ${order[i]}`);
 	}
+	assert.match(main, /OpenVSMarkdown/, 'main.js takes its renderer from the markdown module');
 }
 
 // 7. The host must never strand a run on an unanswerable question, across the sink
