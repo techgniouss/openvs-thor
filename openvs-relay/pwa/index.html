@@ -33,7 +33,10 @@
 <div id="app" hidden>
 	<header class="topbar">
 		<div id="status" class="status">Connecting…</div>
-		<button id="newSessionBtn" class="icon-btn" title="New chat"><span aria-hidden="true">＋</span><span class="icon-label">New</span></button>
+		<div class="topbar-actions">
+			<button id="historyBtn" class="icon-btn" title="History"><span aria-hidden="true">🕘</span><span class="icon-label">History</span></button>
+			<button id="newSessionBtn" class="icon-btn" title="New chat"><span aria-hidden="true">＋</span><span class="icon-label">New</span></button>
+		</div>
 	</header>
 	<nav id="tabs" class="tabs"></nav>
 	<main id="messages" class="messages"></main>
@@ -51,6 +54,7 @@
 		<div id="skillsList" class="skills-list"></div>
 		<div id="contextChip" class="context-chip" hidden></div>
 		<div id="queueChips" class="queue-chips" hidden></div>
+		<div id="slashMenu" class="slash-menu" hidden></div>
 		<div class="compose-row">
 			<textarea id="composer" rows="2" placeholder="Message…"></textarea>
 			<input id="attachImageInput" type="file" accept="image/*" hidden>
@@ -61,6 +65,14 @@
 			<button id="sendBtn" class="icon-btn" title="Send"><span aria-hidden="true">➤</span><span class="icon-label">Send</span></button>
 		</div>
 	</footer>
+</div>
+
+<div id="historyPanel" class="history-panel" hidden>
+	<div class="history-header">
+		<span class="history-title">History</span>
+		<button id="historyCloseBtn" class="icon-btn" title="Close"><span aria-hidden="true">✕</span></button>
+	</div>
+	<div id="historyList" class="history-list"></div>
 </div>
 
 <script type="module" src="/app.js"></script>

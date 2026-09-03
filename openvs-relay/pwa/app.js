@@ -79,6 +79,11 @@ const els = {
 	sendBtn: document.getElementById('sendBtn'),
 	stopBtn: document.getElementById('stopBtn'),
 	newSessionBtn: document.getElementById('newSessionBtn'),
+	historyBtn: document.getElementById('historyBtn'),
+	historyCloseBtn: document.getElementById('historyCloseBtn'),
+	historyPanel: document.getElementById('historyPanel'),
+	historyList: document.getElementById('historyList'),
+	slashMenu: document.getElementById('slashMenu'),
 	enhanceBtn: document.getElementById('enhanceBtn'),
 	modeSelect: /** @type {HTMLSelectElement} */ (document.getElementById('modeSelect')),
 	providerSelect: /** @type {HTMLSelectElement} */ (document.getElementById('providerSelect')),
@@ -144,6 +149,16 @@ let pendingModel = null;
  */
 let pendingQueues = new Map();
 let skillsCatalog = [];
+/**
+ * The slash-command catalog pushed by the host's `commands` message (`session/slash.ts`'s
+ * `SLASH_COMMANDS`) — mirrors media/main.js's own `slashCommands`. Used only to drive
+ * {@link updateSlashMenu}'s autocomplete; the actual dispatch of a typed command goes through
+ * `handleSlash` → the host's `slash` message regardless of whether this catalog has loaded yet.
+ * @type {{cmd: string, desc: string}[]}
+ */
+let slashCommands = [];
+/** Archived conversations, from the host's `history` message — used by the History panel below. @type {{id: string, title?: string, savedAt?: number}[]} */
+let historyEntries = [];
 /**
  * The current `attachContext`/`attachActive` reply, awaiting the next `send` — mirrors
  * media/main.js's own `currentContext`. Set from a `context` message, cleared once actually
@@ -568,6 +583,111 @@ function renderQueueChips() {
 	});
 }
 
+// ---- History panel (Phase 6 polish: `history`/`restoreSession` were already wired end-to-end —
+// the host pushes `history` unprompted on every `ready`, and `restoreSession` is REMOTE_ALLOWED
+// — but nothing on this side ever rendered the one or sent the other, so a closed/cleared chat
+// was reachable from the desktop panel and permanently gone from the phone. ------------------
+
+/** Relative "saved at" time, mirroring `extensions/openvs-chat/media/pairing.js`'s own `relDeviceTime` — duplicated, not shared, for the same cross-package reason as this file's other hand-copies (see its top-of-file doc). */
+function relTime(ts) {
+	if (!ts) { return ''; }
+	const min = Math.floor((Date.now() - ts) / 60000);
+	if (min < 1) { return 'just now'; }
+	if (min < 60) { return `${min}m ago`; }
+	const hr = Math.floor(min / 60);
+	if (hr < 24) { return `${hr}h ago`; }
+	const day = Math.floor(hr / 24);
+	if (day < 7) { return `${day}d ago`; }
+	return new Date(ts).toLocaleDateString();
+}
+
+function renderHistoryList() {
+	if (!els.historyList) { return; }
+	els.historyList.replaceChildren();
+	if (!historyEntries.length) {
+		els.historyList.appendChild(el('div', 'history-empty', 'No archived chats yet — closed or cleared tabs land here.'));
+		return;
+	}
+	// Newest first — `savedAt` is a `Date.now()` ms timestamp; entries with none (shouldn't
+	// happen, but a wire payload is never fully trusted) sort last rather than throwing.
+	const sorted = historyEntries.slice().sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
+	for (const entry of sorted) {
+		const row = el('button', 'history-row');
+		row.type = 'button';
+		row.appendChild(el('span', 'history-row-title', entry.title || 'Chat'));
+		row.appendChild(el('span', 'history-row-time', relTime(entry.savedAt)));
+		row.addEventListener('click', () => {
+			sendApp({ type: 'restoreSession', historyId: entry.id, mode: 'ask' });
+			closeHistoryPanel();
+		});
+		els.historyList.appendChild(row);
+	}
+}
+
+function openHistoryPanel() {
+	if (!els.historyPanel) { return; }
+	renderHistoryList();
+	els.historyPanel.hidden = false;
+}
+
+function closeHistoryPanel() {
+	if (!els.historyPanel) { return; }
+	els.historyPanel.hidden = true;
+}
+
+function historyPanelOpen() {
+	return !!els.historyPanel && !els.historyPanel.hidden;
+}
+
+// ---- Slash-command autocomplete menu (mirrors media/main.js's own updateSlashMenu/
+// renderSlashMenu/applySlashSelection — a tap-to-complete list here rather than arrow-key
+// navigation, since a phone's on-screen keyboard has no arrow keys to navigate one with). ----
+
+/** @type {{cmd: string, desc: string}[]} */
+let slashMatches = [];
+
+function hideSlashMenu() {
+	if (!els.slashMenu) { return; }
+	els.slashMenu.hidden = true;
+	els.slashMenu.replaceChildren();
+	slashMatches = [];
+}
+
+/**
+ * Shows or hides the slash-command menu for the composer's current content. Only while the
+ * whole draft is still just `/` plus the command word being typed — once a space follows, the
+ * command is decided and `handleSlash` takes it from there; matches this exactly (`^\/(\w*)$`,
+ * no trailing content) — same regex as media/main.js's own `updateSlashMenu`.
+ */
+function updateSlashMenu() {
+	if (!els.slashMenu || !els.composer) { return; }
+	const m = /^\/(\w*)$/.exec(els.composer.value);
+	if (!m) { hideSlashMenu(); return; }
+	const partial = m[1].toLowerCase();
+	slashMatches = slashCommands.filter(c => c.cmd.startsWith(partial));
+	if (!slashMatches.length) { hideSlashMenu(); return; }
+	els.slashMenu.replaceChildren();
+	for (const match of slashMatches) {
+		const row = el('button', 'slash-item');
+		row.type = 'button';
+		row.appendChild(el('span', 'slash-cmd', `/${match.cmd}`));
+		row.appendChild(el('span', 'slash-desc', match.desc));
+		// mousedown, not click: fires before the textarea would blur on a touch tap, keeping
+		// focus (and the on-screen keyboard) up — same reasoning as media/main.js's own menu.
+		row.addEventListener('mousedown', e => {
+			e.preventDefault();
+			if (!els.composer) { return; }
+			els.composer.value = `/${match.cmd} `;
+			hideSlashMenu();
+			els.composer.focus();
+			const len = els.composer.value.length;
+			els.composer.setSelectionRange(len, len);
+		});
+		els.slashMenu.appendChild(row);
+	}
+	els.slashMenu.hidden = false;
+}
+
 function setStatus(text, className) {
 	if (!els.status) { return; }
 	els.status.textContent = text;
@@ -657,6 +777,15 @@ function dispatchSend(session, text, modeOverride) {
 function handleSlash(session, rawText) {
 	const text = rawText.trim();
 	if (!/^\/\w+/.test(text)) { return false; }
+	hideSlashMenu();
+	// `/history` is client-owned on the desktop too (opens a local panel; the host has no
+	// business acting on it — see `session/slash.ts`'s `runSlash` doc) — handled fully locally,
+	// same as `media/main.js`'s own `handleSlash`, rather than forwarded to fall through the
+	// host's "unrecognized — send as a normal message" path and get read out to the model.
+	if (/^\/history\b/i.test(text)) {
+		openHistoryPanel();
+		return true;
+	}
 	if (/^\/clear\b/i.test(text)) {
 		// Composer attachments are client-only UI state; the host owns archiving/resetting the
 		// session itself (`SessionStore.clearSession`, reached via `slash` below) — mirrors
@@ -1015,8 +1144,7 @@ function handleAppMessage(msg) {
 			cards.cancel(msg.id, msg.reason);
 			break;
 		case 'commands':
-			// Slash-command catalog — this phase's composer is plain text, so the catalog is
-			// stored but not yet driving an autocomplete menu (Phase 6 polish item).
+			slashCommands = Array.isArray(msg.commands) ? msg.commands : [];
 			break;
 		case 'remote':
 			setStatus(msg.connected ? 'Connected' : 'Disconnected', msg.connected ? 'status-ok' : 'status-warn');
@@ -1034,8 +1162,11 @@ function handleAppMessage(msg) {
 			// picker in this phase's minimal shell.
 			break;
 		case 'history':
-			// Archived-session list, used by `restoreSession` — no dedicated history screen in
-			// this phase's minimal shell yet.
+			historyEntries = Array.isArray(msg.history) ? msg.history : [];
+			// The host pushes this unprompted (every `ready`, and after every close/clear/
+			// restore) — if the panel happens to be open when a fresher one arrives, keep it
+			// showing the current list rather than the snapshot from when it was opened.
+			if (historyPanelOpen()) { renderHistoryList(); }
 			break;
 		case 'steerable': {
 			// Field is `steerable` (chatViewProvider.ts's `declareSteerable`: `post({ type:
@@ -1354,6 +1485,9 @@ document.addEventListener('visibilitychange', () => {
 if (els.sendBtn) { els.sendBtn.addEventListener('click', sendMessage); }
 if (els.stopBtn) { els.stopBtn.addEventListener('click', stopRun); }
 if (els.newSessionBtn) { els.newSessionBtn.addEventListener('click', createSession); }
+if (els.historyBtn) { els.historyBtn.addEventListener('click', openHistoryPanel); }
+if (els.historyCloseBtn) { els.historyCloseBtn.addEventListener('click', closeHistoryPanel); }
+if (els.composer) { els.composer.addEventListener('input', updateSlashMenu); }
 if (els.enhanceBtn) { els.enhanceBtn.addEventListener('click', enhancePrompt); }
 if (els.modeSelect) { els.modeSelect.addEventListener('change', () => setMode(els.modeSelect.value)); }
 if (els.providerSelect) { els.providerSelect.addEventListener('change', () => setProvider(els.providerSelect.value)); }
