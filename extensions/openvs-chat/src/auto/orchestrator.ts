@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { AgentCallbacks, AgentRunner, RunResult } from '../agent/agentRunner';
+import { AgentCallbacks, AgentOptions, AgentRunner, RunResult } from '../agent/agentRunner';
 import { streamBudgeted } from '../agent/budgetedStream';
 import { contextBudgetFor, contextWindowFor, requestBudgets } from '../agent/contextWindow';
 import { Guardrails } from '../agent/guardrails';
@@ -11,6 +11,7 @@ import { ToolApprover, asString, commandTextOf, normalizeToolCall } from '../age
 import { McpToolset } from '../mcp/manager';
 import { TodoItem } from '../persona/todos';
 import { ProviderRegistry } from '../providers/registry';
+import { withProviderResilience } from '../providers/resilience';
 import { ChatMessage, ChatProvider, ModelEntry, ToolCall } from '../providers/types';
 import { AutoRole, CredentialMemo, RoleAssignment, RoleRouter } from './router';
 
@@ -274,16 +275,16 @@ export class AutoOrchestrator {
 		// a small per-request allowance the planner was refused before the implementer — which
 		// does learn its ceiling — ever got to run.
 		const budgets = this.textBudgets(provider, assignment, maxTokens);
-		const { text, truncated } = await streamBudgeted(provider, {
+		const { text, truncated } = await withProviderResilience(this.registry, assignment.providerId, assignment.model, apiKey => streamBudgeted(provider, {
 			messages,
 			model: assignment.model,
-			apiKey: await this.apiKey(assignment.providerId),
+			apiKey,
 			baseUrl: this.registry.getBaseUrl(assignment.providerId),
 			...budgets,
 			signal,
 			onToken: delta => cb.token(delta),
 			onNotice: text => cb.note(text),
-		});
+		}));
 		if (truncated) {
 			// A cut-off plan or review feeds the next phase; say so rather than passing a
 			// half-finished document downstream silently.
@@ -328,6 +329,7 @@ export class AutoOrchestrator {
 				keepHead: seed.length,
 				steering,
 				...this.runLimits(),
+				...this.keyResilienceOptions(a.providerId, a.model),
 			});
 			try {
 				const outcome = await runner.run(
@@ -411,6 +413,7 @@ export class AutoOrchestrator {
 				...this.budgetFor(a, maxTokens),
 				keepHead: stepSeed.length,
 				steering: params.steering,
+				...this.keyResilienceOptions(a.providerId, a.model),
 				...this.runLimits(),
 			});
 			const outcome = await runner.run(stepSeed, runParams, agentCallbacks(cb, sink));
@@ -420,6 +423,23 @@ export class AutoOrchestrator {
 
 	private async apiKey(providerId: string): Promise<string> {
 		return (await this.registry.getApiKey(providerId)) ?? '';
+	}
+
+	/** Same shape as `chatViewProvider.ts`'s `keyResilienceOptions` — wired to this
+	 * orchestrator's own registry so a phase's `AgentRunner` rotates keys and clears
+	 * cooldowns identically to a plain Agent-mode run. */
+	private keyResilienceOptions(providerId: string, model: string): Pick<AgentOptions, 'onKeyFailure' | 'onStepSuccess'> {
+		return {
+			onKeyFailure: async message => {
+				this.registry.cooldowns.markCooldown(providerId, model, message);
+				const rotated = await this.registry.rotateApiKey(providerId);
+				return rotated ? (await this.registry.getApiKey(providerId)) ?? '' : undefined;
+			},
+			onStepSuccess: () => {
+				this.registry.noteApiKeySuccess(providerId);
+				this.registry.cooldowns.clear(providerId, model);
+			},
+		};
 	}
 }
 

@@ -1176,6 +1176,9 @@ async function runAuto(agentSteps, { maxSteps = 20, history = [{ role: 'user', c
 		getProvider: () => provider,
 		async getApiKey() { return 'k'; },
 		getBaseUrl: () => 'u',
+		async rotateApiKey() { return false; },
+		noteApiKeySuccess() { },
+		cooldowns: { markCooldown() { }, isCoolingDown: () => false, clear() { } },
 	};
 	const noop = () => { };
 	await new AutoOrchestrator(registry, autoRouter, approver, maxSteps).run(

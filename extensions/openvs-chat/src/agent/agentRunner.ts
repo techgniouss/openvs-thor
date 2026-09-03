@@ -7,6 +7,7 @@ import { McpToolset } from '../mcp/manager';
 import { SUBAGENT_PREAMBLE } from '../persona/prompts';
 import { stripThinking, stripThinkingTags } from '../persona/thinking';
 import { TodoItem, UPDATE_TODOS_TOOL, parseTodoUpdate } from '../persona/todos';
+import { isKeyFailure } from '../providers/resilience';
 import { extractTextToolCalls } from '../providers/toolCalls';
 import { AgentStep, CONTINUE_PROMPT, ChatProvider, ChatMessage, ToolCall, ToolSpec, endsInRepeatLoop, isAbortError, isTransientProviderError } from '../providers/types';
 import { budgetsForCeiling } from './contextWindow';
@@ -144,6 +145,14 @@ const TUNING_HINT_TOKENS = 25_000;
  * rounds don't consume the step budget — no work was done, so none was spent.
  */
 const MAX_STEP_RETRIES = 3;
+
+/**
+ * How many times one step will rotate to a different stored API key on a 401/403/429
+ * before giving up on rotation and falling through to the ordinary transient-retry (or
+ * failure) path. Small and separate from {@link MAX_STEP_RETRIES}: without a cap, two
+ * dead keys would rotate back and forth between each other forever on every retry.
+ */
+const MAX_KEY_ROTATION_ATTEMPTS = 3;
 
 /** Backoff before re-asking a step, by retry index. Short: the transport already backed off. */
 const STEP_RETRY_DELAYS_MS = [1_000, 3_000, 8_000];
@@ -285,7 +294,7 @@ interface SubagentBudget {
 	spawned: number;
 }
 
-interface AgentOptions {
+export interface AgentOptions {
 	guardrails?: Guardrails;
 	/** Nesting depth (0 = the top-level agent). */
 	depth?: number;
@@ -348,6 +357,23 @@ interface AgentOptions {
 	traceTiming?: boolean;
 	/** Reads the clock. Injectable so the wall-clock ceiling is testable without sleeping. */
 	now?: () => number;
+	/**
+	 * Called when a step fails with a 401/403/429 — a failure a *different* stored API key
+	 * has a real chance of surviving, unlike a 5xx or a network error. Returning a new key
+	 * string retries the same step with it (mutating `params.apiKey` in place, so every
+	 * later step in this run also uses it); returning `undefined` means no spare key exists,
+	 * and the failure falls through to the ordinary transient-retry/failure path below.
+	 * Kept as an injectable hook rather than a direct `ProviderRegistry` dependency so the
+	 * agent loop stays decoupled from key storage — the host wires this to
+	 * `withProviderResilience`'s rotation logic.
+	 */
+	onKeyFailure?: (message: string) => Promise<string | undefined>;
+	/**
+	 * Called after any step succeeds. The host uses this to clear a quota cooldown recorded
+	 * by an earlier failed step in the same run — the (provider, model) pair isn't actually
+	 * out of capacity once a step against it succeeds, whichever key made that happen.
+	 */
+	onStepSuccess?: () => void;
 }
 
 /**
@@ -441,6 +467,10 @@ export class AgentRunner {
 	private appliedCeiling?: number;
 	/** Set once the MCP tool schemas were found not to fit the budget; they are then omitted. */
 	private mcpSchemasDropped = false;
+	/** See {@link AgentOptions.onKeyFailure}. */
+	private readonly onKeyFailure?: (message: string) => Promise<string | undefined>;
+	/** See {@link AgentOptions.onStepSuccess}. */
+	private readonly onStepSuccess?: () => void;
 
 	constructor(
 		private readonly provider: ChatProvider,
@@ -469,6 +499,8 @@ export class AgentRunner {
 		this.maxRunMs = opts?.maxRunMs ?? DEFAULT_MAX_RUN_MS;
 		this.traceTiming = opts?.traceTiming ?? false;
 		this.now = opts?.now ?? Date.now;
+		this.onKeyFailure = opts?.onKeyFailure;
+		this.onStepSuccess = opts?.onStepSuccess;
 	}
 
 	/**
@@ -554,6 +586,7 @@ export class AgentRunner {
 		let truncationRounds = 0;
 		let emptyRounds = 0;
 		let stepRetries = 0;
+		let keyRotationAttempts = 0;
 		// Text carried across a max-token cutoff, plus how many provisional turns hold it in
 		// `messages`. The pieces are rejoined before the next step is judged, so a response
 		// the limit cut in half is read as the one answer the model meant to write.
@@ -675,6 +708,23 @@ export class AgentRunner {
 				// streaming a step that will never arrive. Empty content discards whatever the
 				// failed attempt streamed — the retry re-streams it from the start.
 				callbacks.onStepEnd('');
+
+				// A 401/403/429 is not "transient" under isTransientProviderError below (a bad
+				// key never recovers on its own) — but a DIFFERENT stored key might work right
+				// now, and skipping this would kill the whole run on the first quota hit even
+				// when the user configured a backup key for exactly this. Tried before the
+				// generic transient-retry check, and outside stepRetries' budget: rotating to a
+				// working key is progress, not a flaky-provider retry.
+				if (isKeyFailure(message) && this.onKeyFailure && keyRotationAttempts < MAX_KEY_ROTATION_ATTEMPTS) {
+					const nextKey = await this.onKeyFailure(message);
+					if (nextKey !== undefined) {
+						params.apiKey = nextKey;
+						keyRotationAttempts++;
+						callbacks.onNote(`${message} — retrying with a different stored API key…`);
+						continue;
+					}
+				}
+
 				if (!isTransientProviderError(message) || stepRetries >= MAX_STEP_RETRIES) {
 					// Ending with a result rather than throwing keeps everything the run
 					// accomplished on screen and says plainly why it stopped.
@@ -693,6 +743,8 @@ export class AgentRunner {
 			}
 			// The step arrived, so earlier failures were a blip rather than a broken provider.
 			stepRetries = 0;
+			keyRotationAttempts = 0;
+			this.onStepSuccess?.();
 			if (this.traceTiming) {
 				const secs = ((this.now() - startedStep) / 1_000).toFixed(1);
 				callbacks.onNote(`step ${step + 1}: ${secs}s · ~${Math.round(this.lastPromptTokens / 1_000)}k prompt tokens · ${raw.toolCalls.length} tool call(s)`);
@@ -1275,18 +1327,42 @@ export class AgentRunner {
 			// with a saving it had partly spent. No tool schemas here — this call carries none.
 			this.totalPromptTokens += estimateMessagesTokens(toSummarize);
 			this.requestCount++;
-			await this.provider.streamChat({
+			const cappedMaxTokens = Math.min(maxTokens, this.outputCap ?? maxTokens);
+			const send = (apiKey: string) => this.provider.streamChat({
 				messages: toSummarize,
 				model: params.model,
-				apiKey: params.apiKey,
+				apiKey,
 				baseUrl: params.baseUrl,
 				// Subject to the same reply ceiling as a step: on a backend that charges the
 				// reservation against a per-minute allowance, asking for more than the
 				// allowance permits fails before the model reads a word.
-				maxTokens: Math.min(maxTokens, this.outputCap ?? maxTokens),
+				maxTokens: cappedMaxTokens,
 				signal: params.signal,
 				onToken: delta => { text += delta; },
 			});
+			try {
+				await send(params.apiKey);
+			} catch (err) {
+				// compactMessages swallows a thrown summarizer failure and falls back to the
+				// lossy trim, so a rotated key here is a pure win with no new failure mode —
+				// one retry, same shape as a step's own key-failure handling above, just
+				// without the step-loop's retry-count bookkeeping (this runs at most once
+				// per compaction, not once per step).
+				const message = err instanceof Error ? err.message : String(err);
+				const nextKey = isKeyFailure(message) ? await this.onKeyFailure?.(message) : undefined;
+				if (nextKey === undefined) {
+					throw err;
+				}
+				params.apiKey = nextKey;
+				text = '';
+				// A second real HTTP request, same as a rotated retry in the main step loop
+				// (a fresh `step()` call there re-does its own accounting) — the ledger must
+				// count it too, or a rotated compaction reads as cheaper than it was.
+				this.totalPromptTokens += estimateMessagesTokens(toSummarize);
+				this.requestCount++;
+				await send(nextKey);
+			}
+			this.onStepSuccess?.();
 			// Reasoning models stream their chain of thought through onToken too;
 			// the stored summary must not carry it.
 			return stripThinking(text);
@@ -1594,6 +1670,13 @@ export class AgentRunner {
 				: 0,
 			traceTiming: this.traceTiming,
 			now: this.now,
+			// Inherited so a delegate that hits a 401/403/429 rotates the same way the parent
+			// would, instead of failing outright the first time it needs a backup key. `params`
+			// (mutated in place on rotation) is the same object the parent holds, so a rotation
+			// here is visible to the parent's own later steps too — correct, since it's the
+			// same underlying credential pool for the same provider.
+			onKeyFailure: this.onKeyFailure,
+			onStepSuccess: this.onStepSuccess,
 		});
 
 		const log: string[] = [];

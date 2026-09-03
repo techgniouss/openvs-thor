@@ -5,6 +5,7 @@
 
 import * as vscode from 'vscode';
 import { ProviderRegistry } from '../providers/registry';
+import { withProviderResilience } from '../providers/resilience';
 import { isAbortError, streamChatWithContinuation } from '../providers/types';
 import { API, GitExtension, Repository } from './git';
 
@@ -134,18 +135,19 @@ export async function generateCommitMessage(
 
 	let result: { text: string; truncated: boolean };
 	try {
+		const model = registry.getModel(providerId);
 		// Continuation matters here even at a small maxTokens: a model that ignores the
 		// brevity instruction and writes a long body would otherwise hand back a message
 		// chopped off mid-sentence with no indication anything was cut.
-		result = await streamChatWithContinuation(provider, {
+		result = await withProviderResilience(registry, providerId, model, apiKey => streamChatWithContinuation(provider, {
 			messages: [{ role: 'user', content: buildCommitMessagePrompt(diff) }],
-			model: registry.getModel(providerId),
-			apiKey: (await registry.getApiKey(providerId)) ?? '',
+			model,
+			apiKey,
 			baseUrl: registry.getBaseUrl(providerId),
 			maxTokens: MAX_REPLY_TOKENS,
 			signal: controller.signal,
 			onToken: () => { /* no incremental UI to update while this runs */ },
-		});
+		}));
 	} catch (err) {
 		if (isAbortError(err)) {
 			return;
