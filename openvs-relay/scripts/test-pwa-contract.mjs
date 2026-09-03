@@ -48,6 +48,11 @@ function captures(text, re) {
 const hostSends = new Set([
 	...captures(host, /post\(\{\s*type:\s*'([a-zA-Z]+)'/g),
 	...captures(host, /promptUser\(\{\s*type:\s*'([a-zA-Z]+)'/g),
+	// A message scoped to one sink (`bus.postTo(sinkId, { type: … })`) rather than broadcast —
+	// e.g. a local-only reply like 'inline'/'context' that must never reach a remote sink (see
+	// `src/chatViewProvider.ts`'s `runInline`/`handleAttachContext`) — is still real host
+	// traffic this contract has to know about, same as `test-webview.mjs`'s own copy of this line.
+	...captures(host, /postTo\([^,]*,\s*\{\s*type:\s*'([a-zA-Z]+)'/g),
 ]);
 assert.ok(hostSends.size > 20, `expected the host's outbound message set to be found, got ${hostSends.size}`);
 

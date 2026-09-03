@@ -101,6 +101,11 @@ const hostSends = new Set([
 	// Blocking prompts go out through promptUser rather than post, but they are still
 	// messages the webview has to recognize.
 	...captures(host, /promptUser\(\{\s*type:\s*'([a-zA-Z]+)'/g),
+	// A message scoped to one sink (`bus.postTo(sinkId, { type: … })`) rather than broadcast —
+	// e.g. a local-only reply like 'inline'/'context' that must never reach a remote sink (see
+	// `src/chatViewProvider.ts`'s `runInline`/`handleAttachContext`) — is still traffic the
+	// webview itself has to recognize whenever `sinkId` is (or could be) `WEBVIEW_SINK_ID`.
+	...captures(host, /postTo\([^,]*,\s*\{\s*type:\s*'([a-zA-Z]+)'/g),
 ]);
 /** Message `type` values the webview's dispatcher handles. */
 const webviewHandles = new Set(captures(main, /^\s*case '([a-zA-Z]+)':/gm));
@@ -115,10 +120,25 @@ const webviewSends = new Set([
 /** Message `type` values the host's dispatcher handles. */
 const hostHandles = new Set(captures(host, /^\s*case '([a-zA-Z]+)':/gm));
 
+/**
+ * Message types a remote (Phase 6c+) client's own reply never needs an equivalent for on the
+ * desktop webview — `attachOk` confirms a chunked `attachImage` upload (see
+ * `chatViewProvider.ts`'s `handleAttachImageChunk`), which only a client without a native file
+ * input (the PWA) ever sends in the first place; the desktop webview attaches images locally via
+ * its own file picker and never sends `attachImage` chunks to get this reply to. Kept as an
+ * explicit, named exception (mirroring `test-pwa-contract.mjs`'s `EXCLUDED_FROM_PWA` for the
+ * opposite asymmetry) rather than silently filtered, so a *new* sink-scoped reply type failing
+ * to reach the webview fails loudly here instead of quietly joining this list.
+ */
+const EXCLUDED_FROM_WEBVIEW = new Set(['attachOk']);
+for (const excluded of EXCLUDED_FROM_WEBVIEW) {
+	assert.ok(hostSends.has(excluded), `"${excluded}" is in the exclusion list but the host no longer sends it — remove it from EXCLUDED_FROM_WEBVIEW`);
+}
+
 // 2. Nothing the host posts may go unhandled: a dropped message is a feature that
 // silently does nothing.
 {
-	const unhandled = [...hostSends].filter(t => !webviewHandles.has(t));
+	const unhandled = [...hostSends].filter(t => !EXCLUDED_FROM_WEBVIEW.has(t) && !webviewHandles.has(t));
 	assert.deepStrictEqual(unhandled, [], 'the host posts these but the webview ignores them');
 	// Sanity: the extraction found the real traffic, not an empty set.
 	for (const expected of ['token', 'done', 'toolStart', 'toolEnd', 'approvalRequest', 'askRequest', 'promptCancel']) {
