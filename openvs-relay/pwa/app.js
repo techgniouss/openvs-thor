@@ -79,6 +79,11 @@ const els = {
 	sendBtn: document.getElementById('sendBtn'),
 	stopBtn: document.getElementById('stopBtn'),
 	newSessionBtn: document.getElementById('newSessionBtn'),
+	historyBtn: document.getElementById('historyBtn'),
+	historyCloseBtn: document.getElementById('historyCloseBtn'),
+	historyPanel: document.getElementById('historyPanel'),
+	historyList: document.getElementById('historyList'),
+	slashMenu: document.getElementById('slashMenu'),
 	enhanceBtn: document.getElementById('enhanceBtn'),
 	modeSelect: /** @type {HTMLSelectElement} */ (document.getElementById('modeSelect')),
 	providerSelect: /** @type {HTMLSelectElement} */ (document.getElementById('providerSelect')),
@@ -145,6 +150,16 @@ let pendingModel = null;
 let pendingQueues = new Map();
 let skillsCatalog = [];
 /**
+ * The slash-command catalog pushed by the host's `commands` message (`session/slash.ts`'s
+ * `SLASH_COMMANDS`) — mirrors media/main.js's own `slashCommands`. Used only to drive
+ * {@link updateSlashMenu}'s autocomplete; the actual dispatch of a typed command goes through
+ * `handleSlash` → the host's `slash` message regardless of whether this catalog has loaded yet.
+ * @type {{cmd: string, desc: string}[]}
+ */
+let slashCommands = [];
+/** Archived conversations, from the host's `history` message — used by the History panel below. @type {{id: string, title?: string, savedAt?: number}[]} */
+let historyEntries = [];
+/**
  * The current `attachContext`/`attachActive` reply, awaiting the next `send` — mirrors
  * media/main.js's own `currentContext`. Set from a `context` message, cleared once actually
  * sent (or removed via the chip's own ✕).
@@ -168,12 +183,42 @@ function loadDevice(room) {
 	}
 }
 
+/**
+ * Remembers which room this browser most recently paired to, so a launch that carries no room
+ * of its own (see {@link loadLastRoom}'s doc) can still recover an existing pairing instead of
+ * always landing back on the pairing screen.
+ */
+const LAST_ROOM_KEY = 'openvsRelay.lastRoom';
+
 function saveDevice(room, device) {
 	try {
 		localStorage.setItem(storageKey(room), JSON.stringify(device));
+		// Every successful pairing is "the most recent one" — recorded here, the one place a
+		// device actually gets persisted, rather than at each call site that happens to know a
+		// room id, so this can never drift out of sync with what {@link loadDevice} would find.
+		localStorage.setItem(LAST_ROOM_KEY, room);
 	} catch {
 		// Storage can be unavailable (private browsing, quota) — pairing simply has to be
 		// redone next visit; nothing here is safety-critical to persist.
+	}
+}
+
+/**
+ * The room this browser most recently paired to, or `''` if none/unavailable. `boot()`'s
+ * {@link parseLocation} falls back to this when the launch URL carries no room of its own —
+ * critically, the *installed* PWA's own icon: `manifest.webmanifest`'s `start_url` is the fixed
+ * `"/"`, not the `/p/<roomId>#<code>` URL pairing actually happened at, so without this every
+ * launch from the home-screen icon parsed an empty `roomId`, found nothing under `storageKey('')`
+ * and showed the pairing screen again — every single time — even though the device was already
+ * paired and its real token was sitting in storage under the room it actually paired to. A
+ * bookmarked or shared plain `/pair` link with no room is the one case this is *not* wanted; those
+ * still explicitly carry `?room=` and take precedence in `parseLocation` regardless.
+ */
+function loadLastRoom() {
+	try {
+		return localStorage.getItem(LAST_ROOM_KEY) || '';
+	} catch {
+		return '';
 	}
 }
 
@@ -366,10 +411,32 @@ function renderTabs() {
 	}
 }
 
+/**
+ * Whether the messages pane should auto-scroll to the bottom after the next render — a plain
+ * `replaceChildren()` rebuild (see `transcript.js`'s `render`) resets `scrollTop` to 0 on every
+ * single token, which without this reads as "the chat won't stay scrolled down", the opposite of
+ * every native messaging app. Tracked rather than unconditional so a user who has scrolled up to
+ * reread earlier turns mid-stream isn't yanked back down on the next token — see the `scroll`
+ * listener below, which is what keeps this honest.
+ */
+let stickToBottom = true;
+/** Distance (px) from the true bottom still counted as "at the bottom" — matches the small rubber-band slop touch scrolling leaves even when a user meant to land at the end. */
+const STICK_BOTTOM_THRESHOLD_PX = 48;
+
+if (els.messages) {
+	els.messages.addEventListener('scroll', () => {
+		const el = els.messages;
+		stickToBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= STICK_BOTTOM_THRESHOLD_PX;
+	});
+}
+
 function renderAll() {
 	const session = activeSession();
 	if (!session || !els.messages) { return; }
 	renderTranscript(els.messages, session);
+	if (stickToBottom) {
+		els.messages.scrollTop = els.messages.scrollHeight;
+	}
 	if (els.todos) {
 		renderTodos(els.todos, session.todos || []);
 	}
@@ -516,6 +583,111 @@ function renderQueueChips() {
 	});
 }
 
+// ---- History panel (Phase 6 polish: `history`/`restoreSession` were already wired end-to-end —
+// the host pushes `history` unprompted on every `ready`, and `restoreSession` is REMOTE_ALLOWED
+// — but nothing on this side ever rendered the one or sent the other, so a closed/cleared chat
+// was reachable from the desktop panel and permanently gone from the phone. ------------------
+
+/** Relative "saved at" time, mirroring `extensions/openvs-chat/media/pairing.js`'s own `relDeviceTime` — duplicated, not shared, for the same cross-package reason as this file's other hand-copies (see its top-of-file doc). */
+function relTime(ts) {
+	if (!ts) { return ''; }
+	const min = Math.floor((Date.now() - ts) / 60000);
+	if (min < 1) { return 'just now'; }
+	if (min < 60) { return `${min}m ago`; }
+	const hr = Math.floor(min / 60);
+	if (hr < 24) { return `${hr}h ago`; }
+	const day = Math.floor(hr / 24);
+	if (day < 7) { return `${day}d ago`; }
+	return new Date(ts).toLocaleDateString();
+}
+
+function renderHistoryList() {
+	if (!els.historyList) { return; }
+	els.historyList.replaceChildren();
+	if (!historyEntries.length) {
+		els.historyList.appendChild(el('div', 'history-empty', 'No archived chats yet — closed or cleared tabs land here.'));
+		return;
+	}
+	// Newest first — `savedAt` is a `Date.now()` ms timestamp; entries with none (shouldn't
+	// happen, but a wire payload is never fully trusted) sort last rather than throwing.
+	const sorted = historyEntries.slice().sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
+	for (const entry of sorted) {
+		const row = el('button', 'history-row');
+		row.type = 'button';
+		row.appendChild(el('span', 'history-row-title', entry.title || 'Chat'));
+		row.appendChild(el('span', 'history-row-time', relTime(entry.savedAt)));
+		row.addEventListener('click', () => {
+			sendApp({ type: 'restoreSession', historyId: entry.id, mode: 'ask' });
+			closeHistoryPanel();
+		});
+		els.historyList.appendChild(row);
+	}
+}
+
+function openHistoryPanel() {
+	if (!els.historyPanel) { return; }
+	renderHistoryList();
+	els.historyPanel.hidden = false;
+}
+
+function closeHistoryPanel() {
+	if (!els.historyPanel) { return; }
+	els.historyPanel.hidden = true;
+}
+
+function historyPanelOpen() {
+	return !!els.historyPanel && !els.historyPanel.hidden;
+}
+
+// ---- Slash-command autocomplete menu (mirrors media/main.js's own updateSlashMenu/
+// renderSlashMenu/applySlashSelection — a tap-to-complete list here rather than arrow-key
+// navigation, since a phone's on-screen keyboard has no arrow keys to navigate one with). ----
+
+/** @type {{cmd: string, desc: string}[]} */
+let slashMatches = [];
+
+function hideSlashMenu() {
+	if (!els.slashMenu) { return; }
+	els.slashMenu.hidden = true;
+	els.slashMenu.replaceChildren();
+	slashMatches = [];
+}
+
+/**
+ * Shows or hides the slash-command menu for the composer's current content. Only while the
+ * whole draft is still just `/` plus the command word being typed — once a space follows, the
+ * command is decided and `handleSlash` takes it from there; matches this exactly (`^\/(\w*)$`,
+ * no trailing content) — same regex as media/main.js's own `updateSlashMenu`.
+ */
+function updateSlashMenu() {
+	if (!els.slashMenu || !els.composer) { return; }
+	const m = /^\/(\w*)$/.exec(els.composer.value);
+	if (!m) { hideSlashMenu(); return; }
+	const partial = m[1].toLowerCase();
+	slashMatches = slashCommands.filter(c => c.cmd.startsWith(partial));
+	if (!slashMatches.length) { hideSlashMenu(); return; }
+	els.slashMenu.replaceChildren();
+	for (const match of slashMatches) {
+		const row = el('button', 'slash-item');
+		row.type = 'button';
+		row.appendChild(el('span', 'slash-cmd', `/${match.cmd}`));
+		row.appendChild(el('span', 'slash-desc', match.desc));
+		// mousedown, not click: fires before the textarea would blur on a touch tap, keeping
+		// focus (and the on-screen keyboard) up — same reasoning as media/main.js's own menu.
+		row.addEventListener('mousedown', e => {
+			e.preventDefault();
+			if (!els.composer) { return; }
+			els.composer.value = `/${match.cmd} `;
+			hideSlashMenu();
+			els.composer.focus();
+			const len = els.composer.value.length;
+			els.composer.setSelectionRange(len, len);
+		});
+		els.slashMenu.appendChild(row);
+	}
+	els.slashMenu.hidden = false;
+}
+
 function setStatus(text, className) {
 	if (!els.status) { return; }
 	els.status.textContent = text;
@@ -535,7 +707,12 @@ function setStatus(text, className) {
  */
 function echoUserTurn(session, text) {
 	(session.messages = session.messages || []).push({ role: 'user', content: text });
-	if (session.id === activeSessionId) { renderAll(); }
+	if (session.id === activeSessionId) {
+		// Sending (or steering) a turn always lands the view on it, the same as every native
+		// chat app — even if the user had scrolled up to reread something first.
+		stickToBottom = true;
+		renderAll();
+	}
 }
 
 /**
@@ -583,11 +760,56 @@ function dispatchSend(session, text, modeOverride) {
 	return true;
 }
 
+/**
+ * True if `text` was consumed as a leading-slash command, forwarded to the host's `slash`
+ * dispatch (`extensions/openvs-chat/src/session/slash.ts`'s `runSlash`) instead of an ordinary
+ * `send` — a plain-text port of `media/main.js`'s own `handleSlash`. Checked, like there, *before*
+ * the streaming steer-vs-queue decision below: `/clear`, `/mode`, `/skill`, … must act immediately
+ * even mid-run, not get queued behind whatever the current run is doing. `/history` and `/enhance`
+ * stay client-owned on the desktop (a UI panel and a composer prefill, respectively) — this shell
+ * has no history panel yet (see `case 'history':`'s own doc) and `/enhance` already has its own
+ * ✨ button, so both are simply left to fall through to the host's "unrecognized — forward as an
+ * ordinary message" fallback, exactly as an unrecognized command like `/foo` already does.
+ * @param {any} session
+ * @param {string} text
+ * @returns {boolean}
+ */
+function handleSlash(session, rawText) {
+	const text = rawText.trim();
+	if (!/^\/\w+/.test(text)) { return false; }
+	hideSlashMenu();
+	// `/history` is client-owned on the desktop too (opens a local panel; the host has no
+	// business acting on it — see `session/slash.ts`'s `runSlash` doc) — handled fully locally,
+	// same as `media/main.js`'s own `handleSlash`, rather than forwarded to fall through the
+	// host's "unrecognized — send as a normal message" path and get read out to the model.
+	if (/^\/history\b/i.test(text)) {
+		openHistoryPanel();
+		return true;
+	}
+	if (/^\/clear\b/i.test(text)) {
+		// Composer attachments are client-only UI state; the host owns archiving/resetting the
+		// session itself (`SessionStore.clearSession`, reached via `slash` below) — mirrors
+		// `media/main.js`'s own `/clear` handling.
+		attachedContext = null;
+		renderContextChip();
+	}
+	// The host appends this turn to the session store itself and broadcasts the resulting
+	// `sessions`/`transcript` update to every connected sink (see `sendFollowUp`/each
+	// `SlashEffects` callback in `chatViewProvider.ts`) — unlike `dispatchSend`, this must not
+	// also echo the turn locally, or it would show twice once that broadcast arrives.
+	sendApp({ type: 'slash', sessionId: session.id, command: text });
+	return true;
+}
+
 function sendMessage() {
 	const session = activeSession();
 	if (!session || !els.composer) { return; }
 	const text = els.composer.value;
 	if (!text.trim()) { return; }
+	if (handleSlash(session, text)) {
+		els.composer.value = '';
+		return;
+	}
 	if (session.streaming) {
 		// Mid-run input: steer a live agent run, queue for anything else — mirrors
 		// media/main.js's own `send()` decision (`s.runMode === 'agent' && s.steerable !== false`).
@@ -787,6 +1009,12 @@ function handleAppMessage(msg) {
 			break;
 		}
 		case 'sessions': {
+			// A tab switch (including the very first snapshot) always lands at the bottom of
+			// that tab's own transcript, regardless of whatever scroll position/stickiness the
+			// previously-active tab was left in — see `stickToBottom`'s own doc.
+			if (msg.activeSessionId !== activeSessionId) {
+				stickToBottom = true;
+			}
 			const prevById = new Map(sessions.map(s => [s.id, s]));
 			sessions = (msg.sessions || []).map(s => {
 				const queue = Array.isArray(s.queue) ? s.queue : [];
@@ -916,8 +1144,7 @@ function handleAppMessage(msg) {
 			cards.cancel(msg.id, msg.reason);
 			break;
 		case 'commands':
-			// Slash-command catalog — this phase's composer is plain text, so the catalog is
-			// stored but not yet driving an autocomplete menu (Phase 6 polish item).
+			slashCommands = Array.isArray(msg.commands) ? msg.commands : [];
 			break;
 		case 'remote':
 			setStatus(msg.connected ? 'Connected' : 'Disconnected', msg.connected ? 'status-ok' : 'status-warn');
@@ -935,8 +1162,11 @@ function handleAppMessage(msg) {
 			// picker in this phase's minimal shell.
 			break;
 		case 'history':
-			// Archived-session list, used by `restoreSession` — no dedicated history screen in
-			// this phase's minimal shell yet.
+			historyEntries = Array.isArray(msg.history) ? msg.history : [];
+			// The host pushes this unprompted (every `ready`, and after every close/clear/
+			// restore) — if the panel happens to be open when a fresher one arrives, keep it
+			// showing the current list rather than the snapshot from when it was opened.
+			if (historyPanelOpen()) { renderHistoryList(); }
 			break;
 		case 'steerable': {
 			// Field is `steerable` (chatViewProvider.ts's `declareSteerable`: `post({ type:
@@ -1189,8 +1419,12 @@ function connect() {
 /** Reads `/p/<roomId>#<code>` — the shape the pairing QR encodes, per the plan's Auth step 3. */
 function parseLocation() {
 	const match = /^\/p\/([^/]+)/.exec(location.pathname);
+	const fromUrl = match ? decodeURIComponent(match[1]) : new URLSearchParams(location.search).get('room') || '';
 	return {
-		room: match ? decodeURIComponent(match[1]) : new URLSearchParams(location.search).get('room') || '',
+		// A launch with no room of its own (see `loadLastRoom`'s doc — chiefly the installed
+		// icon's fixed `start_url`) falls back to whichever room this browser paired to last,
+		// so it can still find that pairing's saved device token in `boot()` below.
+		room: fromUrl || loadLastRoom(),
 		code: location.hash ? decodeURIComponent(location.hash.slice(1)) : '',
 	};
 }
@@ -1251,6 +1485,9 @@ document.addEventListener('visibilitychange', () => {
 if (els.sendBtn) { els.sendBtn.addEventListener('click', sendMessage); }
 if (els.stopBtn) { els.stopBtn.addEventListener('click', stopRun); }
 if (els.newSessionBtn) { els.newSessionBtn.addEventListener('click', createSession); }
+if (els.historyBtn) { els.historyBtn.addEventListener('click', openHistoryPanel); }
+if (els.historyCloseBtn) { els.historyCloseBtn.addEventListener('click', closeHistoryPanel); }
+if (els.composer) { els.composer.addEventListener('input', updateSlashMenu); }
 if (els.enhanceBtn) { els.enhanceBtn.addEventListener('click', enhancePrompt); }
 if (els.modeSelect) { els.modeSelect.addEventListener('change', () => setMode(els.modeSelect.value)); }
 if (els.providerSelect) { els.providerSelect.addEventListener('change', () => setProvider(els.providerSelect.value)); }

@@ -182,4 +182,37 @@ const CLIENT_ONLY_COMMANDS = new Set(['history', 'enhance']);
 	}
 }
 
+// 11. `remote: true` — the local/remote boundary `chatViewProvider.ts`'s `handleSlashCommand`
+// threads through for exactly the commands whose *effect* reaches outside the chat session
+// itself (the desktop's own active editor selection, the local filesystem, local MCP config —
+// see `runSlash`'s own doc). Each must report `{ handled: true, denied: true }` and call no
+// effect at all; every other command must be entirely unaffected by `remote`.
+{
+	for (const cmd of SLASH_INLINE) {
+		const { effects, calls } = makeEffects();
+		assert.deepStrictEqual(runSlash(`/${cmd} do it better`, effects, true), { handled: true, denied: true });
+		assert.deepStrictEqual(calls, [], `/${cmd} must not call slashInline when remote`);
+	}
+	for (const create of ['new', 'create']) {
+		const { effects, calls } = makeEffects();
+		assert.deepStrictEqual(runSlash(`/skill ${create}`, effects, true), { handled: true, denied: true });
+		assert.deepStrictEqual(calls, [], `/skill ${create} must not call createSkill when remote`);
+	}
+	for (const mcp of ['/mcp', '/mcp add', '/mcp reconnect', '/mcp status']) {
+		const { effects, calls } = makeEffects();
+		assert.deepStrictEqual(runSlash(mcp, effects, true), { handled: true, denied: true });
+		assert.deepStrictEqual(calls, [], `"${mcp}" must not call any mcp effect when remote`);
+	}
+	// Every other recognized command is unaffected: same result and same effect calls with
+	// `remote: true` as with the default (`false`).
+	for (const text of ['/help', '/clear', '/ask hello', '/auto build the thing', '/skill impeccable', '/skill off', '/skills']) {
+		const local = makeEffects();
+		const remote = makeEffects();
+		const localResult = runSlash(text, local.effects);
+		const remoteResult = runSlash(text, remote.effects, true);
+		assert.deepStrictEqual(remoteResult, localResult, `"${text}" must behave the same whether remote or not`);
+		assert.deepStrictEqual(remote.calls, local.calls, `"${text}" must call the same effects whether remote or not`);
+	}
+}
+
 console.log('test-slash: all assertions passed');

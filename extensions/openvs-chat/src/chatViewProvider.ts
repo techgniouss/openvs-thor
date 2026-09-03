@@ -831,7 +831,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		};
 
 		await vscode.commands.executeCommand('openvsChat.view.focus');
-		this.post({ type: 'inline', mode, prompt: prompts[kind], inline: isEdit });
+		// Local-only, not `this.post`'s broadcast: `prompt` embeds the *desktop's* current
+		// active editor selection verbatim — code the remote user cannot see and did not
+		// choose, unredacted (this field isn't `content`/`preview`, so `RemoteSink`'s own
+		// truncation never even applies to it) — exactly what `REMOTE_DENIED`'s
+		// `applyEdit`/`insertAtCursor` entries exist to keep from a remote sink. Nothing but the
+		// desktop webview itself ever reads an `'inline'` message (see
+		// `test-pwa-contract.mjs`'s `EXCLUDED_FROM_PWA`), so scoping this costs nothing real.
+		this.bus.postTo(WEBVIEW_SINK_ID, { type: 'inline', mode, prompt: prompts[kind], inline: isEdit });
 	}
 
 	async refreshConfig(): Promise<void> {
@@ -1696,7 +1703,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		const text = hasSelection ? editor.document.getText(sel) : editor.document.getText();
 		const name = vscode.workspace.asRelativePath(editor.document.uri);
 		const label = hasSelection ? `${name} (selection)` : name;
-		this.post({
+		// Local-only, not `this.post`'s broadcast: unlike `handleAttachActive` just below (the
+		// deliberate remote-safe equivalent — `postTo` the requesting sink alone, truncated),
+		// this reads the *desktop's* current active editor with no size cap at all — the whole
+		// file, if nothing is selected. `attachContext` is `REMOTE_DENIED` for exactly this
+		// reason; broadcasting its reply would have handed a remote sink the same content the
+		// denied request type exists to keep from it, and — since the field here is
+		// `context.content`, not a top-level `content`/`preview` — with none of `RemoteSink`'s
+		// own truncation applying either.
+		this.bus.postTo(WEBVIEW_SINK_ID, {
 			type: 'context',
 			context: { label, content: `File: ${name} (${editor.document.languageId})\n\n${text}` },
 		});
@@ -1849,6 +1864,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			post({ type: 'error', message: text });
 			post({ type: 'done' });
 		};
+
+		// Edit mode auto-applies the model's reply directly to whatever file
+		// `resolveContext`/`runStreaming` resolve as `editTarget` (the *desktop's* current
+		// active editor) — with no approval prompt at all (see `handleApplyEdit`'s own doc;
+		// this bypasses the whole guardrails/approval-floor system entirely, which only gates
+		// the Agent tool loop). It was only ever meant to be reachable from `runInline`'s own
+		// local-only trigger — a right-click command, or one of the five `SLASH_INLINE`
+		// commands (note: the *slash command* `/edit` is a legacy alias for the `plan` mode,
+		// not this one — see `session/slash.ts`'s `runSlash`; only `runInline`'s own `isEdit`
+		// branch ever sets the raw `'edit'` `ChatMode`). `setMode` and `send` are both
+		// `REMOTE_ALLOWED` and neither re-checked this, so nothing stopped a remote client from
+		// sending `mode: 'edit'` directly and getting the developer's currently-open file
+		// silently rewritten. Checked once here, ahead of both the Auto-routed path
+		// (`handleAutoSend`, which derives its own role from this same `requestedMode`) and the
+		// direct path below — `runStreaming` itself has no `origin` to check this against.
+		if (requestedMode === 'edit' && origin !== WEBVIEW_SINK_ID) {
+			fail('Edit mode isn\'t available from a remote device.');
+			return;
+		}
 
 		// Since the ownership flip, `send` carries only the new turn's own text/images, not
 		// the whole conversation (`message.messages` is a legacy fallback below, kept for a
@@ -2062,8 +2096,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	 */
 	private async handleSlashCommand(sessionId: string, runId: string | undefined, command: string, origin: string): Promise<void> {
 		const effects = this.buildSlashEffects(sessionId, origin, await this.buildSkillsSnapshot());
-		const result = runSlash(command, effects);
+		// See `runSlash`'s own doc on why this boundary must be re-applied here, per-command,
+		// rather than trusted from `isRemoteAllowed('slash')` alone — same local/local-only
+		// check `guardrailsForRun` uses for the approval floor.
+		const result = runSlash(command, effects, origin !== WEBVIEW_SINK_ID);
 		if (result.handled) {
+			if (result.denied) {
+				this.bus.postTo(origin, { type: 'error', sessionId, message: `"${command.trim().split(/\s/, 1)[0]}" isn't available from a remote device.` });
+				return;
+			}
 			if (result.sendRest) {
 				await this.sendFollowUp(sessionId, runId, result.sendRest, origin);
 			}

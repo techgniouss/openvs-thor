@@ -53,6 +53,14 @@ export interface SlashResult {
 	 * — the caller sends this as a normal message after acting on the mode/provider change.
 	 */
 	readonly sendRest?: string;
+	/**
+	 * True if `text` was recognized but refused because {@link runSlash}'s `remote` argument was
+	 * set — the command's *effect* is not in this instance itself (no `slashInline`,
+	 * `createSkill`, `mcpAdd`, `mcpReconnect` or `openMcpSettings` call happened). The caller
+	 * should tell the requesting sink so, not fall through to `sendRest`/the "unrecognized —
+	 * forward as a normal message" path — see {@link runSlash}'s own doc on why this exists.
+	 */
+	readonly denied?: boolean;
 }
 
 /**
@@ -147,8 +155,30 @@ export function buildSkillsText(snapshot: SlashSkillsSnapshot): string {
  * reaches here anyway (a client that does not special-case them), `runSlash` reports
  * `handled: false` and the caller's own "unknown — treat as a normal message" fallback applies,
  * same as it would for a typo like `/foo`.
+ *
+ * `remote` (default `false`, i.e. the trusted desktop webview) is the same local/remote
+ * distinction `chatViewProvider.ts`'s `guardrailsForRun` applies to a run's approval floor,
+ * threaded down here for the same reason: `slash`, unlike every other webview→host message
+ * type, is *one* `REMOTE_ALLOWED` type whose dispatch fans out into several different effects —
+ * `isRemoteAllowed` only ever sees `'slash'` itself, never which command it carries, so nothing
+ * upstream of this function re-checks a specific command against `src/remote/policy.ts`'s
+ * `REMOTE_DENIED`. Three of those effects are exactly the things that list exists to keep a
+ * remote client away from, reachable anyway before this parameter existed:
+ *  - `slashInline` (the five `SLASH_INLINE` commands) reads whatever is in the *desktop's own*
+ *    active editor selection right now — code the remote user cannot see and did not choose —
+ *    and for `fix`/`doc`/`optimize`/`edit` arms `inlineEditActive` to apply the model's reply
+ *    directly to that file. This is precisely what `applyEdit`/`insertAtCursor` being
+ *    `REMOTE_DENIED` was for; `slash` routing around it made that denial a no-op.
+ *  - `createSkill` (`/skill new`/`/skill create`) scaffolds a new workspace file.
+ *  - `mcpAdd`/`mcpReconnect`/`openMcpSettings` (any `/mcp` form) reach local MCP server
+ *    configuration — `mcpAdd` in particular can register a server whose command the extension
+ *    will later spawn as a local process.
+ * When `remote` is true, each of those three branches below reports `{ handled: true, denied:
+ * true }` and calls no effect at all, instead of its ordinary behavior — deny-by-default for the
+ * *reachable-through-`slash`* surface, matching how `REMOTE_DENIED` already treats each of these
+ * as a standalone message type.
  */
-export function runSlash(text: string, effects: SlashEffects): SlashResult {
+export function runSlash(text: string, effects: SlashEffects, remote = false): SlashResult {
 	const parsed = parseSlash(text);
 	if (!parsed) {
 		return { handled: false };
@@ -174,6 +204,9 @@ export function runSlash(text: string, effects: SlashEffects): SlashResult {
 		return rest ? { handled: true, sendRest: rest } : { handled: true };
 	}
 	if (SLASH_INLINE.includes(cmd)) {
+		if (remote) {
+			return { handled: true, denied: true };
+		}
 		effects.slashInline(cmd, rest);
 		return { handled: true };
 	}
@@ -184,6 +217,9 @@ export function runSlash(text: string, effects: SlashEffects): SlashResult {
 	if (cmd === 'skill') {
 		const id = rest.toLowerCase();
 		if (id === 'new' || id === 'create') {
+			if (remote) {
+				return { handled: true, denied: true };
+			}
 			effects.createSkill();
 			return { handled: true };
 		}
@@ -191,6 +227,9 @@ export function runSlash(text: string, effects: SlashEffects): SlashResult {
 		return { handled: true };
 	}
 	if (cmd === 'mcp') {
+		if (remote) {
+			return { handled: true, denied: true };
+		}
 		if (rest === 'add') {
 			effects.mcpAdd();
 			return { handled: true };
