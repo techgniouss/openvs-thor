@@ -471,7 +471,12 @@ export async function streamChatWithContinuation(
 
 /**
  * A chat provider knows how to stream a completion from a specific backend.
- * Implementations must be self-contained and only use the global `fetch`.
+ * Implementations must be self-contained and only use the global `fetch` —
+ * with one deliberate, narrow exception: a local-CLI passthrough provider (`claudeCodeCli.ts`)
+ * spawns the user's already-installed CLI as a subprocess instead, because the backend it
+ * reuses is a program on the user's own PATH, not an HTTP endpoint. It stays a plain
+ * text-in/text-out `streamChat` like every other provider here — the exception is the
+ * transport, not the contract.
  */
 export interface ChatProvider {
 	readonly info: ProviderInfo;

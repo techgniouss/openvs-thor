@@ -319,6 +319,7 @@
             "grok",
             "kiro",
             "web_gemini",
+            "claude-code-cli",
             "custom"
           ],
           "enumDescriptions": [
@@ -340,6 +341,7 @@
             "%config.provider.grok%",
             "%config.provider.kiro%",
             "%config.provider.web_gemini%",
+            "%config.provider.claude-code-cli%",
             "%config.provider.custom%"
           ],
           "default": "nvidia",
@@ -574,6 +576,16 @@
           "type": "boolean",
           "default": false,
           "description": "%config.webGemini.enabled%"
+        },
+        "openvsChat.claude-code-cli.model": {
+          "type": "string",
+          "default": "",
+          "description": "%config.claude-code-cli.model%"
+        },
+        "openvsChat.claude-code-cli.cliPath": {
+          "type": "string",
+          "default": "",
+          "description": "%config.claude-code-cli.cliPath%"
         },
         "openvsChat.custom.model": {
           "type": "string",
