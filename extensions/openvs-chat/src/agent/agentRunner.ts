@@ -262,10 +262,16 @@ export interface AgentCallbacks {
 	onToken(delta: string): void;
 	/** The current step finished producing text (authoritative full content). */
 	onStepEnd(content: string): void;
-	/** A tool call is about to run. */
-	onToolStart(call: ToolCall): void;
-	/** A tool call finished. */
-	onToolEnd(call: ToolCall, result: string, isError: boolean): void;
+	/**
+	 * A tool call is about to run. `parentCallId`, when set, is the `id` of the
+	 * `spawn_subagent` call this one is running nested under — a delegate's own tool
+	 * activity, forwarded live from `runSubagent` so the UI can nest it under that call's
+	 * card instead of it appearing as an unrelated top-level event. Unset for every
+	 * top-level call, including `spawn_subagent` itself.
+	 */
+	onToolStart(call: ToolCall, parentCallId?: string): void;
+	/** A tool call finished. `parentCallId` mirrors {@link onToolStart}'s. */
+	onToolEnd(call: ToolCall, result: string, isError: boolean, parentCallId?: string): void;
 	/** An out-of-band note (e.g. reaching the step limit). */
 	onNote(text: string): void;
 	/** The agent replaced its visible task checklist (top-level agent only). */
@@ -1610,8 +1616,19 @@ export class AgentRunner {
 					onStepStart: () => { /* nested steps aren't surfaced individually */ },
 					onToken: () => { /* nested narration is captured in the summary */ },
 					onStepEnd: content => { if (content) { finalText = content; log.push(content); } },
-					onToolStart: c => log.push(`• ${c.name}(${shortArgs(c.args)})`),
-					onToolEnd: (_c, r, e) => log.push(`  ${e ? '⚠ ' : ''}${truncate(r, 300)}`),
+					// Forwarded live to the outer callbacks, tagged with `call.id` (the
+					// spawn_subagent call's own, already-rendered card) so the UI nests this
+					// delegate's activity under it instead of the user seeing nothing move
+					// until the whole delegation finishes. Narration/step lifecycle stays
+					// opaque, as above — only tool activity is worth surfacing mid-run.
+					onToolStart: c => {
+						log.push(`• ${c.name}(${shortArgs(c.args)})`);
+						callbacks.onToolStart(c, call.id);
+					},
+					onToolEnd: (c, r, e) => {
+						log.push(`  ${e ? '⚠ ' : ''}${truncate(r, 300)}`);
+						callbacks.onToolEnd(c, r, e, call.id);
+					},
 					// Surfaced to the user too: a sub-agent that quietly ran out of budget
 					// used to be invisible, leaving its half-done work unexplained.
 					onNote: t => { log.push(t); callbacks.onNote(`Sub-agent: ${t}`); },
