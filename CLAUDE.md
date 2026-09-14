@@ -122,8 +122,10 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   loop step via `steerQueues`).
 - `src/providers/` — one file per model backend (`openai.ts`, `anthropic.ts`, `nvidia.ts`,
   `openrouter.ts`, `groq.ts`, `mistral.ts`, `cloudflare.ts` (Workers AI), `kimi.ts`
-  (Moonshot), `qwen.ts` (DashScope), `custom.ts` (any OpenAI-compatible endpoint —
-  Ollama/LM Studio/vLLM/etc., no key required),
+  (Moonshot), `qwen.ts` (DashScope), `zai.ts` (Z.AI/Zhipu GLM), `opencodeZen.ts`
+  (OpenCode Zen — not the `opencode` CLI), `xkiro.ts` (the xkiro.com gateway), `copilot.ts`,
+  `grok.ts`, `kiro.ts` (OAuth-proxy backends — see below), `custom.ts` (any OpenAI-compatible
+  endpoint — Ollama/LM Studio/vLLM/etc., no key required),
   `openaiCompatible.ts`) implementing the shared `ChatProvider` interface (`types.ts`),
   with `toolCalls.ts` holding the model-agnostic robustness layer: it repairs the malformed
   tool-call JSON weaker models emit (fences, Python literals, trailing commas, truncation)
@@ -185,6 +187,41 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   shared `OAuthTokenStore` used by all web sign-in flows (Claude, ChatGPT, and OpenRouter's
   one-click PKCE sign-in via `signInOpenRouter`), refreshing tokens transparently near
   expiry.
+  `copilot.ts`, `grok.ts` and `kiro.ts` are a **third, deliberately separate** provider
+  category: each calls another vendor's own internal client backend (GitHub Copilot Chat's,
+  the Grok CLI's, CodeWhisperer's) rather than a documented public API — the same category
+  `AntigravityProvider` already established, with the same account-ban risk its doc comment
+  states plainly and every one of these three repeats. Copilot and Grok authenticate via
+  RFC 8628 device flow (`src/deviceAuth.ts` — a generic client, no per-vendor knowledge) with
+  native VS Code sign-in UI in `src/deviceSignIn.ts`'s `signInWithDeviceFlow` (a cancellable
+  progress notification showing the code, no webview changes needed since every provider
+  card already posts the same generic `signIn` message `handleSignIn` branches on). Kiro
+  instead **imports** a credential Kiro's own IDE/CLI already wrote
+  (`deviceSignIn.ts`'s `importKiroCredential`, reading `~/.aws/sso/cache/kiro-auth-token.json`)
+  — it implements no sign-in flow of its own. All three subclass `providers/oauthProxy.ts`'s
+  `OAuthProxyChatProvider`, which caches the short-lived "wire" token minted from the
+  long-lived stored credential (Copilot's two-stage GitHub-token → Copilot-token exchange;
+  Grok/Kiro's simpler refresh-when-near-expiry) per credential string, de-duplicating a
+  concurrent burst onto one in-flight mint. All three sit in `auto/router.ts`'s
+  `NOT_AUTO_INFERRED`, alongside `antigravity`: Auto mode must never select one of these on
+  the user's behalf.
+  `providers/webCookie/` is a **fourth** category, riskier still: `geminiWebProvider.ts`'s
+  `GeminiWebProvider` (id `web_gemini`) decrypts a real signed-in Chrome profile's own Google
+  session cookies (`chromeCookies.ts` — Windows DPAPI via a `powershell.exe` one-liner to
+  unwrap Chrome's AES-256-GCM master key, then Node's built-in `crypto` per cookie; **the one
+  dependency this extension carries**, `sql.js`, reads the `Cookies` SQLite file with no
+  native build step) and replays them against `gemini.google.com`'s **consumer chat UI** via
+  its `batchexecute` wire format (`extractGeminiText`/`parseSessionTokens`, ported from a
+  companion project's verified-working implementation) — not an API-shaped backend at all.
+  Off by **default** behind its own setting (`openvsChat.webGemini.enabled`, checked on every
+  call — the extra gate `NOT_AUTO_INFERRED` membership alone doesn't give, since that only
+  stops *automatic* selection) and Windows-only (`isPlatformSupported`); on any other platform
+  or with Chrome's newer App-Bound Encryption ("v20") it fails honestly rather than guessing.
+  Single-turn (the upstream takes one prompt string, no `messages` array). Multi-account reuses
+  the ordinary key-rotation machinery from `keyRotation.ts` rather than a bespoke pool: each
+  stored "key" here is a Chrome **user-data-directory path** naming one profile, and the
+  "Sign in" button (`chatViewProvider.ts`) auto-fills the platform default rather than
+  prompting for anything, since there is nothing to paste.
 - `src/agent/` — the Agent-mode tool loop: `tools.ts` (read/list/write files, run commands,
   `fetch_url`, plus `ask_user`, which blocks the loop on a multiple-choice question).
   `fetch_url` is the agent's only route off the machine — a URL the user pasted, docs that
@@ -218,7 +255,22 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   ever **tighten**: the allowance is tokens-per-request, not a window, so letting a roomy one
   raise the budget would trade a rate-limit rejection for a context-length one. When no
   header is offered the same ceiling is still learned from the HTTP 413 body
-  (`parseTokenLimit`), one wasted request later. `apiFetch` also takes a `pace` hook: when a
+  (`parseTokenLimit`), one wasted request later.
+  A stated rate limit is a *ceiling*; `providers/keyRotation.ts`'s `KeyRotator` and
+  `providers/cooldown.ts`'s `CooldownTracker` are what a session does about actually hitting
+  one. `ProviderRegistry.getApiKeys` returns a provider's primary stored key plus any backup
+  keys from its "Additional API keys" panel field; `withProviderResilience`
+  (`providers/resilience.ts`) wraps every request-issuing call site (plain chat, Agent-mode
+  steps and sub-agents via `AgentOptions.onKeyFailure`/`onStepSuccess`, compaction's
+  summarizer, Auto's text and implementer phases, commit-message generation) and on a
+  401/403/429 rotates to the next stored key and retries once, recording a quota cooldown on
+  the (provider, model) pair either way. `auto/router.ts`'s `resolveRoleCandidates` skips a
+  cooling-down inferred candidate in favor of the next-ranked one, falling back to the
+  cooling candidates only when every inferred option is cooling at once — a stale cooldown
+  costing one avoidable 429 beats Auto refusing to run. All three are session-scoped and
+  in-memory, same convention as `RateLimitTracker` below: a stale rotation or cooldown is
+  worth at most one wasted request, since the next one re-learns the truth.
+  `apiFetch` also takes a `pace` hook: when a
   reading says the request cannot fit what is left of the current window, it waits out the
   refill instead of spending a request to be refused — Groq counts *failed* requests against
   the daily budget. All its backoff sleeps are abortable, so Stop is instant. Each

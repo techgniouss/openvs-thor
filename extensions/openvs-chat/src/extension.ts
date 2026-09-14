@@ -92,7 +92,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		vscode.commands.registerCommand('openvsChat.configureProvider', (presetId?: string) =>
 			configureProvider(registry, viewProvider, presetId)),
 		vscode.commands.registerCommand('openvsChat.signIn', (presetId?: string) =>
-			signIn(registry, auth, viewProvider, presetId)),
+			signIn(registry, viewProvider, presetId)),
 		vscode.commands.registerCommand('openvsChat.clearKey', () => clearKey(registry, viewProvider)),
 		vscode.commands.registerCommand('openvsChat.mcpReconnect', async () => {
 			mcp.reconnect();
@@ -321,22 +321,18 @@ async function configureProvider(
 	await view.credentialsChanged(id);
 }
 
-async function signIn(
-	registry: ProviderRegistry, auth: WebAuthManager, view: ChatViewProvider, presetId?: string,
-): Promise<void> {
+/**
+ * Delegates to `ChatViewProvider.handleSignIn` — the one implementation of "sign in to a
+ * provider" (device-flow OAuth, Kiro's credential import, the redirect-URI/native web flow,
+ * or a paste-a-key prompt), shared with the webview panel's own "Sign in" button so the
+ * Command Palette entry point never falls behind it again.
+ */
+async function signIn(registry: ProviderRegistry, view: ChatViewProvider, presetId?: string): Promise<void> {
 	const id = presetId ?? await pickProvider(registry, 'Sign in to which provider?');
 	if (!id) {
 		return;
 	}
-	try {
-		const ok = await auth.signIn(id);
-		if (ok) {
-			vscode.window.showInformationMessage(`Signed in to ${registry.getProvider(id)?.info.label ?? id}.`);
-		}
-	} catch (err) {
-		vscode.window.showErrorMessage(err instanceof Error ? err.message : String(err));
-	}
-	await view.credentialsChanged(id);
+	await view.handleSignIn(id);
 }
 
 async function selectSkill(view: ChatViewProvider, extensionUri: vscode.Uri): Promise<void> {

@@ -312,6 +312,13 @@
             "cloudflare",
             "kimi",
             "qwen",
+            "zai",
+            "opencode_zen",
+            "xkiro",
+            "copilot",
+            "grok",
+            "kiro",
+            "web_gemini",
             "custom"
           ],
           "enumDescriptions": [
@@ -326,6 +333,13 @@
             "%config.provider.cloudflare%",
             "%config.provider.kimi%",
             "%config.provider.qwen%",
+            "%config.provider.zai%",
+            "%config.provider.opencode_zen%",
+            "%config.provider.xkiro%",
+            "%config.provider.copilot%",
+            "%config.provider.grok%",
+            "%config.provider.kiro%",
+            "%config.provider.web_gemini%",
             "%config.provider.custom%"
           ],
           "default": "nvidia",
@@ -490,6 +504,76 @@
           "type": "string",
           "default": "",
           "description": "%config.authUrl%"
+        },
+        "openvsChat.zai.model": {
+          "type": "string",
+          "default": "glm-4.6-flash",
+          "description": "%config.zai.model%"
+        },
+        "openvsChat.zai.baseUrl": {
+          "type": "string",
+          "default": "https://api.z.ai/api/paas/v4",
+          "description": "%config.zai.baseUrl%"
+        },
+        "openvsChat.zai.authUrl": {
+          "type": "string",
+          "default": "",
+          "description": "%config.authUrl%"
+        },
+        "openvsChat.opencode_zen.model": {
+          "type": "string",
+          "default": "laguna-s-2.1-free",
+          "description": "%config.opencode_zen.model%"
+        },
+        "openvsChat.opencode_zen.baseUrl": {
+          "type": "string",
+          "default": "https://opencode.ai/zen/v1",
+          "description": "%config.opencode_zen.baseUrl%"
+        },
+        "openvsChat.opencode_zen.authUrl": {
+          "type": "string",
+          "default": "",
+          "description": "%config.authUrl%"
+        },
+        "openvsChat.xkiro.model": {
+          "type": "string",
+          "default": "mistralai/mistral-medium-3.5",
+          "description": "%config.xkiro.model%"
+        },
+        "openvsChat.xkiro.baseUrl": {
+          "type": "string",
+          "default": "https://xkiro.com/v1",
+          "description": "%config.xkiro.baseUrl%"
+        },
+        "openvsChat.xkiro.authUrl": {
+          "type": "string",
+          "default": "",
+          "description": "%config.authUrl%"
+        },
+        "openvsChat.copilot.model": {
+          "type": "string",
+          "default": "gpt-4.1",
+          "description": "%config.copilot.model%"
+        },
+        "openvsChat.grok.model": {
+          "type": "string",
+          "default": "grok-4.6",
+          "description": "%config.grok.model%"
+        },
+        "openvsChat.kiro.model": {
+          "type": "string",
+          "default": "claude-sonnet-4-5",
+          "description": "%config.kiro.model%"
+        },
+        "openvsChat.web_gemini.model": {
+          "type": "string",
+          "default": "gemini-2.5-flash",
+          "description": "%config.web_gemini.model%"
+        },
+        "openvsChat.webGemini.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "%config.webGemini.enabled%"
         },
         "openvsChat.custom.model": {
           "type": "string",
@@ -900,5 +984,11 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/microsoft/vscode.git"
+  },
+  "dependencies": {
+    "sql.js": "1.14.2"
+  },
+  "devDependencies": {
+    "@types/sql.js": "1.4.11"
   }
 }

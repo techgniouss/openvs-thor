@@ -1016,6 +1016,19 @@
 							value="${escapeHtml(p.baseUrlOverride || '')}" />
 						<button class="save-base-url">Save</button>
 					</div>
+				</details>` : ''}
+				${(p.requiresApiKey || p.id === 'web_gemini') ? `
+				<details class="provider-advanced">
+					<summary>Additional API keys${p.extraApiKeyCount ? ` (${p.extraApiKeyCount} saved)` : ''}</summary>
+					<div class="provider-row">
+						<textarea class="extra-keys-input" rows="3"
+							placeholder="${p.id === 'web_gemini'
+								? 'One Chrome user-data-directory path per line — one per additional Google account, rotated in the same way a backup key would be'
+								: 'One backup key per line — rotated in automatically when the primary key is rate-limited or rejected'}"></textarea>
+					</div>
+					<div class="provider-row">
+						<button class="save-extra-keys">Save</button>
+					</div>
 				</details>` : ''}`;
 			const keyInput = /** @type {HTMLInputElement} */ (card.querySelector('.key-input'));
 			if (hasAccountId) {
@@ -1040,6 +1053,16 @@
 				const baseUrlInput = /** @type {HTMLInputElement} */ (card.querySelector('.base-url-input'));
 				card.querySelector('.save-base-url')?.addEventListener('click', () => {
 					vscode.postMessage({ type: 'setBaseUrl', provider: p.id, text: baseUrlInput.value.trim() });
+				});
+			}
+			if (p.requiresApiKey || p.id === 'web_gemini') {
+				// Never pre-filled from `p` — the actual key values never leave SecretStorage,
+				// only the count does (see `extraApiKeyCount`), matching the primary key-input's
+				// own always-blank-on-refresh behavior above.
+				const extraKeysInput = /** @type {HTMLTextAreaElement} */ (card.querySelector('.extra-keys-input'));
+				card.querySelector('.save-extra-keys')?.addEventListener('click', () => {
+					const keys = extraKeysInput.value.split('\n').map(k => k.trim()).filter(Boolean);
+					vscode.postMessage({ type: 'saveExtraKeys', provider: p.id, keys });
 				});
 			}
 			card.querySelector('.get-key')?.addEventListener('click', (e) => {

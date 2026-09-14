@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as vscode from 'vscode';
-import { AgentRunner, RunResult } from './agent/agentRunner';
+import { AgentOptions, AgentRunner, RunResult } from './agent/agentRunner';
 import { streamBudgeted } from './agent/budgetedStream';
 import { CACHED_COMPACT_TRIGGER, COMPACT_MARKER, COMPACT_TRIGGER, SUMMARY_MAX_TOKENS, compactMessages, shouldCompact } from './agent/compaction';
 import { contextWindowFor, requestBudgets } from './agent/contextWindow';
@@ -13,14 +13,19 @@ import { ApprovalRequest, ApprovalResult, ToolApprover, UserQuestion } from './a
 import { AutoOrchestrator, describePinnedModelError, isModelError } from './auto/orchestrator';
 import { AUTO_ROLES, AutoRole, RoleAssignment, RoleRouter } from './auto/router';
 import { WebAuthManager } from './auth';
+import { importKiroCredential, signInWithDeviceFlow } from './deviceSignIn';
 import { McpManager } from './mcp/manager';
 import { supportsNativeSignIn } from './oauth';
 import { buildEnvContext } from './persona/envContext';
 import { modeDoctrine, personaBase } from './persona/prompts';
 import { smallTalkKind } from './persona/smallTalk';
 import { ThinkingStreamParser, formatThinking, stripHistoryThinking, stripThinking } from './persona/thinking';
+import { CopilotProvider } from './providers/copilot';
+import { GrokProvider } from './providers/grok';
 import { ProviderRegistry } from './providers/registry';
+import { withProviderResilience } from './providers/resilience';
 import { ChatImage, ChatMessage, ChatProvider, ModelEntry, entrySupportsTools, isAbortError, modelSupportsVision } from './providers/types';
+import { defaultChromeProfilePath } from './providers/webCookie/chromeCookies';
 import { AttachImageChunk, UploadAssembler } from './remote/attachments';
 import { RulesProvider } from './rules';
 import { MessageSink, SessionBus } from './session/bus';
@@ -135,6 +140,8 @@ interface WebviewToHost {
 	messages?: ChatMessage[];
 	context?: AttachedContext;
 	key?: string;
+	/** Backup API keys for `saveExtraKeys` — one entry per non-blank textarea line. */
+	keys?: string[];
 	url?: string;
 	content?: string;
 	role?: string;
@@ -1297,6 +1304,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 					await this.postConfig();
 				}
 				break;
+			case 'saveExtraKeys':
+				// Backup keys for round-robin on 401/403/429 — see ProviderRegistry.setExtraApiKeys
+				// and providers/resilience.ts. Empty strings/whitespace-only lines are dropped
+				// there, so a textarea with trailing blank lines round-trips cleanly.
+				if (message.provider && Array.isArray(message.keys)) {
+					await this.registry.setExtraApiKeys(message.provider, message.keys.filter((k): k is string => typeof k === 'string'));
+					await this.postConfig();
+				}
+				break;
 			case 'clearKey':
 				if (message.provider) {
 					await this.clearKeyWithEnvNotice(message.provider);
@@ -1540,13 +1556,79 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		}
 	}
 
-	private async handleSignIn(providerId?: string): Promise<void> {
+	/**
+	 * Runs the sign-in flow for `providerId`: device-flow OAuth for Copilot/Grok, a local
+	 * credential import for Kiro, the redirect-URI/native web flow for everything that has
+	 * one configured, and a paste-a-key prompt otherwise. Public (not just reached via the
+	 * webview's generic `signIn` message) so `extension.ts`'s `openvsChat.signIn` command —
+	 * the Command Palette entry point — shares this one implementation instead of
+	 * duplicating a second, older dispatch that never learned about the three OAuth-proxy
+	 * providers.
+	 */
+	async handleSignIn(providerId?: string): Promise<void> {
 		if (!providerId) {
 			return;
 		}
 		try {
 			const provider = this.registry.getProvider(providerId);
-			if (this.registry.getAuthUrl(providerId) || supportsNativeSignIn(providerId)) {
+			const label = provider?.info.label ?? providerId;
+			if (providerId === 'copilot') {
+				// Device-flow sign-in against GitHub's own OAuth grant — see CopilotProvider's
+				// class doc for what this actually authenticates as and why.
+				const result = await signInWithDeviceFlow(label, {
+					deviceCodeUrl: CopilotProvider.DEVICE_CODE_URL,
+					tokenUrl: CopilotProvider.TOKEN_URL,
+					clientId: CopilotProvider.CLIENT_ID,
+					scope: CopilotProvider.SCOPE,
+				});
+				if (result) {
+					// Copilot has no separate refresh token to persist — the GitHub device-flow
+					// token itself is the long-lived credential; CopilotProvider mints the
+					// short-lived wire token from it per request.
+					await this.registry.setApiKey(providerId, result.accessToken);
+					this.invalidateModelCache(providerId);
+					vscode.window.showInformationMessage(`${label} connected.`);
+				}
+			} else if (providerId === 'grok') {
+				// A thunk, not a pre-resolved config: OIDC discovery runs INSIDE the progress
+				// notification signInWithDeviceFlow opens, so a slow/hanging discovery call
+				// still shows a cancel button instead of leaving the click on "Sign in" looking
+				// like it did nothing.
+				const result = await signInWithDeviceFlow(label, signal => GrokProvider.discoverDeviceFlowConfig(signal));
+				if (result) {
+					await this.registry.setApiKey(providerId, JSON.stringify({
+						accessToken: result.accessToken, refreshToken: result.refreshToken, expiresAt: result.expiresAt,
+					}));
+					this.invalidateModelCache(providerId);
+					vscode.window.showInformationMessage(`${label} connected.`);
+				}
+			} else if (providerId === 'kiro') {
+				// Not a sign-in flow at all — imports the token Kiro's own IDE/CLI already
+				// wrote after a normal sign-in there. See importKiroCredential's doc.
+				const credential = await importKiroCredential();
+				await this.registry.setApiKey(providerId, credential);
+				this.invalidateModelCache(providerId);
+				vscode.window.showInformationMessage(`${label} credential imported.`);
+			} else if (providerId === 'web_gemini') {
+				// Also not a sign-in flow — there is no credential to obtain, only a Chrome
+				// profile directory to point at. Auto-filling the DEFAULT profile's path as
+				// the primary key (rather than leaving it blank, which also works — see
+				// GeminiWebProvider.profilePath) is what makes "Additional API keys" usable
+				// for a second/third Google account: ProviderRegistry.getApiKeys only
+				// considers the backup pool once a primary key is actually stored.
+				const defaultProfile = defaultChromeProfilePath();
+				if (!defaultProfile) {
+					vscode.window.showErrorMessage('Gemini (Chrome session) has no default Chrome profile location on this platform (Windows only, for now).');
+				} else {
+					await this.registry.setApiKey(providerId, defaultProfile);
+					this.invalidateModelCache(providerId);
+					vscode.window.showInformationMessage(
+						`${label} will use the default Chrome profile (${defaultProfile}). Add more Google accounts ` +
+						'under "Additional API keys" on this card, and enable "openvsChat.webGemini.enabled" in ' +
+						'Settings before using it — read the risk in the provider\'s description first.',
+					);
+				}
+			} else if (this.registry.getAuthUrl(providerId) || supportsNativeSignIn(providerId)) {
 				// A web auth backend is configured (or the provider has a built-in
 				// account login): run the browser round-trip flow.
 				const ok = await this.auth.signIn(providerId);
@@ -1625,18 +1707,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		const controller = new AbortController();
 		let out = '';
 		try {
-			await provider.streamChat({
+			const resolvedModel = model || this.registry.getModel(providerId);
+			await withProviderResilience(this.registry, providerId, resolvedModel, key => provider.streamChat({
 				messages: [
 					{ role: 'system', content: ENHANCE_SYSTEM },
 					{ role: 'user', content: text },
 				],
-				model: model || this.registry.getModel(providerId),
-				apiKey: apiKey ?? '',
+				model: resolvedModel,
+				apiKey: key,
 				baseUrl: this.registry.getBaseUrl(providerId),
 				maxTokens: this.registry.getMaxTokens(),
 				signal: controller.signal,
 				onToken: delta => { out += delta; },
-			});
+			}));
 			this.bus.postTo(origin, { type: 'enhancedPrompt', text: out.trim() || text });
 		} catch (err) {
 			this.bus.postTo(origin, { type: 'enhanceError', message: err instanceof Error ? err.message : String(err) });
@@ -2402,13 +2485,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			// Trims to the budget and, if the backend still refuses the request as too big,
 			// retries once inside the ceiling it named. Shared with the Auto pipeline's text
 			// phases so the two cannot drift.
-			({ text: full, truncated } = await streamBudgeted(provider, {
+			({ text: full, truncated } = await withProviderResilience(this.registry, provider.info.id, params.model, apiKey => streamBudgeted(provider, {
 				messages,
 				...params,
+				apiKey,
 				contextBudget: this.configuredContextTokens(params.model, params.maxTokens, provider.info.id),
 				onToken: delta => thinking.push(delta),
 				onNotice: text => post({ type: 'info', message: text }),
-			}));
+			})));
 		} finally {
 			// Flushed even on failure, or text buffered inside an unclosed <thinking> tag
 			// is lost along with the error.
@@ -2463,6 +2547,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	/**
+	 * `AgentOptions.onKeyFailure`/`onStepSuccess` wired to this registry's key rotation and
+	 * quota cooldown, shared by `runAgent` and `runReadOnlyAgent` so the two loops rotate and
+	 * clear cooldowns identically. Kept as a hook rather than handing `AgentRunner` the
+	 * registry directly — see `AgentOptions.onKeyFailure`'s doc for why.
+	 */
+	private keyResilienceOptions(providerId: string, model: string): Pick<AgentOptions, 'onKeyFailure' | 'onStepSuccess'> {
+		return {
+			onKeyFailure: async message => {
+				this.registry.cooldowns.markCooldown(providerId, model, message);
+				const rotated = await this.registry.rotateApiKey(providerId);
+				return rotated ? (await this.registry.getApiKey(providerId)) ?? '' : undefined;
+			},
+			onStepSuccess: () => {
+				this.registry.noteApiKeySuccess(providerId);
+				this.registry.cooldowns.clear(providerId, model);
+			},
+		};
+	}
+
+	/**
 	 * Whether a model can call tools, preferring the fetched catalog metadata (which is
 	 * authoritative for providers like OpenRouter that report it) over the heuristic
 	 * per-provider patterns.
@@ -2495,6 +2599,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			keepHead,
 			maxRunMs: this.configuredMaxRunMs(),
 			traceTiming: vscode.workspace.getConfiguration('openvsChat').get<boolean>('agent.traceTiming') ?? false,
+			...this.keyResilienceOptions(provider.info.id, params.model),
 		});
 		let stepThinking: ThinkingStreamParser | undefined;
 		return runner.run(messages, params, {
@@ -2551,6 +2656,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			steering: () => this.drainSteering(sessionId, runId),
 			maxRunMs: this.configuredMaxRunMs(),
 			traceTiming: vscode.workspace.getConfiguration('openvsChat').get<boolean>('agent.traceTiming') ?? false,
+			...this.keyResilienceOptions(provider.info.id, params.model),
 		});
 		let stepThinking: ThinkingStreamParser | undefined;
 		post({ type: 'todos', items: [] });
@@ -2784,14 +2890,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		}
 		const res = await compactMessages(messages, async (toSummarize, maxTokens) => {
 			let text = '';
-			await provider.streamChat({
-				messages: toSummarize,
-				model: params.model,
-				apiKey: params.apiKey,
-				baseUrl: params.baseUrl,
-				maxTokens,
-				signal: params.signal,
-				onToken: delta => { text += delta; },
+			// Best-effort: compactMessages swallows a thrown summarizer failure and degrades
+			// to the lossy trim, so a rotated key here is a pure win with no new failure mode
+			// to guard — the surrounding try/catch already existed.
+			await withProviderResilience(this.registry, provider.info.id, params.model, async apiKey => {
+				await provider.streamChat({
+					messages: toSummarize,
+					model: params.model,
+					apiKey,
+					baseUrl: params.baseUrl,
+					maxTokens,
+					signal: params.signal,
+					onToken: delta => { text += delta; },
+				});
 			});
 			return stripThinking(text);
 			// Bounded by the same budget the conversation itself is trimmed to, less the
