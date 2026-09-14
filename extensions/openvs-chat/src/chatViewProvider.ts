@@ -2696,7 +2696,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		const target = this.sessionStore.getSession(targetSessionId);
 		if (!target) {
 			// Raced with `list_agent_sessions`: the tab closed between the two calls.
-			return { error: `No open chat tab with session id "${targetSessionId}" — it may have just been closed.` };
+			return { ok: false, error: `No open chat tab with session id "${targetSessionId}" — it may have just been closed.` };
 		}
 		const senderTitle = this.sessionStore.getSession(fromSessionId)?.title || 'New chat';
 		const replyHint = expectsReply
@@ -2715,9 +2715,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			const queue = this.steerQueues.get(targetSessionId) ?? [];
 			queue.push({ runId: liveRunId, text: content });
 			this.steerQueues.set(targetSessionId, queue);
-			return { delivered: 'live' };
+			return { ok: true, delivered: 'live' };
 		}
-		return { delivered: 'queued' };
+		return { ok: true, delivered: 'queued' };
 	}
 
 	/**

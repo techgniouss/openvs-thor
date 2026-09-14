@@ -313,10 +313,13 @@ export interface AgentSessionInfo {
  * `'live'` means the target has an in-flight steerable run and will see the message on its
  * next loop step; `'queued'` means the target is idle and the message was appended to its
  * conversation for the next time it runs — never claimed as `'live'`, since nothing is
- * watching it yet. `error` covers a target that no longer exists (raced with `list_agent_sessions`)
- * or any other delivery failure.
+ * watching it yet. `ok: false` covers a target that no longer exists (raced with
+ * `list_agent_sessions`) or any other delivery failure. Discriminated on `ok` (not an
+ * ad hoc `'error' in outcome` check) per this repo's `local/code-no-in-operator` rule.
  */
-export type AgentMessageDelivery = { readonly delivered: 'live' | 'queued' } | { readonly error: string };
+export type AgentMessageDelivery =
+	| { readonly ok: true; readonly delivered: 'live' | 'queued' }
+	| { readonly ok: false; readonly error: string };
 
 /**
  * Agent-to-agent (A2A) messaging capability, injected into a TOP-LEVEL session's
@@ -1205,7 +1208,7 @@ export class AgentRunner {
 		}
 		const expectsReply = asBoolean(call.args.expectsReply);
 		const outcome = await this.a2a.sendMessage(targetSessionId, message, expectsReply);
-		if ('error' in outcome) {
+		if (!outcome.ok) {
 			return { result: outcome.error, isError: true };
 		}
 		this.agentMessagesSent++;

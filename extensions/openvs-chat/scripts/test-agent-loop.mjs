@@ -1890,7 +1890,7 @@ async function runAuto(agentSteps, { maxSteps = 20, history = [{ role: 'user', c
 	const a2a = {
 		selfId: 'me',
 		listSessions: () => [{ id: 'other', title: 'Other', running: false }],
-		sendMessage: async () => { sent++; return { delivered: 'queued' }; },
+		sendMessage: async () => { sent++; return { ok: true, delivered: 'queued' }; },
 	};
 	const provider = fakeProvider([
 		{ content: '', toolCalls: [{ id: 'c1', name: 'send_agent_message', args: { targetSessionId: 'other', message: 'one' } }] },
@@ -1957,7 +1957,7 @@ async function runAuto(agentSteps, { maxSteps = 20, history = [{ role: 'user', c
 			assert.strictEqual(targetSessionId, 'target');
 			seenExpectsReply = expectsReply;
 			bridge.push(message);
-			return { delivered: 'live' };
+			return { ok: true, delivered: 'live' };
 		},
 	};
 	const senderProvider = fakeProvider([

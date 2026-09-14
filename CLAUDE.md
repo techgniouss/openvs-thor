@@ -222,6 +222,20 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   stored "key" here is a Chrome **user-data-directory path** naming one profile, and the
   "Sign in" button (`chatViewProvider.ts`) auto-fills the platform default rather than
   prompting for anything, since there is nothing to paste.
+  `providers/claudeCodeCli.ts`'s `ClaudeCodeCliProvider` (id `claude-code-cli`) is a **fifth**
+  category — BYOA (bring your own agent) rather than BYOK: it spawns the user's own,
+  already-installed Claude Code CLI (`claude -p … --output-format text`, or
+  `openvsChat.claude-code-cli.cliPath` for a non-PATH install) as a subprocess and streams its
+  stdout back as a plain chat reply, so someone with an existing Claude Code subscription can
+  reuse it without a separate Anthropic API key. Deliberately narrow: single-shot passthrough
+  only (the whole conversation is flattened into one prompt on every call — there is no
+  server-side session to resume), `info.supportsTools: false` and no `runAgentStep`, so it is
+  never wired into this extension's own Agent-mode tool loop and can never bypass
+  `agentRunner.ts`/`guardrails.ts` — whatever the CLI does internally to produce its answer
+  stays internal, only the final text comes back. `visionModelPatterns` is the unmatchable
+  sentinel (`antigravity.ts`'s pattern), not an empty list, because an empty list means
+  "assumed vision-capable" and this provider never sends attached images. Excluded from Auto
+  inference in `router.ts` for the same reason `custom` is: a local CLI may not be installed.
 - `src/agent/` — the Agent-mode tool loop: `tools.ts` (read/list/write files, run commands,
   `fetch_url`, plus `ask_user`, which blocks the loop on a multiple-choice question).
   `fetch_url` is the agent's only route off the machine — a URL the user pasted, docs that
@@ -238,6 +252,28 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   path and touch another), `agentRunner.ts` (the loop itself, including `spawn_subagent`
   delegation and the completion gate that refuses to call a run "done" while the model's
   own `update_todos` checklist has open items or it wrote files without verifying them).
+  A delegate's own tool calls now stream live under its `spawn_subagent` card instead of
+  staying opaque until the whole delegation finishes: `AgentCallbacks.onToolStart`/`onToolEnd`
+  carry an optional `parentCallId`, `runSubagent` forwards the child's tool activity through
+  it (narration/step lifecycle stays batched into the final summary as before — only tool
+  activity is worth surfacing mid-run), and `media/main.js` nests the rendered card under a
+  `.tool-children` group, falling back to a top-level card if the parent scrolled out of view
+  rather than dropping the event.
+  **Agent-to-agent (A2A) messaging** lets a top-level session's agent address another open
+  chat tab: `list_agent_sessions` (read-only) discovers a target by id/title/running-state,
+  `send_agent_message` delivers text to it. Both are offered only at `depth === 0`
+  (`AgentOptions.a2a`, injected from `chatViewProvider.ts`'s `buildA2A` — `AgentRunner` has no
+  knowledge of sibling sessions itself) and never forwarded into a `spawn_subagent` child's
+  options, so a delegate can never reach another tab however deep the nesting. Delivery has
+  two honestly-reported outcomes: a target with a live steerable run gets the message pushed
+  onto `steerQueues` — the exact mechanism real user-typed steering already uses — and is told
+  `'live'`; an idle target gets the header-prefixed message appended as a durable transcript
+  turn (`TranscriptEntry.fromAgentSession`, deliberately not a `kind`, so it stays a real
+  turn in `sendableMessages`) and is told `'queued'`, never `'live'`. `send_agent_message` is
+  gated by the same hard `autoApproves`/`approver.confirm` machinery as `run_command`/MCP
+  calls, plus a small per-run cap (`Guardrails.maxAgentMessages`, default 3) bounding a
+  runaway back-and-forth between two tabs — no reply-loop orchestration, no `responseId`
+  threading beyond that.
   A run is bounded on **two** axes, because they come apart: `openvsChat.agent.maxSteps`
   caps how many times the model is asked (Full Auto extends itself to 2× that, nothing
   else does), and `openvsChat.agent.maxRunMinutes` caps how long the asking may take —
@@ -256,6 +292,15 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   raise the budget would trade a rate-limit rejection for a context-length one. When no
   header is offered the same ceiling is still learned from the HTTP 413 body
   (`parseTokenLimit`), one wasted request later.
+  The same reading also drives a **proactive** notice, layered on top of that reactive
+  machinery rather than replacing it: `rateLimitStatus` (a pure function over a
+  `RateLimitSnapshot`, also exposed as `RateLimitTracker.status`) classifies a model's
+  last-known allowance as `'ok'` / `'near'` (<20% remaining) / `'critical'` (<5%) /
+  `'unknown'` (no reading, or one past `SNAPSHOT_TTL_MS`) — never invented from nothing.
+  `chatViewProvider.ts`'s `maybeNoticeRateLimit` posts a one-line `{ type: 'info' }` notice
+  on `'near'`/`'critical'` after a successful request, on both the plain streaming path and
+  the agent loop's `onStepSuccess` hook, throttled to once per (provider, model) per 5
+  minutes so a long run sitting at `'critical'` doesn't repeat it every step.
   A stated rate limit is a *ceiling*; `providers/keyRotation.ts`'s `KeyRotator` and
   `providers/cooldown.ts`'s `CooldownTracker` are what a session does about actually hitting
   one. `ProviderRegistry.getApiKeys` returns a provider's primary stored key plus any backup
