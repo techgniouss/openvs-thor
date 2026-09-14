@@ -22,6 +22,7 @@ import { smallTalkKind } from './persona/smallTalk';
 import { ThinkingStreamParser, formatThinking, stripHistoryThinking, stripThinking } from './persona/thinking';
 import { CopilotProvider } from './providers/copilot';
 import { GrokProvider } from './providers/grok';
+import { rateLimitStatus } from './providers/rateLimits';
 import { ProviderRegistry } from './providers/registry';
 import { withProviderResilience } from './providers/resilience';
 import { ChatImage, ChatMessage, ChatProvider, ModelEntry, entrySupportsTools, isAbortError, modelSupportsVision } from './providers/types';
@@ -77,6 +78,14 @@ const MIN_SKILL_CHARS = 2_000;
  * but high enough to survey a codebase — the old cap of 8 ended investigations mid-search.
  */
 const MAX_READ_ONLY_STEPS = 30;
+
+/**
+ * Minimum time between proactive rate-limit notices for the same (provider, model) pair. A
+ * long agent run can succeed dozens of times while sitting at `'near'`/`'critical'` — this is
+ * what keeps that from repeating the same notice on every step. See
+ * {@link ChatViewProvider.rateLimitNoticeAt}.
+ */
+const RATE_LIMIT_NOTICE_COOLDOWN_MS = 5 * 60_000;
 
 /** A unique id for one send, used to fence out messages from a superseded run. */
 function newRunId(): string {
@@ -300,6 +309,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	 * the loop that is about to start and is drained when it does.
 	 */
 	private readonly steerableRuns = new Map<string, string>();
+
+	/**
+	 * Last time a proactive rate-limit notice (see {@link maybeNoticeRateLimit}) was shown for
+	 * a `${providerId}:${model}` pair, epoch ms. Session-scoped and in-memory, same convention
+	 * as {@link RateLimitTracker}/`CooldownTracker`/`KeyRotator` — a stale entry costs at most
+	 * one skipped or one extra notice, since the next successful request re-derives the truth.
+	 * Throttled purely by elapsed time ({@link RATE_LIMIT_NOTICE_COOLDOWN_MS}) rather than by
+	 * "notify again only after dropping back to `'ok'`": a run that sits at `'critical'` for
+	 * an hour genuinely deserves more than one reminder, and a pure time cooldown needs no
+	 * extra state to track the last-seen status per pair.
+	 */
+	private readonly rateLimitNoticeAt = new Map<string, number>();
 
 	/**
 	 * Remote-control connection status, as last reported by `RemoteService` via
@@ -2498,6 +2519,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			// is lost along with the error.
 			thinking.flush();
 		}
+		// A throw above propagates out of this function, so reaching here means the request
+		// succeeded — the same "after a successful request" hook point `keyResilienceOptions`
+		// uses for the agent-loop path.
+		this.maybeNoticeRateLimit(provider, params.model, post);
 		// Records the authoritative final text for this non-agent turn — there is no
 		// agentStepEnd on this path, so this is its equivalent. `stripThinking` mirrors what
 		// the webview's own transcript actually keeps (raw `full` still carries any
@@ -2547,12 +2572,47 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	/**
+	 * Surfaces a one-line, low-urgency notice through the same `{ type: 'info' }` channel as
+	 * every other transport status (see `runStreaming`'s `onNotice` and {@link retryNotice})
+	 * when `provider.rateLimit(model)`'s last reading says the allowance is running low —
+	 * *before* a request actually gets refused with a 429, not only after (that reactive side
+	 * stays entirely in `keyRotation.ts`/`cooldown.ts` and is untouched by this).
+	 *
+	 * Purely additive visibility: a provider with no `rateLimit()`, or one that has said
+	 * nothing yet, yields `'unknown'` from {@link rateLimitStatus} and nothing is posted —
+	 * never invents a warning from the absence of data. `'ok'` is likewise silent. Throttled
+	 * per (provider, model) via {@link rateLimitNoticeAt} so a long-running agent loop that
+	 * keeps succeeding at `'near'`/`'critical'` gets this once per
+	 * {@link RATE_LIMIT_NOTICE_COOLDOWN_MS} window, not once per step.
+	 */
+	private maybeNoticeRateLimit(provider: ChatProvider, model: string, post: SessionPost, now = Date.now()): void {
+		const status = rateLimitStatus(provider.rateLimit?.(model), now);
+		if (status !== 'near' && status !== 'critical') {
+			return;
+		}
+		const key = `${provider.info.id}:${model}`;
+		const last = this.rateLimitNoticeAt.get(key);
+		if (last !== undefined && now - last < RATE_LIMIT_NOTICE_COOLDOWN_MS) {
+			return;
+		}
+		this.rateLimitNoticeAt.set(key, now);
+		const urgency = status === 'critical' ? 'is critically close to' : 'is close to';
+		post({
+			type: 'info',
+			message: `${provider.info.label} ${urgency} its rate limit for ${model} — consider switching models or providers, or adding a backup API key in Settings.`,
+		});
+	}
+
+	/**
 	 * `AgentOptions.onKeyFailure`/`onStepSuccess` wired to this registry's key rotation and
 	 * quota cooldown, shared by `runAgent` and `runReadOnlyAgent` so the two loops rotate and
 	 * clear cooldowns identically. Kept as a hook rather than handing `AgentRunner` the
-	 * registry directly — see `AgentOptions.onKeyFailure`'s doc for why.
+	 * registry directly — see `AgentOptions.onKeyFailure`'s doc for why. Also carries the
+	 * proactive rate-limit notice (see {@link maybeNoticeRateLimit}) on every successful step,
+	 * since `provider` and `post` are only in scope at these two call sites.
 	 */
-	private keyResilienceOptions(providerId: string, model: string): Pick<AgentOptions, 'onKeyFailure' | 'onStepSuccess'> {
+	private keyResilienceOptions(provider: ChatProvider, model: string, post: SessionPost): Pick<AgentOptions, 'onKeyFailure' | 'onStepSuccess'> {
+		const providerId = provider.info.id;
 		return {
 			onKeyFailure: async message => {
 				this.registry.cooldowns.markCooldown(providerId, model, message);
@@ -2562,6 +2622,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			onStepSuccess: () => {
 				this.registry.noteApiKeySuccess(providerId);
 				this.registry.cooldowns.clear(providerId, model);
+				this.maybeNoticeRateLimit(provider, model, post);
 			},
 		};
 	}
@@ -2599,7 +2660,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			keepHead,
 			maxRunMs: this.configuredMaxRunMs(),
 			traceTiming: vscode.workspace.getConfiguration('openvsChat').get<boolean>('agent.traceTiming') ?? false,
-			...this.keyResilienceOptions(provider.info.id, params.model),
+			...this.keyResilienceOptions(provider, params.model, post),
 		});
 		let stepThinking: ThinkingStreamParser | undefined;
 		return runner.run(messages, params, {
@@ -2656,7 +2717,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			steering: () => this.drainSteering(sessionId, runId),
 			maxRunMs: this.configuredMaxRunMs(),
 			traceTiming: vscode.workspace.getConfiguration('openvsChat').get<boolean>('agent.traceTiming') ?? false,
-			...this.keyResilienceOptions(provider.info.id, params.model),
+			...this.keyResilienceOptions(provider, params.model, post),
 		});
 		let stepThinking: ThinkingStreamParser | undefined;
 		post({ type: 'todos', items: [] });
