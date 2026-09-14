@@ -25,8 +25,10 @@ export interface AutoCallbacks {
 	agentStepStart(): void;
 	/** The implementer's current step finished (authoritative full text). */
 	agentStepEnd(content: string): void;
-	onToolStart(call: ToolCall): void;
-	onToolEnd(call: ToolCall, result: string, isError: boolean): void;
+	/** `parentCallId` mirrors `AgentCallbacks.onToolStart`'s — set only for a sub-agent's own nested tool activity. */
+	onToolStart(call: ToolCall, parentCallId?: string): void;
+	/** `parentCallId` mirrors `AgentCallbacks.onToolEnd`'s. */
+	onToolEnd(call: ToolCall, result: string, isError: boolean, parentCallId?: string): void;
 	/** An informational note (skipped review, model fallback, step limit, …). */
 	note(text: string): void;
 	/** The implementer's visible checklist changed. */
@@ -449,8 +451,8 @@ function agentCallbacks(cb: AutoCallbacks, sink: ChangeSink): AgentCallbacks {
 		onStepStart: () => cb.agentStepStart(),
 		onToken: delta => cb.token(delta),
 		onStepEnd: content => { if (content) { sink.narration.push(content); } cb.agentStepEnd(content); },
-		onToolStart: call => { recordChangeStart(sink, call); cb.onToolStart(call); },
-		onToolEnd: (call, result, isError) => { recordChangeEnd(sink, call, result, isError); cb.onToolEnd(call, result, isError); },
+		onToolStart: (call, parentCallId) => { recordChangeStart(sink, call); cb.onToolStart(call, parentCallId); },
+		onToolEnd: (call, result, isError, parentCallId) => { recordChangeEnd(sink, call, result, isError); cb.onToolEnd(call, result, isError, parentCallId); },
 		onNote: text => cb.note(text),
 		onTodos: items => cb.onTodos?.(items),
 	};

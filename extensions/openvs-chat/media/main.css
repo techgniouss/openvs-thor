@@ -818,6 +818,14 @@ body.settings-window #settingsPanel {
 }
 .tool-summary:hover { opacity: 1; }
 details[open] > .tool-summary { margin-bottom: 4px; }
+/* A delegated sub-agent's own tool calls, grouped under its spawn_subagent card instead of
+   appearing as unrelated top-level cards (indent + rule mirrors .thinking-body below). */
+.tool-children {
+	margin: 6px 0 0; padding-left: 10px;
+	border-left: 2px solid var(--vscode-panel-border, rgba(127,127,127,0.3));
+}
+.tool-children:empty { display: none; }
+.tool-children .tool { font-size: 0.95em; }
 
 /* ---- Reasoning ----
    Collapsed by default: a run's thinking dwarfs its answer, so it shows as a single

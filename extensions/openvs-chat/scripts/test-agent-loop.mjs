@@ -1754,4 +1754,45 @@ async function runAuto(agentSteps, { maxSteps = 20, history = [{ role: 'user', c
 	assert.ok(/offset=\d+ to continue/.test(tight), 'and is told how to read the rest, so nothing is lost');
 }
 
+// 38. A sub-agent's own tool activity is forwarded live to the OUTER callbacks, tagged with
+// the spawn_subagent call's own id as `parentCallId` — the UI nests it under that call's
+// already-rendered card instead of it appearing as an unrelated top-level event, and the
+// spawn_subagent call itself stays untagged (it IS the top-level event).
+{
+	const provider = {
+		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+		async listModels() { return []; },
+		async runAgentStep(request) {
+			const isChild = request.messages.some(m => m.content.includes('DELEGATE THIS'));
+			if (isChild) {
+				return request.messages.some(m => m.role === 'tool')
+					? { content: 'child done', toolCalls: [] }
+					: { content: '', toolCalls: [{ id: 'k1', name: 'list_dir', args: { path: 'dir' } }] };
+			}
+			return request.messages.some(m => m.role === 'tool')
+				? { content: 'parent done', toolCalls: [] }
+				: { content: '', toolCalls: [{ id: 's1', name: 'spawn_subagent', args: { goal: 'DELEGATE THIS', readOnly: true } }] };
+		},
+	};
+	const events = [];
+	const cb = {
+		...noopCallbacks(),
+		onToolStart: (call, parentCallId) => events.push(['start', call.id, parentCallId]),
+		onToolEnd: (call, _result, _isError, parentCallId) => events.push(['end', call.id, parentCallId]),
+	};
+	const runner = new AgentRunner(provider, approver, 10);
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, cb);
+	assert.strictEqual(result.reason, 'done');
+	assert.deepStrictEqual(
+		events.filter(e => e[1] === 'k1'),
+		[['start', 'k1', 's1'], ['end', 'k1', 's1']],
+		"the delegate's own tool call is tagged with the spawn_subagent call's id",
+	);
+	assert.deepStrictEqual(
+		events.filter(e => e[1] === 's1'),
+		[['start', 's1', undefined], ['end', 's1', undefined]],
+		'the spawn_subagent call itself carries no parentCallId — it is the top-level event',
+	);
+}
+
 console.log('test-agent-loop: all assertions passed');

@@ -2386,8 +2386,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 							// Records the authoritative text for this step.
 							this.recordAssistantTurn(sessionId, formatted);
 						},
-						onToolStart: call => post({ type: 'toolStart', id: call.id, name: call.name, args: call.args }),
-						onToolEnd: (call, result, isError) => post({ type: 'toolEnd', id: call.id, name: call.name, result, isError }),
+						onToolStart: (call, parentCallId) => post({ type: 'toolStart', id: call.id, name: call.name, args: call.args, parentCallId }),
+						onToolEnd: (call, result, isError, parentCallId) => post({ type: 'toolEnd', id: call.id, name: call.name, result, isError, parentCallId }),
 						note: text => post({ type: 'info', message: text }),
 						onTodos: items => post({ type: 'todos', items }),
 					},
@@ -2613,9 +2613,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				// Records the authoritative text for this step.
 				this.recordAssistantTurn(sessionId, formatted);
 			},
-			onToolStart: call => post({ type: 'toolStart', id: call.id, name: call.name, args: call.args }),
-			onToolEnd: (call, result, isError) =>
-				post({ type: 'toolEnd', id: call.id, name: call.name, result, isError }),
+			onToolStart: (call, parentCallId) => post({ type: 'toolStart', id: call.id, name: call.name, args: call.args, parentCallId }),
+			onToolEnd: (call, result, isError, parentCallId) =>
+				post({ type: 'toolEnd', id: call.id, name: call.name, result, isError, parentCallId }),
 			onNote: text => post({ type: 'info', message: text }),
 		});
 	}
@@ -2677,9 +2677,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 					// Records the authoritative text for this step.
 					this.recordAssistantTurn(sessionId, formatted);
 				},
-				onToolStart: call => post({ type: 'toolStart', id: call.id, name: call.name, args: call.args }),
-				onToolEnd: (call, result, isError) =>
-					post({ type: 'toolEnd', id: call.id, name: call.name, result, isError }),
+				onToolStart: (call, parentCallId) => post({ type: 'toolStart', id: call.id, name: call.name, args: call.args, parentCallId }),
+				onToolEnd: (call, result, isError, parentCallId) =>
+					post({ type: 'toolEnd', id: call.id, name: call.name, result, isError, parentCallId }),
 				onNote: text => post({ type: 'info', message: text }),
 				onTodos: items => post({ type: 'todos', items }),
 			});

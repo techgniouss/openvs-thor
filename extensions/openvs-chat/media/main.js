@@ -439,7 +439,13 @@
 		keepWorkingLast();
 		return body;
 	}
-	function appendToolEl(name, args) {
+	/**
+	 * Renders a tool-call card. `container`, when given, is a sub-agent's `.tool-children`
+	 * group (see `childrenContainer`) rather than the top-level transcript — a delegate's
+	 * own tool activity nests under its `spawn_subagent` card instead of appearing as an
+	 * unrelated top-level event.
+	 */
+	function appendToolEl(name, args, container) {
 		const wrap = document.createElement('div');
 		wrap.className = 'tool running';
 		const head = document.createElement('div');
@@ -464,10 +470,24 @@
 		details.appendChild(out);
 		wrap.appendChild(head);
 		wrap.appendChild(details);
-		els.messages.appendChild(wrap);
+		(container || els.messages).appendChild(wrap);
 		keepWorkingLast();
 		scrollToBottom();
-		return { wrap, out, details, summary };
+		return { wrap, out, details, summary, children: null };
+	}
+
+	/**
+	 * Lazily creates (and caches on `parent`) the nested-activity group a delegated
+	 * sub-agent's own tool cards render into, so several of them visually collect under one
+	 * `spawn_subagent` card rather than each getting its own container element.
+	 */
+	function childrenContainer(parent) {
+		if (!parent.children) {
+			parent.children = document.createElement('div');
+			parent.children.className = 'tool-children';
+			parent.wrap.appendChild(parent.children);
+		}
+		return parent.children;
 	}
 	function summarizeArgs(args) {
 		try {
@@ -2494,7 +2514,12 @@
 				// Tool blocks are rendered live only for the visible tab.
 				if (s.id === activeSessionId) {
 					noteWorkingProgress();
-					const el = appendToolEl(msg.name, msg.args);
+					// `parentCallId` names a delegate's `spawn_subagent` card; when that card
+					// is still on screen this call nests under it. A named parent that is not
+					// found (e.g. scrolled out of a windowed transcript) falls back to a plain
+					// top-level card — visible but unparented beats vanishing silently.
+					const parent = msg.parentCallId ? toolEls.get(toolKey(s.id, msg.parentCallId)) : undefined;
+					const el = appendToolEl(msg.name, msg.args, parent ? childrenContainer(parent) : undefined);
 					toolEls.set(toolKey(s.id, msg.id || ('t' + (toolSeq++))), el);
 				}
 				break;
