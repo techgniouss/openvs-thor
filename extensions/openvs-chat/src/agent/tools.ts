@@ -209,8 +209,14 @@ export const AGENT_TOOLS: ToolSpec[] = [
  * and Ask mode needs it as much as Agent mode does — "what does this page say" and "check
  * the current API" are questions, not tasks. Its egress is governed by the approval policy
  * (see {@link fetchUrl}), not by this list.
+ *
+ * `list_agent_sessions` belongs here for the same reason: it reads the other open tabs'
+ * titles/run state and changes nothing. Like `ask_user`/`spawn_subagent` it is handled by
+ * `AgentRunner` itself rather than {@link executeTool} (it needs the sibling-session map,
+ * which lives in `chatViewProvider.ts` — see `AgentOptions.a2a`), so it never reaches the
+ * generic dispatch below; it is listed here purely for this classification.
  */
-export const READ_ONLY_TOOL_NAMES = ['read_file', 'list_dir', 'search_files', 'glob_files', 'fetch_url'];
+export const READ_ONLY_TOOL_NAMES = ['read_file', 'list_dir', 'search_files', 'glob_files', 'fetch_url', 'list_agent_sessions'];
 
 /**
  * Every name the model can call as a tool, including the ones the agent loop handles
@@ -222,7 +228,7 @@ export const READ_ONLY_TOOL_NAMES = ['read_file', 'list_dir', 'search_files', 'g
  * retries the same call. `update_todos` is spelled out rather than imported to keep this
  * module free of a dependency on the agent loop.
  */
-const CALLABLE_TOOL_NAMES = new Set([...AGENT_TOOLS.map(t => t.name), 'ask_user', 'update_todos', 'spawn_subagent']);
+const CALLABLE_TOOL_NAMES = new Set([...AGENT_TOOLS.map(t => t.name), 'ask_user', 'update_todos', 'spawn_subagent', 'list_agent_sessions', 'send_agent_message']);
 
 /**
  * How many options an {@link ASK_USER_TOOL} call may offer. Two is the minimum for a
@@ -288,8 +294,47 @@ export const SPAWN_SUBAGENT_TOOL: ToolSpec = {
 	},
 };
 
+/**
+ * Agent-to-agent (A2A) discovery tool: lists the other open chat tabs so a top-level Agent
+ * run can find a session id to address with {@link SEND_AGENT_MESSAGE_TOOL}. Handled by
+ * {@link AgentRunner} (not {@link executeTool}) — it needs the sibling-session map, which
+ * only `chatViewProvider.ts` has (see `AgentOptions.a2a`). Never offered to a `spawn_subagent`
+ * delegate; only a top-level, user-initiated session may discover or address another tab.
+ */
+export const LIST_AGENT_SESSIONS_TOOL: ToolSpec = {
+	name: 'list_agent_sessions',
+	description: 'List the other open chat tabs (their session id, title, and whether each is currently running), so you can address one with send_agent_message. Never includes this session itself.',
+	parameters: {
+		type: 'object',
+		properties: {},
+	},
+};
+
+/**
+ * Agent-to-agent (A2A) messaging tool: sends a text message to another open chat tab's
+ * agent, addressed by session id. Handled by {@link AgentRunner}, gated behind the same
+ * approval machinery as every other side-effecting tool (`runOneTool`'s MCP-call branch),
+ * plus a small per-run cap (`Guardrails.maxAgentMessages`) — see `AgentOptions.a2a`'s doc
+ * for the full delivery story (a live run is steered; an idle one is queued for its next
+ * turn). One explicit call per message: this does NOT start a reply loop — the model
+ * decides whether and when to send again.
+ */
+export const SEND_AGENT_MESSAGE_TOOL: ToolSpec = {
+	name: 'send_agent_message',
+	description: 'Send a text message to another open chat tab\'s agent, addressed by session id (get one from list_agent_sessions). Use this to hand off a question, ask for a review, or start a discussion between two tabs — one message per call; it does not wait for or fetch a reply. If the target is mid-run, it is delivered live and picked up on its next step; if idle, it is queued into that tab\'s conversation for the next time it runs.',
+	parameters: {
+		type: 'object',
+		properties: {
+			targetSessionId: { type: 'string', description: 'The session id of the chat tab to message (from list_agent_sessions). Cannot be this session\'s own id.' },
+			message: { type: 'string', description: 'The message body to send.' },
+			expectsReply: { type: 'boolean', description: 'True if you want the other agent to reply back to this session with its own send_agent_message call. Adds a one-line instruction on how to reply.' },
+		},
+		required: ['targetSessionId', 'message'],
+	},
+};
+
 /** What kind of side effect an approval covers; also the granularity of "always allow". */
-export type ApprovalKind = 'write' | 'command' | 'mcp';
+export type ApprovalKind = 'write' | 'command' | 'mcp' | 'agent_message';
 
 /** One request for the user's permission to take a side-effecting action. */
 export interface ApprovalRequest {

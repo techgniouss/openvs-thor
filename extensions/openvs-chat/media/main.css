@@ -615,6 +615,17 @@ html, body {
 	font-weight: 400;
 }
 
+/* ---- Agent-to-agent message (send_agent_message, received) ---- */
+.message.agent-message .body {
+	border-left: 3px solid var(--vscode-charts-blue, #3794ff);
+}
+.message.agent-message .role::after {
+	content: ' · from agent';
+	text-transform: none;
+	letter-spacing: normal;
+	font-weight: 400;
+}
+
 .icon-button.busy {
 	opacity: 0.5;
 	animation: composer-busy-spin 1.2s linear infinite;

@@ -33,7 +33,7 @@
 
 	/**
 	 * @typedef {{ role: string, label?: string, provider?: string, model?: string, source?: string }} AutoPhase
-	 * @typedef {{ role: 'user'|'assistant', content: string, images?: {mimeType:string,data:string}[], kind?: 'info'|'error'|'auto', phases?: AutoPhase[] }} Msg
+	 * @typedef {{ role: 'user'|'assistant', content: string, images?: {mimeType:string,data:string}[], kind?: 'info'|'error'|'auto', phases?: AutoPhase[], fromAgentSession?: {id:string,title:string} }} Msg
 	 * @typedef {{ content: string, status: 'pending'|'in_progress'|'completed' }} Todo
 	 * @typedef {{ id: string, title: string, messages: Msg[], streaming: boolean, pending: string|null, queue: string[], todos?: Todo[], runId?: string, runMode?: string, steerable?: boolean, compactSummary?: string, compactedUpTo?: number, mode?: string }} Session
 	 */
@@ -397,6 +397,10 @@
 			}
 			const body = appendMessageEl(m.role, m.content, m.images);
 			if (m.kind) { body.parentElement?.classList.add(m.kind === 'auto' ? 'info' : m.kind); }
+			// A message delivered by another chat tab's agent (send_agent_message) — carries
+			// no `kind` (it's a real, sendable turn, unlike an 'info'/'error' notice), so it
+			// is marked distinctly here instead, mirroring the `.steering` class below.
+			if (m.fromAgentSession) { body.parentElement?.classList.add('agent-message'); }
 		}
 		// Re-attach the in-flight assistant bubble when switching back to a streaming tab.
 		if (s.pending !== null) {

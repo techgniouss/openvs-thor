@@ -14,7 +14,7 @@ import { budgetsForCeiling } from './contextWindow';
 import { CACHED_COMPACT_TRIGGER, COMPACT_TRIGGER, SUMMARY_MAX_TOKENS, canCompact, compactMessages, compactionThreshold, shouldCompact } from './compaction';
 import { elidedToolCallIds, estimateMessagesTokens, estimateToolsTokens, isContextLengthError, parseTokenLimit, pruneToolOutput, trimMessages } from './context';
 import { Guardrails, autoApproves, loadGuardrails, resolveWorkspacePath } from './guardrails';
-import { AGENT_TOOLS, ASK_USER_TOOL, AskOption, MAX_ASK_OPTIONS, READ_ONLY_TOOL_NAMES, SPAWN_SUBAGENT_TOOL, ToolApprover, ToolLimits, VerifyCommand, asBoolean, asString, commandTextOf, detectVerificationCommands, executeTool, isVerificationCommand } from './tools';
+import { AGENT_TOOLS, ASK_USER_TOOL, AskOption, LIST_AGENT_SESSIONS_TOOL, MAX_ASK_OPTIONS, READ_ONLY_TOOL_NAMES, SEND_AGENT_MESSAGE_TOOL, SPAWN_SUBAGENT_TOOL, ToolApprover, ToolLimits, VerifyCommand, asBoolean, asString, commandTextOf, detectVerificationCommands, executeTool, isVerificationCommand } from './tools';
 
 const MCP_PREFIX = 'mcp__';
 
@@ -300,6 +300,45 @@ interface SubagentBudget {
 	spawned: number;
 }
 
+/** One other open chat tab, as offered to the model by `list_agent_sessions`. */
+export interface AgentSessionInfo {
+	readonly id: string;
+	readonly title: string;
+	/** Whether that tab currently has a run in flight. */
+	readonly running: boolean;
+}
+
+/**
+ * The outcome of a `send_agent_message` delivery, as reported by {@link AgentA2A.sendMessage}.
+ * `'live'` means the target has an in-flight steerable run and will see the message on its
+ * next loop step; `'queued'` means the target is idle and the message was appended to its
+ * conversation for the next time it runs — never claimed as `'live'`, since nothing is
+ * watching it yet. `error` covers a target that no longer exists (raced with `list_agent_sessions`)
+ * or any other delivery failure.
+ */
+export type AgentMessageDelivery = { readonly delivered: 'live' | 'queued' } | { readonly error: string };
+
+/**
+ * Agent-to-agent (A2A) messaging capability, injected into a TOP-LEVEL session's
+ * `AgentRunner` only — see {@link AgentOptions.a2a}. `AgentRunner` has no knowledge of
+ * sibling sessions itself (only `chatViewProvider.ts`'s session map does), so this is a
+ * narrow interface passed in, the same inversion `AgentOptions.onKeyFailure` already uses
+ * for key rotation: the agent loop stays decoupled from `ChatViewProvider`.
+ */
+export interface AgentA2A {
+	/** This run's own session id, so a self-targeted send is refused without a round trip. */
+	readonly selfId: string;
+	/** The other open top-level chat sessions — excludes {@link selfId}. */
+	listSessions(): AgentSessionInfo[];
+	/**
+	 * Delivers `message` to `targetSessionId`. The caller ({@link AgentRunner.sendAgentMessage})
+	 * has already checked `targetSessionId !== selfId` and that it appears in
+	 * {@link listSessions}, so this only needs to re-check existence defensively (the target
+	 * tab may have closed between those two calls) and perform the actual delivery.
+	 */
+	sendMessage(targetSessionId: string, message: string, expectsReply: boolean): Promise<AgentMessageDelivery>;
+}
+
 export interface AgentOptions {
 	guardrails?: Guardrails;
 	/** Nesting depth (0 = the top-level agent). */
@@ -380,6 +419,15 @@ export interface AgentOptions {
 	 * out of capacity once a step against it succeeds, whichever key made that happen.
 	 */
 	onStepSuccess?: () => void;
+	/**
+	 * Agent-to-agent messaging (`list_agent_sessions`/`send_agent_message`). Offered as tools
+	 * only when this is set AND {@link depth} is 0 — i.e. only for a top-level, user-initiated
+	 * session's own run. `runSubagent` below deliberately does NOT forward this to the child
+	 * options it builds, so a `spawn_subagent` delegate can never see or call either tool,
+	 * however deep the nesting: that bounds the whole feature's blast radius to the tabs a
+	 * user actually opened, with no delegate-spawns-delegate path to a cross-tab message.
+	 */
+	a2a?: AgentA2A;
 }
 
 /**
@@ -477,6 +525,10 @@ export class AgentRunner {
 	private readonly onKeyFailure?: (message: string) => Promise<string | undefined>;
 	/** See {@link AgentOptions.onStepSuccess}. */
 	private readonly onStepSuccess?: () => void;
+	/** See {@link AgentOptions.a2a}. Only ever set when {@link depth} is 0 — see that doc. */
+	private readonly a2a?: AgentA2A;
+	/** `send_agent_message` calls this run has made so far, capped at {@link Guardrails.maxAgentMessages}. */
+	private agentMessagesSent = 0;
 
 	constructor(
 		private readonly provider: ChatProvider,
@@ -507,6 +559,7 @@ export class AgentRunner {
 		this.now = opts?.now ?? Date.now;
 		this.onKeyFailure = opts?.onKeyFailure;
 		this.onStepSuccess = opts?.onStepSuccess;
+		this.a2a = opts?.a2a;
 	}
 
 	/**
@@ -533,6 +586,13 @@ export class AgentRunner {
 		const base = [...AGENT_TOOLS];
 		if (this.depth === 0) {
 			base.push(UPDATE_TODOS_TOOL, ASK_USER_TOOL);
+			// Belt-and-suspenders on top of `runSubagent` simply never forwarding `a2a` to a
+			// child's options: a delegate can never reach depth 0, so this alone would already
+			// exclude it, but checking depth explicitly here matches how ASK_USER_TOOL above
+			// is scoped and keeps the two guards from being able to drift apart.
+			if (this.a2a) {
+				base.push(LIST_AGENT_SESSIONS_TOOL, SEND_AGENT_MESSAGE_TOOL);
+			}
 		}
 		if (this.depth < this.guardrails.maxSubagentDepth && this.budget.spawned < this.guardrails.maxSubagents) {
 			base.push(SPAWN_SUBAGENT_TOOL);
@@ -1068,6 +1128,95 @@ export class AgentRunner {
 			: { result: `The user dismissed the question without answering. Proceed with the most reasonable option and say which you chose.${dropped}`, isError: false };
 	}
 
+	/** Lists the other open chat tabs for `list_agent_sessions`. See {@link AgentA2A.listSessions}. */
+	private listAgentSessions(): { result: string; isError: boolean } {
+		// `this.depth !== 0` is unreachable today — `runSubagent` below never forwards `a2a`
+		// to a child's options, so a delegate's `this.a2a` is always undefined — but checked
+		// explicitly anyway so this stays refused even if a future change to `runSubagent`
+		// accidentally started passing it through. Requirement: only a top-level,
+		// user-initiated session may use either A2A tool.
+		if (!this.a2a || this.depth !== 0) {
+			return { result: 'Agent-to-agent messaging is not available in this run.', isError: true };
+		}
+		const sessions = this.a2a.listSessions();
+		if (!sessions.length) {
+			return { result: 'No other chat tabs are open right now.', isError: false };
+		}
+		const lines = sessions.map(s => `- id "${s.id}": "${s.title}" (${s.running ? 'running' : 'idle'})`);
+		return { result: `Other open chat tabs:\n${lines.join('\n')}`, isError: false };
+	}
+
+	/**
+	 * Sends one `send_agent_message` call: validates the arguments, enforces the per-run
+	 * cap and the approval gate (same machinery as `callMcp` above — see this tool's own
+	 * doc), then hands off to {@link AgentA2A.sendMessage} for the actual delivery.
+	 */
+	private async sendAgentMessage(call: ToolCall): Promise<{ result: string; isError: boolean }> {
+		// See the matching check in `listAgentSessions` above for why `depth !== 0` is
+		// checked explicitly rather than relied on implicitly via `a2a` being unset.
+		if (!this.a2a || this.depth !== 0) {
+			return { result: 'Agent-to-agent messaging is not available in this run.', isError: true };
+		}
+		const targetSessionId = asString(call.args.targetSessionId).trim();
+		const message = asString(call.args.message).trim();
+		if (!targetSessionId) {
+			return { result: 'send_agent_message requires a non-empty "targetSessionId" — call list_agent_sessions to find one.', isError: true };
+		}
+		if (!message) {
+			return { result: 'send_agent_message requires a non-empty "message".', isError: true };
+		}
+		if (targetSessionId === this.a2a.selfId) {
+			return { result: 'A session cannot send a message to itself.', isError: true };
+		}
+		const target = this.a2a.listSessions().find(s => s.id === targetSessionId);
+		if (!target) {
+			return { result: `No open chat tab with session id "${targetSessionId}". Call list_agent_sessions to see what's open right now.`, isError: true };
+		}
+		if (this.agentMessagesSent >= this.guardrails.maxAgentMessages) {
+			return {
+				result: `You have already sent ${this.agentMessagesSent} agent-to-agent message(s) this run (limit ${this.guardrails.maxAgentMessages}). `
+					+ 'Stop sending further cross-tab messages — continue the task another way.',
+				isError: true,
+			};
+		}
+		// Same hard approval gate every other side-effecting tool goes through
+		// (`runOneTool`'s MCP-call branch, `callMcp` above): a model choosing to inject text
+		// into another running agent is a real side effect, and this must be no easier to
+		// talk around than `run_command`/`fetch_url` — respecting whatever policy the user
+		// has set (default `yolo`, same as everything else; nothing here is a separate rung).
+		if (!autoApproves(this.guardrails)) {
+			const { approved, feedback } = await this.approver.confirm({
+				kind: 'agent_message',
+				signature: `send_agent_message:${targetSessionId}`,
+				title: `Send a message to "${target.title}"?`,
+				detail: `Sends text to another open chat tab's agent (session "${targetSessionId}"), which will read and act on it.`,
+				preview: message,
+				previewLanguage: 'text',
+			});
+			if (!approved) {
+				const reason = feedback?.trim();
+				return {
+					result: reason
+						? `The user denied sending this agent-to-agent message and said: "${reason}".`
+						: 'The user denied sending this agent-to-agent message. Try a different approach rather than repeating it.',
+					isError: true,
+				};
+			}
+		}
+		const expectsReply = asBoolean(call.args.expectsReply);
+		const outcome = await this.a2a.sendMessage(targetSessionId, message, expectsReply);
+		if ('error' in outcome) {
+			return { result: outcome.error, isError: true };
+		}
+		this.agentMessagesSent++;
+		return {
+			result: outcome.delivered === 'live'
+				? `Delivered live to "${target.title}" (session "${targetSessionId}") — it will see this on its next step.`
+				: `"${target.title}" (session "${targetSessionId}") is idle right now, so the message was queued into its conversation for the next time it runs — it has NOT seen it yet.`,
+			isError: false,
+		};
+	}
+
 	/**
 	 * Asks the model for one step, keeping the conversation inside the context budget.
 	 * If the provider still rejects it as too big, the budget is cut and the step is
@@ -1396,6 +1545,25 @@ export class AgentRunner {
 			}
 			if (call.name === SPAWN_SUBAGENT_TOOL.name) {
 				spawnCalls.push(call);
+				continue;
+			}
+			// Handled here rather than falling through to the read-only batch path below:
+			// `list_agent_sessions` IS in READ_ONLY_TOOL_NAMES (for classification — see that
+			// list's doc), but it is never dispatched through `executeTool`, so a batch would
+			// hand it to the generic "no tool called…" fallback instead of actually listing
+			// sessions. Checked before that path, exactly like SPAWN_SUBAGENT_TOOL above.
+			if (call.name === LIST_AGENT_SESSIONS_TOOL.name) {
+				callbacks.onToolStart(call);
+				const outcome = this.listAgentSessions();
+				callbacks.onToolEnd(call, outcome.result, outcome.isError);
+				outcomes.push({ call, ...outcome });
+				continue;
+			}
+			if (call.name === SEND_AGENT_MESSAGE_TOOL.name) {
+				callbacks.onToolStart(call);
+				const outcome = await this.sendAgentMessage(call);
+				callbacks.onToolEnd(call, outcome.result, outcome.isError);
+				outcomes.push({ call, ...outcome });
 				continue;
 			}
 			// A run of adjacent read-only calls has no side effects and no ordering between

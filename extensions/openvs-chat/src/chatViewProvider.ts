@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as vscode from 'vscode';
-import { AgentOptions, AgentRunner, RunResult } from './agent/agentRunner';
+import { AgentA2A, AgentMessageDelivery, AgentOptions, AgentRunner, AgentSessionInfo, RunResult } from './agent/agentRunner';
 import { streamBudgeted } from './agent/budgetedStream';
 import { CACHED_COMPACT_TRIGGER, COMPACT_MARKER, COMPACT_TRIGGER, SUMMARY_MAX_TOKENS, compactMessages, shouldCompact } from './agent/compaction';
 import { contextWindowFor, requestBudgets } from './agent/contextWindow';
@@ -2637,6 +2637,90 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	/**
+	 * Builds the `AgentA2A` capability for one top-level session's own Agent-mode run — the
+	 * `AgentOptions.onKeyFailure`-style inversion `AgentRunner` needs for `list_agent_sessions`/
+	 * `send_agent_message`, since it has no knowledge of sibling sessions itself. Only
+	 * `runAgent` below passes this to its `AgentRunner`; `runReadOnlyAgent` (Ask/Plan) does
+	 * not, and neither does `AgentRunner.runSubagent` forward it to a delegate's options — so
+	 * a `spawn_subagent` child never sees either tool, whatever its nesting depth.
+	 */
+	private buildA2A(sessionId: string): AgentA2A {
+		return {
+			selfId: sessionId,
+			listSessions: () => this.listAgentSessions(sessionId),
+			sendMessage: (targetSessionId, message, expectsReply) =>
+				this.deliverAgentMessage(sessionId, targetSessionId, message, expectsReply),
+		};
+	}
+
+	/**
+	 * The other open top-level chat sessions for `list_agent_sessions` — excludes `sessionId`
+	 * itself. The "New chat" fallback for an untitled session matches the live tab strip's own
+	 * (`media/main.js`'s `renderTabs`, `s.title || 'New chat'`) rather than history's
+	 * "Untitled chat" — this lists LIVE tabs, not archived ones.
+	 */
+	private listAgentSessions(sessionId: string): AgentSessionInfo[] {
+		return this.sessionStore.getSessions()
+			.filter(s => s.id !== sessionId)
+			.map(s => ({ id: s.id, title: s.title || 'New chat', running: s.streaming }));
+	}
+
+	/**
+	 * Delivers one agent-to-agent message from `fromSessionId` to `targetSessionId`.
+	 *
+	 * Two cases, mirroring exactly what `steerQueues`/`steerableRuns` already distinguish for
+	 * user-typed steering (see `dispatchMessage`'s `'steer'` case, ~line 1537): a target with
+	 * a live steerable run gets the message injected the same way — pushed onto
+	 * `steerQueues`, picked up on that run's next loop step. An idle target has no loop to
+	 * inject into.
+	 *
+	 * `SessionState.queue` is deliberately NOT used for the idle case: per `media/main.js`'s
+	 * `send()`, that field only ever fills while a tab is mid-run but not steerable (Ask/Plan)
+	 * and is drained once THAT run ends (main.js:2672-2676) — nothing drains it for a tab
+	 * that is already idle, so pushing there would strand the message with no run ever
+	 * picking it up. Appending it to the transcript as an ordinary turn instead is durable
+	 * (survives a reload), lands in `sendableMessages` the next time that session sends
+	 * (unlike an 'info'/'error' notice — this carries no `kind`), and is pushed to any open
+	 * webview immediately via `postTranscript`, so a person watching that tab sees the
+	 * message arrive rather than only inferring it from the model's next reply. The same
+	 * append+`postTranscript` also runs for the live case, for the same durability/visibility
+	 * reasons — it does not interfere with the live injection, which acts on the run's own
+	 * in-memory `messages` and is independent of what is persisted here.
+	 */
+	private async deliverAgentMessage(
+		fromSessionId: string,
+		targetSessionId: string,
+		message: string,
+		expectsReply: boolean,
+	): Promise<AgentMessageDelivery> {
+		const target = this.sessionStore.getSession(targetSessionId);
+		if (!target) {
+			// Raced with `list_agent_sessions`: the tab closed between the two calls.
+			return { error: `No open chat tab with session id "${targetSessionId}" — it may have just been closed.` };
+		}
+		const senderTitle = this.sessionStore.getSession(fromSessionId)?.title || 'New chat';
+		const replyHint = expectsReply
+			? ` Reply with send_agent_message, using targetSessionId: "${fromSessionId}".`
+			: '';
+		const content = `[Message from agent session "${senderTitle}" (id ${fromSessionId})]:\n${message}${replyHint}`;
+		this.sessionStore.appendMessage(targetSessionId, {
+			role: 'user',
+			content,
+			fromAgentSession: { id: fromSessionId, title: senderTitle },
+		});
+		this.persistSessionState();
+		this.postTranscript(targetSessionId);
+		const liveRunId = this.steerableRuns.get(targetSessionId);
+		if (liveRunId !== undefined) {
+			const queue = this.steerQueues.get(targetSessionId) ?? [];
+			queue.push({ runId: liveRunId, text: content });
+			this.steerQueues.set(targetSessionId, queue);
+			return { delivered: 'live' };
+		}
+		return { delivered: 'queued' };
+	}
+
+	/**
 	 * Runs Ask/Plan with the read-only tool loop: the model can read, list and search
 	 * workspace files to ground its answer or plan, but gets no write/command tools.
 	 */
@@ -2717,6 +2801,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			steering: () => this.drainSteering(sessionId, runId),
 			maxRunMs: this.configuredMaxRunMs(),
 			traceTiming: vscode.workspace.getConfiguration('openvsChat').get<boolean>('agent.traceTiming') ?? false,
+			// Top-level Agent-mode run only — see `buildA2A`'s own doc for why neither
+			// `runReadOnlyAgent` (Ask/Plan) nor a `spawn_subagent` delegate ever gets this.
+			a2a: this.buildA2A(sessionId),
 			...this.keyResilienceOptions(provider, params.model, post),
 		});
 		let stepThinking: ThinkingStreamParser | undefined;

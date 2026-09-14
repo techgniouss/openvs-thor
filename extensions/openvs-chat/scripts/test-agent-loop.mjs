@@ -1795,4 +1795,244 @@ async function runAuto(agentSteps, { maxSteps = 20, history = [{ role: 'user', c
 	);
 }
 
+// 39. list_agent_sessions lists the other open tabs (title + running state), excluding the
+// caller's own session — never available at all without an injected `a2a` capability.
+{
+	const a2a = {
+		selfId: 'me',
+		listSessions: () => [{ id: 'other', title: 'Other Tab', running: true }],
+		sendMessage: async () => { throw new Error('not used by this test'); },
+	};
+	const provider = fakeProvider([
+		{ content: '', toolCalls: [{ id: 'c1', name: 'list_agent_sessions', args: {} }] },
+		{ content: 'done', toolCalls: [] },
+	]);
+	const runner = new AgentRunner(provider, approver, 10, { a2a });
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.strictEqual(result.reason, 'done');
+	const toolTurn = provider.seen[1].find(m => m.startsWith('tool:'));
+	assert.match(toolTurn, /other/, 'the other tab is listed');
+	assert.match(toolTurn, /Other Tab/, 'with its title');
+	assert.doesNotMatch(toolTurn, /"me"/, 'the caller never lists itself');
+}
+
+// 39b. Without an injected `a2a` (e.g. Ask/Plan, or any run the host didn't wire it into),
+// list_agent_sessions is never even offered as a tool.
+{
+	let offered;
+	const provider = {
+		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+		async listModels() { return []; },
+		async runAgentStep(request) { offered = request.tools.map(t => t.name); return { content: 'done', toolCalls: [] }; },
+	};
+	const runner = new AgentRunner(provider, approver, 10);
+	await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.ok(!offered.includes('list_agent_sessions'), 'no a2a capability, no A2A tools');
+	assert.ok(!offered.includes('send_agent_message'));
+}
+
+// 40. send_agent_message refuses a missing/empty targetSessionId with a clean tool error.
+{
+	const a2a = {
+		selfId: 'me',
+		listSessions: () => [{ id: 'other', title: 'Other', running: false }],
+		sendMessage: async () => { throw new Error('must not be called'); },
+	};
+	const provider = fakeProvider([
+		{ content: '', toolCalls: [{ id: 'c1', name: 'send_agent_message', args: { message: 'hi' } }] },
+		{ content: 'done', toolCalls: [] },
+	]);
+	const runner = new AgentRunner(provider, approver, 10, { a2a });
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.strictEqual(result.reason, 'done', 'the run recovers rather than throwing');
+	assert.match(provider.seen[1].find(m => m.startsWith('tool:')), /non-empty "targetSessionId"/);
+}
+
+// 41. send_agent_message refuses a session targeting itself.
+{
+	const a2a = {
+		selfId: 'me',
+		listSessions: () => [{ id: 'other', title: 'Other', running: false }],
+		sendMessage: async () => { throw new Error('must not be called'); },
+	};
+	const provider = fakeProvider([
+		{ content: '', toolCalls: [{ id: 'c1', name: 'send_agent_message', args: { targetSessionId: 'me', message: 'hi' } }] },
+		{ content: 'done', toolCalls: [] },
+	]);
+	const runner = new AgentRunner(provider, approver, 10, { a2a });
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.strictEqual(result.reason, 'done');
+	assert.match(provider.seen[1].find(m => m.startsWith('tool:')), /cannot send a message to itself/i);
+}
+
+// 41b. send_agent_message refuses a target session id that does not exist.
+{
+	const a2a = {
+		selfId: 'me',
+		listSessions: () => [{ id: 'other', title: 'Other', running: false }],
+		sendMessage: async () => { throw new Error('must not be called'); },
+	};
+	const provider = fakeProvider([
+		{ content: '', toolCalls: [{ id: 'c1', name: 'send_agent_message', args: { targetSessionId: 'ghost', message: 'hi' } }] },
+		{ content: 'done', toolCalls: [] },
+	]);
+	const runner = new AgentRunner(provider, approver, 10, { a2a });
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.strictEqual(result.reason, 'done');
+	assert.match(provider.seen[1].find(m => m.startsWith('tool:')), /No open chat tab with session id "ghost"/);
+}
+
+// 42. The per-run cap (Guardrails.maxAgentMessages) refuses further sends once reached, with
+// a message telling the model to stop rather than keep trying — and a2a.sendMessage is
+// never even called for the refused attempt.
+{
+	let sent = 0;
+	const a2a = {
+		selfId: 'me',
+		listSessions: () => [{ id: 'other', title: 'Other', running: false }],
+		sendMessage: async () => { sent++; return { delivered: 'queued' }; },
+	};
+	const provider = fakeProvider([
+		{ content: '', toolCalls: [{ id: 'c1', name: 'send_agent_message', args: { targetSessionId: 'other', message: 'one' } }] },
+		{ content: '', toolCalls: [{ id: 'c2', name: 'send_agent_message', args: { targetSessionId: 'other', message: 'two' } }] },
+		{ content: 'done', toolCalls: [] },
+	]);
+	const runner = new AgentRunner(provider, approver, 10, { a2a, guardrails: { ...guardrails, maxAgentMessages: 1 } });
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.strictEqual(result.reason, 'done');
+	assert.strictEqual(sent, 1, 'only the first message actually reached delivery');
+	assert.match(provider.seen[1].find(m => m.startsWith('tool:')), /queued/, 'the first send succeeded');
+	// `seen[2]` carries BOTH tool results by now (this call's history includes the first
+	// send's too), so the last one — not `.find`'s first — is the one this step answers.
+	assert.match(provider.seen[2].filter(m => m.startsWith('tool:')).at(-1), /limit 1/, 'the second is refused by the cap');
+}
+
+// 43. send_agent_message goes through the SAME approval gate every other side-effecting
+// tool uses (`autoApproves`/`approver.confirm`) — under a strict policy the approver is
+// actually consulted, and a denial comes back as a clean tool-error result rather than
+// throwing or bypassing delivery.
+{
+	const a2a = {
+		selfId: 'me',
+		listSessions: () => [{ id: 'other', title: 'Other', running: false }],
+		sendMessage: async () => { throw new Error('must not be called after a denial'); },
+	};
+	let confirmCalls = 0;
+	const denying = {
+		confirm: async request => { confirmCalls++; assert.strictEqual(request.kind, 'agent_message'); return { approved: false, feedback: 'not now' }; },
+		ask: async () => '',
+	};
+	const provider = fakeProvider([
+		{ content: '', toolCalls: [{ id: 'c1', name: 'send_agent_message', args: { targetSessionId: 'other', message: 'hi' } }] },
+		{ content: 'done', toolCalls: [] },
+	]);
+	const strict = { ...guardrails, approval: 'always' };
+	const runner = new AgentRunner(provider, denying, 10, { a2a, guardrails: strict });
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.strictEqual(result.reason, 'done', 'a denial ends the run cleanly, not with a thrown error');
+	assert.strictEqual(confirmCalls, 1, 'the approval gate was actually consulted');
+	const toolTurn = provider.seen[1].find(m => m.startsWith('tool:'));
+	assert.match(toolTurn, /denied sending this agent-to-agent message/i);
+	assert.match(toolTurn, /not now/, "the user's feedback is fed back to the model");
+}
+
+// 44. Delivery into a live steerable run actually reaches that run's next step — the same
+// `steering` callback real user-typed steering drains. `a2a.sendMessage` here stands in for
+// `ChatViewProvider.deliverAgentMessage`, pushing into a queue a second AgentRunner drains
+// via its own `steering` option, proving the text that reached delivery is what the target
+// sees on its next request.
+{
+	// `a2a.sendMessage` stands in for `ChatViewProvider.deliverAgentMessage`, which is what
+	// actually builds the "[Message from agent session…]:" header and reply-hint text — that
+	// wrapping is exercised where it lives (chatViewProvider.ts), not here. This test's job
+	// is purely the AgentRunner-side contract: the raw message and `expectsReply` reach
+	// `sendMessage` intact, and whatever `sendMessage` pushes for delivery is what a target
+	// run's `steering` drain actually sees on its next step.
+	const bridge = [];
+	let seenExpectsReply;
+	const a2a = {
+		selfId: 'sender',
+		listSessions: () => [{ id: 'target', title: 'Target Tab', running: true }],
+		sendMessage: async (targetSessionId, message, expectsReply) => {
+			assert.strictEqual(targetSessionId, 'target');
+			seenExpectsReply = expectsReply;
+			bridge.push(message);
+			return { delivered: 'live' };
+		},
+	};
+	const senderProvider = fakeProvider([
+		{ content: '', toolCalls: [{ id: 'c1', name: 'send_agent_message', args: { targetSessionId: 'target', message: 'peer review this diff', expectsReply: true } }] },
+		{ content: 'sent', toolCalls: [] },
+	]);
+	const senderRunner = new AgentRunner(senderProvider, approver, 10, { a2a });
+	const senderResult = await senderRunner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.strictEqual(senderResult.reason, 'done');
+	assert.match(senderProvider.seen[1].find(m => m.startsWith('tool:')), /Delivered live/, 'the sender is told it was delivered live, not queued');
+	assert.strictEqual(bridge.length, 1);
+	assert.match(bridge[0], /peer review this diff/, 'the raw message reaches sendMessage intact');
+	assert.strictEqual(seenExpectsReply, true, 'expectsReply is passed through');
+
+	const targetProvider = fakeProvider([{ content: 'reviewed', toolCalls: [] }]);
+	const targetRunner = new AgentRunner(targetProvider, approver, 10, { steering: () => bridge.splice(0) });
+	await targetRunner.run([{ role: 'user', content: 'original task' }], params, noopCallbacks());
+	assert.ok(
+		targetProvider.seen[0].some(m => m.startsWith('user:') && m.includes('peer review this diff')),
+		"the message reaches the target run's next step as a user turn",
+	);
+}
+
+// 45. `spawn_subagent` delegates never get either A2A tool — not offered in their schema at
+// all, whatever the parent's own capability — and the runtime handler refuses them too, as
+// a second, independent guard (`AgentOptions.a2a`'s doc: `runSubagent` never forwards `a2a`
+// to a child's options in the first place).
+{
+	let offeredToChild;
+	const parentA2a = {
+		selfId: 'parent',
+		listSessions: () => [{ id: 'other', title: 'Other', running: false }],
+		sendMessage: async () => { throw new Error('must not be reachable from a sub-agent'); },
+	};
+	const provider = {
+		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+		async listModels() { return []; },
+		async runAgentStep(request) {
+			const isChild = request.messages.some(m => m.content.includes('TRY A2A'));
+			if (isChild) {
+				offeredToChild = request.tools.map(t => t.name);
+				return { content: 'child done', toolCalls: [] };
+			}
+			return request.messages.some(m => m.role === 'tool')
+				? { content: 'parent done', toolCalls: [] }
+				: { content: '', toolCalls: [{ id: 's1', name: 'spawn_subagent', args: { goal: 'TRY A2A', readOnly: false } }] };
+		},
+	};
+	const runner = new AgentRunner(provider, approver, 20, { a2a: parentA2a });
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.strictEqual(result.reason, 'done');
+	assert.ok(offeredToChild, 'the sub-agent ran');
+	assert.ok(!offeredToChild.includes('list_agent_sessions'), 'not offered to a delegate');
+	assert.ok(!offeredToChild.includes('send_agent_message'), 'not offered to a delegate');
+}
+
+// 45b. Even a depth>0 runner constructed WITH an `a2a` capability (never how `runSubagent`
+// actually builds a child today, but the explicit belt-and-suspenders check both tool
+// handlers make) refuses both tools at runtime rather than reaching it.
+{
+	const a2a = {
+		selfId: 'child',
+		listSessions: () => [{ id: 'other', title: 'Other', running: false }],
+		sendMessage: async () => { throw new Error('must not be reachable below depth 0'); },
+	};
+	const provider = fakeProvider([
+		{ content: '', toolCalls: [{ id: 'c1', name: 'list_agent_sessions', args: {} }] },
+		{ content: '', toolCalls: [{ id: 'c2', name: 'send_agent_message', args: { targetSessionId: 'other', message: 'hi' } }] },
+		{ content: 'done', toolCalls: [] },
+	]);
+	const runner = new AgentRunner(provider, approver, 10, { a2a, depth: 1 });
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.strictEqual(result.reason, 'done');
+	assert.match(provider.seen[1].find(m => m.startsWith('tool:')), /not available in this run/);
+	assert.match(provider.seen[2].filter(m => m.startsWith('tool:')).at(-1), /not available in this run/);
+}
+
 console.log('test-agent-loop: all assertions passed');
