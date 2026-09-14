@@ -7,6 +7,7 @@ import * as vscode from 'vscode';
 import { OAuthTokenStore } from '../oauth';
 import { AnthropicProvider } from './anthropic';
 import { AntigravityProvider } from './antigravity';
+import { ClaudeCodeCliProvider } from './claudeCodeCli';
 import { CLOUDFLARE_ACCOUNT_PLACEHOLDER, CloudflareProvider } from './cloudflare';
 import { CooldownTracker } from './cooldown';
 import { CopilotProvider } from './copilot';
@@ -59,8 +60,10 @@ const ENV_VARS: Record<string, string | undefined> = {
  * it's handed and talks to a hardcoded endpoint. Copilot, Grok and Kiro are the same
  * category of OAuth-proxy backend, each pinned to one endpoint (or, for Copilot, an
  * account-reported one) that a user-supplied base URL could not meaningfully redirect.
+ * `claude-code-cli` has no HTTP endpoint at all to redirect — it spawns a local binary — so
+ * it gets its own `claude-code-cli.cliPath` setting instead (see ClaudeCodeCliProvider).
  */
-const NO_BASE_URL_SETTING = new Set(['antigravity', 'copilot', 'grok', 'kiro', 'web_gemini']);
+const NO_BASE_URL_SETTING = new Set(['antigravity', 'copilot', 'grok', 'kiro', 'web_gemini', 'claude-code-cli']);
 
 /** Per-provider runtime configuration resolved from settings + secret storage. */
 export interface ResolvedProviderConfig {
@@ -118,7 +121,7 @@ export class ProviderRegistry {
 
 	constructor(private readonly secrets: vscode.SecretStorage) {
 		this.oauth = new OAuthTokenStore(secrets);
-		for (const provider of [new NvidiaProvider(), new OpenAIProvider(), new AnthropicProvider(), new GeminiProvider(), new AntigravityProvider(), new OpenRouterProvider(), new GroqProvider(), new MistralProvider(), new CloudflareProvider(), new KimiProvider(), new QwenProvider(), new ZaiProvider(), new OpenCodeZenProvider(), new XkiroProvider(), new CopilotProvider(), new GrokProvider(), new KiroProvider(), new GeminiWebProvider(), new CustomProvider()]) {
+		for (const provider of [new NvidiaProvider(), new OpenAIProvider(), new AnthropicProvider(), new GeminiProvider(), new AntigravityProvider(), new OpenRouterProvider(), new GroqProvider(), new MistralProvider(), new CloudflareProvider(), new KimiProvider(), new QwenProvider(), new ZaiProvider(), new OpenCodeZenProvider(), new XkiroProvider(), new CopilotProvider(), new GrokProvider(), new KiroProvider(), new GeminiWebProvider(), new ClaudeCodeCliProvider(), new CustomProvider()]) {
 			this.providers.set(provider.info.id, provider);
 		}
 	}
