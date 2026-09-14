@@ -90,6 +90,14 @@ export interface Guardrails {
 	readonly maxSubagentDepth: number;
 	readonly parallelResearch: boolean;
 	/**
+	 * Maximum `send_agent_message` calls a single top-level run may make. Purely a bound on
+	 * a runaway back-and-forth between two tabs — each side's own cap is enough to stop that,
+	 * so unlike `maxSubagents` this is never shared across a tree of runs (the tool is never
+	 * even offered below depth 0 — see `AgentOptions.a2a`'s doc). Small by default: a real
+	 * "debate this" or "review that" exchange is a handful of messages, not a conversation.
+	 */
+	readonly maxAgentMessages: number;
+	/**
 	 * Whether consecutive read-only tool calls in one step run concurrently. The four read
 	 * tools take no approval and change nothing, so the only thing serializing them bought
 	 * was latency — a model that batched four reads (as the agent doctrine tells it to)
@@ -128,6 +136,7 @@ export function loadGuardrails(): Guardrails {
 		commandTimeoutMs: cfg.get<number>('agent.commandTimeoutMs') ?? 300_000,
 		maxSubagents: cfg.get<number>('agent.maxSubagents') ?? 4,
 		maxSubagentDepth: cfg.get<number>('agent.maxSubagentDepth') ?? 2,
+		maxAgentMessages: cfg.get<number>('agent.maxAgentMessages') ?? 3,
 		parallelResearch: cfg.get<boolean>('agent.parallelResearch') ?? true,
 		parallelReads: cfg.get<boolean>('agent.parallelReads') ?? true,
 		shell: cfg.get<string>('agent.shell')?.trim() ?? '',

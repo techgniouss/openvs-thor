@@ -94,6 +94,7 @@
   "config.agent.commandTimeoutMs": "Maximum time (ms) a shell command run by the agent may take before it is killed. Must comfortably exceed a full build or test run, or verification steps get cut off midway.",
   "config.agent.shell": "Shell used to run the agent's commands (e.g. \"C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe\" or \"/bin/zsh\"). Leave empty to detect one: /bin/sh elsewhere, and on Windows the Git Bash that ships with Git, falling back to PowerShell and then cmd.exe. Models write POSIX shell by default, so Git Bash is preferred where it exists.",
   "config.agent.maxSubagents": "Maximum number of sub-agents a single run may spawn (cost/safety cap).",
+  "config.agent.maxAgentMessages": "Maximum agent-to-agent messages a single top-level run may send to other chat tabs (cost/safety cap).",
   "config.agent.maxSubagentDepth": "How deeply sub-agents may nest (a sub-agent spawning sub-agents). 1 disables nesting.",
   "config.agent.parallelResearch": "Run read-only research sub-agents in parallel. Write-capable sub-agents always run sequentially.",
   "config.agent.parallelReads": "Run a step's adjacent read-only tool calls (read_file, list_dir, glob_files, search_files) concurrently instead of one after another. They take no approval and change nothing, so serializing them only added latency. Turn off on a workspace where concurrent file access is a problem.",

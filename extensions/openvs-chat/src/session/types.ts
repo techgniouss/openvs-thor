@@ -66,6 +66,15 @@ export interface TranscriptEntry {
 	readonly phases?: TranscriptPhase[];
 	readonly toolCalls?: TranscriptToolCall[];
 	readonly toolCallId?: string;
+	/**
+	 * Set on a `role: 'user'` turn delivered by another chat tab's agent via
+	 * `send_agent_message` (see `agentRunner.ts`'s `AgentA2A`), so the webview can render it
+	 * distinctly (`media/main.js`'s `renderAll`, mirroring the `.steering` class pattern).
+	 * Deliberately NOT a `kind` — the whole point of agent-to-agent delivery is that the
+	 * receiving model actually sees the message on its next turn, and a `kind` would exclude
+	 * it from {@link SessionStore.sendableMessages} same as an 'info'/'error' notice.
+	 */
+	readonly fromAgentSession?: { readonly id: string; readonly title: string };
 }
 
 /** A task-checklist item the agent loop tracks for a run, rendered as the session's todo panel. */

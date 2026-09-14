@@ -647,6 +647,11 @@
           "default": 2,
           "description": "%config.agent.maxSubagentDepth%"
         },
+        "openvsChat.agent.maxAgentMessages": {
+          "type": "number",
+          "default": 3,
+          "description": "%config.agent.maxAgentMessages%"
+        },
         "openvsChat.agent.parallelResearch": {
           "type": "boolean",
           "default": true,
