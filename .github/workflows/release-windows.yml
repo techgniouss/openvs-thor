@@ -31,10 +31,6 @@ jobs:
       npm_config_foreground_scripts: 'true'
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # extensions/copilot is neither compiled nor packaged by this build - see
-      # build/npm/dirs.ts. Skipping its ~1.3GB install saves several minutes and
-      # removes the largest batch of unsigned native prebuilds from the runner.
-      VSCODE_SKIP_COPILOT_EXTENSION_INSTALL: '1'
     steps:
       - name: Exclude build workspace from Windows Defender
         # GH-hosted windows-latest runners' real-time AV has been observed quarantining
