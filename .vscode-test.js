@@ -28,29 +28,9 @@ const extensions = [
 		mocha: { timeout: 60_000 }
 	},
 	{
-		label: 'ipynb',
-		workspaceFolder: path.join(os.tmpdir(), `ipynb-${Math.floor(Math.random() * 100000)}`),
-		mocha: { timeout: 60_000 }
-	},
-	{
-		label: 'notebook-renderers',
-		workspaceFolder: path.join(os.tmpdir(), `nbout-${Math.floor(Math.random() * 100000)}`),
-		mocha: { timeout: 60_000 }
-	},
-	{
-		label: 'vscode-colorize-tests',
-		workspaceFolder: `extensions/vscode-colorize-tests/test`,
-		mocha: { timeout: 60_000 }
-	},
-	{
 		label: 'terminal-suggest',
 		workspaceFolder: path.join(os.tmpdir(), `terminal-suggest-${Math.floor(Math.random() * 100000)}`),
 		mocha: { timeout: 60_000 }
-	},
-	{
-		label: 'vscode-colorize-perf-tests',
-		workspaceFolder: `extensions/vscode-colorize-perf-tests/test`,
-		mocha: { timeout: 6000_000 }
 	},
 	{
 		label: 'configuration-editing',
@@ -58,37 +38,9 @@ const extensions = [
 		mocha: { timeout: 60_000 }
 	},
 	{
-		label: 'github-authentication',
-		workspaceFolder: path.join(os.tmpdir(), `msft-auth-${Math.floor(Math.random() * 100000)}`),
-		mocha: { timeout: 60_000 }
-	},
-	{
-		label: 'microsoft-authentication',
-		mocha: { timeout: 60_000 }
-	},
-	{
-		label: 'vscode-api-tests-folder',
-		extensionDevelopmentPath: `extensions/vscode-api-tests`,
-		workspaceFolder: `extensions/vscode-api-tests/testWorkspace`,
-		mocha: { timeout: 60_000 },
-		files: 'extensions/vscode-api-tests/out/singlefolder-tests/**/*.test.js',
-	},
-	{
-		label: 'vscode-api-tests-workspace',
-		extensionDevelopmentPath: `extensions/vscode-api-tests`,
-		workspaceFolder: `extensions/vscode-api-tests/testworkspace.code-workspace`,
-		mocha: { timeout: 60_000 },
-		files: 'extensions/vscode-api-tests/out/workspace-tests/**/*.test.js',
-	},
-	{
 		label: 'git-base',
 		mocha: { timeout: 60_000 }
 	},
-	{
-		label: 'copilot',
-		files: 'extensions/copilot/dist/test-extension.js',
-		mocha: { ui: 'tdd', timeout: 60_000 }
-	}
 ];
 
 
