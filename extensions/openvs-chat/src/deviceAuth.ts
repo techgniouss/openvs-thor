@@ -105,17 +105,28 @@ export async function pollDeviceToken(
 			throw new Error('device code expired before it was approved');
 		}
 		onTick?.();
-		const response = await fetch(config.tokenUrl, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
-			body: new URLSearchParams({
-				client_id: config.clientId,
-				device_code: device.deviceCode,
-				grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-				...(config.extraTokenParams ?? {}),
-			}).toString(),
-			signal,
-		});
+		let response: Response;
+		try {
+			response = await fetch(config.tokenUrl, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+				body: new URLSearchParams({
+					client_id: config.clientId,
+					device_code: device.deviceCode,
+					grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+					...(config.extraTokenParams ?? {}),
+				}).toString(),
+				signal,
+			});
+		} catch {
+			if (signal.aborted) {
+				throw new DOMException('Aborted', 'AbortError');
+			}
+			// A dropped connection mid-poll says nothing about the grant — the user may already
+			// have approved it in the browser. Keep polling until the code itself expires.
+			await sleep(intervalMs, signal);
+			continue;
+		}
 		const json = await response.json().catch(() => ({})) as Record<string, unknown>;
 		if (response.ok && typeof json.access_token === 'string') {
 			return {
@@ -133,8 +144,15 @@ export async function pollDeviceToken(
 		}
 		if (error === 'slow_down') {
 			intervalMs += 5000;
+		} else if (error && error !== 'authorization_pending') {
+			// Any other stated error (invalid_client, unsupported_grant_type, …) is terminal per
+			// RFC 8628 §3.5. Polling on used to leave the user watching "waiting for approval"
+			// for the code's whole lifetime — fifteen minutes — over something no approval fixes.
+			const detail = typeof json.error_description === 'string' ? `: ${json.error_description}` : '';
+			throw new Error(`sign-in failed (${error}${detail})`);
 		}
-		// authorization_pending, slow_down, or an unrecognized transient error: keep polling.
+		// authorization_pending, slow_down, or no stated error at all (a 5xx or a non-JSON
+		// gateway page — transient): keep polling.
 		await sleep(intervalMs, signal);
 	}
 }

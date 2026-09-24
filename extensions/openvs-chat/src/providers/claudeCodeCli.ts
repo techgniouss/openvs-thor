@@ -13,6 +13,15 @@ const DEFAULT_BINARY = 'claude';
 /** Grace period after SIGTERM before an aborted child is force-killed with SIGKILL. */
 const KILL_GRACE_MS = 3000;
 
+/** How much of the CLI's stdout an error message may quote. */
+const STDOUT_TAIL_CHARS = 500;
+
+/** The CLI's wording when its own sign-in has lapsed. */
+const AUTH_FAILURE = /authenticat|oauth|not logged in|log ?in|\/login|credential/i;
+
+/** Model names and aliases the CLI takes (`sonnet`, `claude-opus-4-8`, `opus[1m]`, …); nothing a shell would interpret. */
+const SAFE_MODEL = /^[\w.:@\[\]-]+$/;
+
 /**
  * Provider that shells out to the user's own, already-installed Claude Code CLI (`claude`) in
  * non-interactive single-shot mode ("BYOA" — bring your own agent), so someone who already
@@ -77,15 +86,31 @@ export class ClaudeCodeCliProvider implements ChatProvider {
 		const cliPath = vscode.workspace.getConfiguration('openvsChat').get<string>('claude-code-cli.cliPath')?.trim();
 		const binary = cliPath || DEFAULT_BINARY;
 		const model = request.model.trim();
-		const args = ['-p', buildPrompt(request.messages), '--output-format', 'text'];
+		// The model becomes part of a command line (through a shell on Windows, below), so only
+		// the characters real model names and aliases use are accepted.
+		if (model && !SAFE_MODEL.test(model)) {
+			throw new Error(`Claude Code CLI: "${model}" is not a valid model name.`);
+		}
+		// The prompt goes in on stdin, which `claude -p` reads when no prompt argument is given.
+		// As an argument the whole conversation was one command-line entry, and Windows caps a
+		// command line at ~32k characters: any chat longer than that failed to start at all.
+		const prompt = buildPrompt(request.messages);
+		const args = ['-p', '--output-format', 'text'];
 		if (model) {
 			args.push('--model', model);
 		}
+		// npm installs the CLI on Windows as `claude.cmd`, which Node will not spawn without a
+		// shell. Only the binary is quoted; every argument is a fixed flag or the checked model.
+		const viaShell = process.platform === 'win32' && !/\.(exe|com)$/i.test(binary);
 
 		return new Promise<StreamChatResult>((resolve, reject) => {
 			let child;
 			try {
-				child = spawn(binary, args, { windowsHide: true });
+				// Through a shell the command is one string built here, not arguments handed to
+				// `spawn`: Node deprecates the latter (DEP0190) because it only concatenates them.
+				child = viaShell
+					? spawn([`"${binary}"`, ...args].join(' '), { windowsHide: true, shell: true })
+					: spawn(binary, args, { windowsHide: true });
 			} catch (err) {
 				reject(new Error(installHint(binary, err instanceof Error ? err.message : String(err))));
 				return;
@@ -95,6 +120,9 @@ export class ClaudeCodeCliProvider implements ChatProvider {
 			let settled = false;
 			let killTimer: ReturnType<typeof setTimeout> | undefined;
 			let stderr = '';
+			// The CLI reports some failures on stdout, not stderr — an expired sign-in prints
+			// "Failed to authenticate: …" there and exits 1 — so the error keeps its tail too.
+			let stdoutTail = '';
 
 			const cleanup = (): void => {
 				request.signal.removeEventListener('abort', onAbort);
@@ -114,16 +142,29 @@ export class ClaudeCodeCliProvider implements ChatProvider {
 			// timeout-kill pattern `run_command` uses in `agent/tools.ts`.
 			const onAbort = (): void => {
 				aborted = true;
+				// On Windows the CLI runs under a shell (and node under the CLI): ending the tree is
+				// the only way Stop actually stops it.
+				if (process.platform === 'win32' && child.pid !== undefined) {
+					spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true }).on('error', () => child.kill());
+					return;
+				}
 				child.kill('SIGTERM');
 				killTimer = setTimeout(() => child.kill('SIGKILL'), KILL_GRACE_MS);
 			};
 			request.signal.addEventListener('abort', onAbort, { once: true });
+			// A CLI that exits before reading all of stdin (a bad flag, say) would otherwise raise
+			// EPIPE here; its exit code and stderr already say what went wrong.
+			child.stdin?.on('error', () => { /* reported through 'close' */ });
+			child.stdin?.end(prompt);
 
 			// `setEncoding` (not decoding each Buffer chunk by hand) is what keeps a multi-byte
 			// UTF-8 character split across two chunks from arriving as mojibake — Node's
 			// StringDecoder buffers the partial trailing byte(s) internally until the rest lands.
 			child.stdout?.setEncoding('utf8');
-			child.stdout?.on('data', (chunk: string) => request.onToken(chunk));
+			child.stdout?.on('data', (chunk: string) => {
+				stdoutTail = (stdoutTail + chunk).slice(-STDOUT_TAIL_CHARS);
+				request.onToken(chunk);
+			});
 			child.stderr?.setEncoding('utf8');
 			child.stderr?.on('data', (chunk: string) => { stderr += chunk; });
 
@@ -146,8 +187,11 @@ export class ClaudeCodeCliProvider implements ChatProvider {
 						resolve({ truncated: false });
 						return;
 					}
-					const detail = stderr.trim().slice(0, 500);
-					reject(new Error(`Claude Code CLI exited with code ${code}${detail ? `: ${detail}` : '.'}`));
+					// Measured live: with only stderr read, an expired sign-in surfaced as a bare
+					// "exited with code 1", its actual reason sitting unread on stdout.
+					const detail = (stderr.trim() || stdoutTail.trim()).slice(0, 500);
+					const hint = AUTH_FAILURE.test(detail) ? ' Run `claude` in a terminal and sign in again (`/login`), then retry.' : '';
+					reject(new Error(`Claude Code CLI exited with code ${code}${detail ? `: ${detail.replace(/[.\s]+$/, '')}.` : '.'}${hint}`));
 				});
 			});
 		});

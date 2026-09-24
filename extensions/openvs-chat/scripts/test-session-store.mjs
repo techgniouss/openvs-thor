@@ -19,6 +19,7 @@ import {
 	buildPersistedState,
 	loadState,
 	messagesForState,
+	restoredSessions,
 	saveState,
 } from '../out/session/persistence.js';
 
@@ -239,14 +240,20 @@ function fakeImage(bytes) {
 // conversation the user is actually looking at keeps its screenshot.
 {
 	const budget = { left: MAX_PERSISTED_IMAGE_BYTES };
+	// Every field but the image data survives the marker — `fromEditor` is what keeps an editor
+	// action's selected code off a paired phone, and it used to be dropped here and on archive.
+	const from = { id: 's2', title: 'Other' };
 	const kept = messagesForState([
-		{ role: 'user', content: 'old', images: [fakeImage(1_500_000)] },
+		{ role: 'user', content: 'old', images: [fakeImage(1_500_000)], fromEditor: true, fromAgentSession: from },
 		{ role: 'user', content: 'new', images: [fakeImage(1_500_000)] },
 	], budget);
 	assert.deepStrictEqual(kept, [
-		{ role: 'user', content: 'old\n\n_[1 image not kept after reload]_', kind: undefined },
+		{ role: 'user', content: 'old\n\n_[1 image not kept after reload]_', fromEditor: true, fromAgentSession: from },
 		{ role: 'user', content: 'new', images: [fakeImage(1_500_000)] },
 	]);
+	assert.deepStrictEqual(
+		archiveSession([], { id: 'a', title: 't', messages: [{ role: 'user', content: 'x', images: [fakeImage(4)], fromEditor: true }] }, makeDeps())[0].messages,
+		[{ role: 'user', content: '🖼 (image attachment not kept in history)\nx', fromEditor: true }]);
 
 	const store = new SessionStore(makeDeps());
 	const background = store.getActive(); // id0 — stays inactive
@@ -302,6 +309,39 @@ function fakeImage(bytes) {
 	// No persisted state at all recovers to no sessions — the caller (SessionStore.hydrate)
 	// is responsible for the "always at least one session" invariant, not this pure function.
 	assert.deepStrictEqual(adoptLegacyState({}, deps), { sessions: [], activeSessionId: '', history: [], provider: undefined });
+}
+
+// A restart. The payload was saved on every change but never read back, so the store began
+// empty on each activation: open tabs vanished unarchived, History could not be reopened, and
+// the first tab closed afterwards rewrote the archive as just itself — every earlier
+// conversation gone. Restoring means tabs come back idle, and closing one keeps the archive.
+{
+	const before = new SessionStore(makeDeps());
+	const tab = before.getActive();
+	tab.title = 'live tab';
+	tab.messages.push({ role: 'user', content: 'hello' }, { role: 'assistant', content: 'hi' });
+	tab.queue.push('follow-up');
+	tab.streaming = true; // mid-run when the host went down
+	const oldArchive = [{ id: 'old', title: 'older chat', messages: [{ role: 'user', content: 'x' }], savedAt: 5 }];
+	const memento = new Map();
+	await saveState({ get: (k, d) => memento.get(k) ?? d, update: async (k, v) => { memento.set(k, v); } },
+		buildPersistedState(before.getSessions(), before.getActiveId(), oldArchive));
+	const saved = loadState({ get: (k, d) => memento.get(k) ?? d, update: async () => { } });
+
+	const after = new SessionStore(makeDeps());
+	after.hydrate({ sessions: restoredSessions(saved), activeSessionId: saved.activeSessionId });
+	after.mergeHistory(saved.history);
+	const back = after.getActive();
+	assert.deepStrictEqual(
+		[back.id, back.title, back.messages.length, back.queue, back.streaming, back.pending],
+		[tab.id, 'live tab', 2, ['follow-up'], false, null],
+	);
+	assert.ok(after.restoreSession('old'), 'a History entry can be reopened after the restart');
+	after.createSession();
+	after.closeSession(back.id);
+	assert.deepStrictEqual(after.getHistory().map(h => h.id), [tab.id], 'the closed tab is archived');
+	// Deleting from History removes it from the store — the copy every later save comes from.
+	assert.deepStrictEqual([after.deleteHistory(tab.id), after.deleteHistory(tab.id), after.getHistory()], [true, false, []]);
 }
 
 console.log('test-session-store: all assertions passed');

@@ -188,6 +188,16 @@
         "category": "OpenVS Thor"
       },
       {
+        "command": "openvsChat.remoteInstallCloudflared",
+        "title": "%commands.remoteInstallCloudflared%",
+        "category": "OpenVS Thor"
+      },
+      {
+        "command": "openvsChat.remoteSetTunnel",
+        "title": "%commands.remoteSetTunnel%",
+        "category": "OpenVS Thor"
+      },
+      {
         "command": "openvsChat.completions.toggle",
         "title": "%commands.completionsToggle%",
         "category": "OpenVS Thor"
@@ -376,6 +386,19 @@
           "type": "string",
           "default": "",
           "description": "%config.authUrl%"
+        },
+        "openvsChat.anthropic.thinking": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "off"
+          ],
+          "enumDescriptions": [
+            "%config.anthropic.thinking.auto%",
+            "%config.anthropic.thinking.off%"
+          ],
+          "default": "auto",
+          "description": "%config.anthropic.thinking%"
         },
         "openvsChat.nvidia.model": {
           "type": "string",
@@ -697,6 +720,38 @@
           "default": "",
           "description": "%config.remote.relayUrl%"
         },
+        "openvsChat.remote.relayMode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "local",
+            "hosted"
+          ],
+          "enumDescriptions": [
+            "%config.remote.relayMode.auto%",
+            "%config.remote.relayMode.local%",
+            "%config.remote.relayMode.hosted%"
+          ],
+          "default": "auto",
+          "description": "%config.remote.relayMode%"
+        },
+        "openvsChat.remote.cloudflaredPath": {
+          "type": "string",
+          "default": "",
+          "description": "%config.remote.cloudflaredPath%"
+        },
+        "openvsChat.remote.tunnelHostname": {
+          "type": "string",
+          "default": "",
+          "description": "%config.remote.tunnelHostname%"
+        },
+        "openvsChat.remote.localPort": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "%config.remote.localPort%"
+        },
         "openvsChat.remote.deviceTokenDays": {
           "type": "number",
           "default": 30,
@@ -902,6 +957,21 @@
           "type": "boolean",
           "default": true,
           "description": "%config.persona.environment%"
+        },
+        "openvsChat.persona.compactPrompt": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "always",
+            "never"
+          ],
+          "enumDescriptions": [
+            "%config.persona.compactPrompt.auto%",
+            "%config.persona.compactPrompt.always%",
+            "%config.persona.compactPrompt.never%"
+          ],
+          "default": "auto",
+          "description": "%config.persona.compactPrompt%"
         },
         "openvsChat.systemPrompt": {
           "type": "string",

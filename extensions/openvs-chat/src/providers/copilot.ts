@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { OAuthProxyChatProvider } from './oauthProxy';
+import { OAuthProxyChatProvider, WireSession } from './oauthProxy';
 import { AgentRequest, AgentStep, ChatRequest, ModelEntry, ProviderInfo, StreamChatResult, apiFetch, describeHttpError } from './types';
 
 /**
@@ -51,15 +51,8 @@ export class CopilotProvider extends OAuthProxyChatProvider {
 	static readonly CLIENT_ID = 'Iv1.b507a08c87ecfe98';
 	static readonly SCOPE = 'read:user';
 
-	/** Host the last successful token mint said to use — an individual account is issued
-	 * `api.individual.githubcopilot.com`, not the bare `api.githubcopilot.com` some
-	 * community proxies hardcode. Falls back to the bare host before the first mint.
-	 * Per-instance (not module-global): every credential in a pool is the same product, but
-	 * keeping it on the instance avoids one provider's mint silently deciding another
-	 * hypothetical instance's host. */
-	private lastApiHost = CopilotProvider.DEFAULT_API_HOST;
 
-	protected async mintToken(githubToken: string, signal: AbortSignal): Promise<{ token: string; expiresAt: number }> {
+	protected async mintToken(githubToken: string, signal: AbortSignal): Promise<WireSession> {
 		const response = await apiFetch('https://api.github.com/copilot_internal/v2/token', {
 			method: 'GET',
 			headers: {
@@ -84,10 +77,14 @@ export class CopilotProvider extends OAuthProxyChatProvider {
 		if (!body.token) {
 			throw new Error('GitHub Copilot: token exchange returned no token.');
 		}
-		if (body.endpoints?.api) {
-			this.lastApiHost = body.endpoints.api.replace(/\/+$/, '');
-		}
-		return { token: body.token, expiresAt: (body.expires_at ?? 0) * 1000 };
+		// The host travels with the token it was issued for. It used to be one field on the
+		// provider, so with several Copilot accounts in rotation one account's token was sent
+		// to another's host (individual and business accounts are served from different ones).
+		return {
+			token: body.token,
+			expiresAt: (body.expires_at ?? 0) * 1000,
+			baseUrl: body.endpoints?.api ? body.endpoints.api.replace(/\/+$/, '') : undefined,
+		};
 	}
 
 	/** Every one of these is load-bearing — dropping `copilot-integration-id` or
@@ -113,20 +110,20 @@ export class CopilotProvider extends OAuthProxyChatProvider {
 	// class doc for why this can't instead be done inside the synchronous `authHeaders`.
 
 	override async streamChat(request: ChatRequest): Promise<StreamChatResult> {
-		const token = await this.wireToken(request.apiKey, request.signal);
-		return super.streamChat({ ...request, apiKey: token, baseUrl: this.lastApiHost });
+		return this.withWireSession(request.apiKey, request.signal,
+			session => super.streamChat({ ...request, apiKey: session.token, baseUrl: session.baseUrl ?? CopilotProvider.DEFAULT_API_HOST }));
 	}
 
 	override async runAgentStep(request: AgentRequest): Promise<AgentStep> {
-		const token = await this.wireToken(request.apiKey, request.signal);
-		return super.runAgentStep({ ...request, apiKey: token, baseUrl: this.lastApiHost });
+		return this.withWireSession(request.apiKey, request.signal,
+			session => super.runAgentStep({ ...request, apiKey: session.token, baseUrl: session.baseUrl ?? CopilotProvider.DEFAULT_API_HOST }));
 	}
 
 	override async listModels(apiKey: string, _baseUrl: string, signal: AbortSignal): Promise<ModelEntry[]> {
 		if (!apiKey) {
 			return this.info.suggestedModels.map(id => ({ id }));
 		}
-		const token = await this.wireToken(apiKey, signal);
-		return super.listModels(token, this.lastApiHost, signal);
+		return this.withWireSession(apiKey, signal,
+			session => super.listModels(session.token, session.baseUrl ?? CopilotProvider.DEFAULT_API_HOST, signal));
 	}
 }

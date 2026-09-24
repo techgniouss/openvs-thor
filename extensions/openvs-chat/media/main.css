@@ -1036,8 +1036,14 @@ details.thinking > summary:hover { color: var(--vscode-foreground); }
 }
 .role-controls .role-model {
 	flex: 1 1 auto; min-width: 0;
+	background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground);
+	border: 1px solid var(--vscode-dropdown-border, transparent); border-radius: 4px; padding: 3px 4px;
+}
+.role-controls .role-model:disabled { opacity: 0.7; }
+.role-model-custom {
+	display: block; width: 100%; box-sizing: border-box; margin-top: 6px;
 	background: var(--vscode-input-background); color: var(--vscode-input-foreground);
-	border: 1px solid var(--vscode-input-border, transparent); border-radius: 4px; padding: 3px 6px;
+	border: 1px solid var(--vscode-focusBorder, var(--vscode-input-border, transparent)); border-radius: 4px; padding: 3px 6px;
 }
 .role-problem {
 	margin-top: 6px; font-size: 0.8em;
@@ -1326,3 +1332,21 @@ details.thinking > summary:hover { color: var(--vscode-foreground); }
 .todo-icon { flex: none; }
 .todo-completed { opacity: 0.55; text-decoration: line-through; }
 .todo-in_progress { font-weight: 600; }
+
+/* ---- Remote control: on/off switch and pairing help ---- */
+.remote-toggle {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	margin-left: auto;
+	font-size: 0.85em;
+	cursor: pointer;
+}
+.remote-toggle-input { margin: 0; cursor: pointer; accent-color: var(--vscode-button-background); }
+.remote-pairing-hint {
+	margin: 8px 0;
+	padding: 6px 8px;
+	border-radius: 4px;
+	background: var(--vscode-textBlockQuote-background, rgba(127, 127, 127, 0.1));
+	line-height: 1.45;
+}

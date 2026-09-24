@@ -5,14 +5,16 @@
 
 import { AgentCallbacks, AgentOptions, AgentRunner, RunResult } from '../agent/agentRunner';
 import { streamBudgeted } from '../agent/budgetedStream';
-import { contextBudgetFor, contextWindowFor, requestBudgets } from '../agent/contextWindow';
+import { contextTurn } from '../agent/context';
+import { contextWindowFor, requestBudgets } from '../agent/contextWindow';
 import { Guardrails } from '../agent/guardrails';
 import { ToolApprover, asString, commandTextOf, normalizeToolCall } from '../agent/tools';
 import { McpToolset } from '../mcp/manager';
+import { modeDoctrine } from '../persona/prompts';
 import { TodoItem } from '../persona/todos';
 import { ProviderRegistry } from '../providers/registry';
-import { withProviderResilience } from '../providers/resilience';
-import { ChatMessage, ChatProvider, ModelEntry, ToolCall } from '../providers/types';
+import { isKeyFailure, withProviderResilience } from '../providers/resilience';
+import { ChatMessage, ChatProvider, ModelEntry, ToolCall, isAbortError, isTransientProviderError } from '../providers/types';
 import { AutoRole, CredentialMemo, RoleAssignment, RoleRouter } from './router';
 
 /** Events the orchestrator emits as it moves through the plan → code → review phases. */
@@ -39,6 +41,15 @@ export interface AutoRunParams {
 	readonly history: ChatMessage[];
 	readonly contextText?: string;
 	readonly baseSystemPrompt: string;
+	/**
+	 * The condensed base prompt, sent in place of {@link baseSystemPrompt} to a phase whose
+	 * model's request budget cannot carry it (see `needsCompactPrompt`).
+	 */
+	readonly compactBaseSystemPrompt?: string;
+	/** `openvsChat.persona.thinking`: whether the implementer gets the <thinking> scaffold. */
+	readonly thinking?: boolean;
+	/** `openvsChat.persona.compactPrompt` is `always`: the implementer starts on the compact prompt and condensed schemas. */
+	readonly forceCompactPrompt?: boolean;
 	readonly signal: AbortSignal;
 	/**
 	 * Drains course corrections the user typed while the run was in flight, so the
@@ -109,6 +120,20 @@ export class AutoOrchestrator {
 	/** When this Auto run started, so each phase gets what is left rather than a fresh budget. */
 	private startedAt = Date.now();
 
+	/** Whether this run already said it uses the compact prompt; once covers every phase. */
+	private compactNoted = false;
+
+	/** See {@link AutoRunParams.forceCompactPrompt}; set when the run starts. */
+	private forceCompactPrompt = false;
+
+	/** Relays a phase's switch to the compact prompt, once per run. */
+	private noteCompactPrompt(cb: AutoCallbacks, notice: string): void {
+		if (!this.compactNoted) {
+			this.compactNoted = true;
+			cb.note(notice);
+		}
+	}
+
 	/** The wall-clock allowance to hand the next runner, floored so a late phase still runs. */
 	private remainingRunMs(): number {
 		if (this.maxRunMs <= 0) {
@@ -131,21 +156,36 @@ export class AutoOrchestrator {
 			model: assignment.model,
 			maxOutputTokens: maxTokens,
 			entries: this.catalog?.(assignment.providerId),
-			stated: provider.rateLimit?.(assignment.model)?.limitTokens,
+			stated: provider.rateLimit?.(assignment.model)?.requestCeiling,
 		});
 	}
 
-	/** Context-window and trim budget for a role's model, catalog-aware where possible. */
-	private budgetFor(assignment: RoleAssignment, maxTokens: number): { contextWindow: number; maxContextTokens: number } {
+	/**
+	 * Context window, trim budget and reply cap for the implementer's model, from the same
+	 * {@link requestBudgets} every other path sizes its requests with. Derived from the window
+	 * alone, an 8k-window model was handed an 8k conversation *and* the full reply reservation,
+	 * and an allowance the backend had already stated was ignored until the run re-learned it.
+	 */
+	private budgetFor(provider: ChatProvider, assignment: RoleAssignment, maxTokens: number): Pick<AgentOptions, 'contextWindow' | 'maxContextTokens' | 'maxOutputTokens'> {
 		const entries = this.catalog?.(assignment.providerId);
+		const budgets = requestBudgets({
+			model: assignment.model,
+			maxOutputTokens: maxTokens,
+			entries,
+			stated: provider.rateLimit?.(assignment.model)?.requestCeiling,
+		});
 		return {
 			contextWindow: contextWindowFor(assignment.model, entries),
-			maxContextTokens: contextBudgetFor(assignment.model, maxTokens, 0, entries),
+			maxContextTokens: budgets.contextBudget,
+			// Only when the request had to be split: the option also lowers the run's budget
+			// floor, which is right for a derived ceiling and wrong for a roomy window.
+			maxOutputTokens: budgets.maxTokens < maxTokens ? budgets.maxTokens : undefined,
 		};
 	}
 
 	async run(params: AutoRunParams, cb: AutoCallbacks): Promise<void> {
 		this.startedAt = Date.now();
+		this.forceCompactPrompt = !!params.forceCompactPrompt;
 		// One credential sweep for all three roles rather than one per role.
 		const memo: CredentialMemo = new Map();
 		// The planner and the implementer are both handed the conversation, so if it carries
@@ -172,7 +212,7 @@ export class AutoOrchestrator {
 
 		const maxTokens = this.registry.getMaxTokens();
 		const ctxMessages: ChatMessage[] = params.contextText
-			? [{ role: 'user', content: `Context for the request:\n\n${params.contextText}` }]
+			? [contextTurn(params.contextText)]
 			: [];
 		const lastUser = [...params.history].reverse().find(m => m.role === 'user')?.content ?? '';
 
@@ -181,7 +221,7 @@ export class AutoOrchestrator {
 			{ role: 'system', content: planSystem(params.baseSystemPrompt) },
 			...ctxMessages,
 			...params.history,
-		], maxTokens, params.signal, cb);
+		], maxTokens, params.signal, cb, compactOf(params, planSystem));
 
 		if (params.signal.aborted) {
 			throw new DOMException('Aborted', 'AbortError');
@@ -194,12 +234,12 @@ export class AutoOrchestrator {
 			await this.runCodeDecomposed(codeCandidates, steps, planText, ctxMessages, params, maxTokens, cb, sink);
 		} else {
 			await this.runCode(codeCandidates, [
-				{ role: 'system', content: codeSystem(params.baseSystemPrompt) },
+				{ role: 'system', content: codeSystem(params.baseSystemPrompt, false, params.thinking) },
 				...ctxMessages,
 				...params.history,
 				{ role: 'assistant', content: `Here is the plan to follow:\n\n${planText}` },
 				{ role: 'user', content: 'Implement this plan now using the tools.' },
-			], maxTokens, params.signal, cb, sink, params.steering);
+			], maxTokens, params.signal, cb, sink, params.steering, compactOf(params, (base, compact) => codeSystem(base, compact, params.thinking)));
 		}
 
 		if (!reviewCandidates.length || params.signal.aborted) {
@@ -223,10 +263,20 @@ export class AutoOrchestrator {
 					`Review the changes above against the request and plan. Point out correctness bugs, ` +
 					`missed steps and risks. Be concise and specific. If it is correct and complete, say so.`,
 			},
-		], maxTokens, params.signal, cb);
+		], maxTokens, params.signal, cb, compactOf(params, reviewSystem));
 	}
 
-	/** Streams a text phase (plan/review), falling back to the next inferred candidate on a model error. */
+	/**
+	 * The candidate the implementer falls back to after candidate `i` failed with `err`, or -1.
+	 * Only an inferred role, and only while nothing has happened yet: a second model picking up
+	 * half-applied work it never saw would redo or contradict it.
+	 */
+	private implementerFallback(candidates: readonly RoleAssignment[], i: number, err: unknown, sink: ChangeSink): number {
+		const untouched = sink.narration.length === 0 && sink.changes.length === 0;
+		return candidates[i].source === 'inferred' && untouched ? nextCandidate(candidates, i, err) : -1;
+	}
+
+	/** Streams a text phase (plan/review), falling back to the next inferred candidate when it fails. */
 	private async streamWithFallback(
 		role: AutoRole,
 		candidates: RoleAssignment[],
@@ -234,6 +284,7 @@ export class AutoOrchestrator {
 		maxTokens: number,
 		signal: AbortSignal,
 		cb: AutoCallbacks,
+		compactSystem?: string,
 	): Promise<string> {
 		let lastError: unknown;
 		for (let i = 0; i < candidates.length; i++) {
@@ -244,15 +295,16 @@ export class AutoOrchestrator {
 			}
 			cb.phase(role, a, true);
 			try {
-				return await this.streamOnce(a, messages, maxTokens, signal, cb);
+				return await this.streamOnce(a, messages, maxTokens, signal, cb, compactSystem);
 			} catch (err) {
 				if (signal.aborted) {
 					throw err;
 				}
-				const next = candidates[i + 1];
-				if (a.source === 'inferred' && isModelError(err) && next?.ready) {
-					cb.note(`${a.model} unavailable — trying ${next.model}.`);
+				const next = a.source === 'inferred' ? nextCandidate(candidates, i, err) : -1;
+				if (next >= 0) {
+					cb.note(fallbackNote(a, candidates[next], err));
 					lastError = err;
+					i = next - 1;
 					continue;
 				}
 				throw a.source === 'configured' && isModelError(err) ? describePinnedModelError(a, err) : err;
@@ -267,6 +319,7 @@ export class AutoOrchestrator {
 		maxTokens: number,
 		signal: AbortSignal,
 		cb: AutoCallbacks,
+		compactSystem?: string,
 	): Promise<string> {
 		const provider = this.registry.getProvider(assignment.providerId);
 		if (!provider) {
@@ -277,16 +330,20 @@ export class AutoOrchestrator {
 		// a small per-request allowance the planner was refused before the implementer — which
 		// does learn its ceiling — ever got to run.
 		const budgets = this.textBudgets(provider, assignment, maxTokens);
-		const { text, truncated } = await withProviderResilience(this.registry, assignment.providerId, assignment.model, apiKey => streamBudgeted(provider, {
+		const { text, truncated, compactPrompt } = await withProviderResilience(this.registry, assignment.providerId, assignment.model, apiKey => streamBudgeted(provider, {
 			messages,
 			model: assignment.model,
 			apiKey,
 			baseUrl: this.registry.getBaseUrl(assignment.providerId),
 			...budgets,
+			compactSystem,
 			signal,
 			onToken: delta => cb.token(delta),
 			onNotice: text => cb.note(text),
 		}));
+		if (compactPrompt) {
+			this.noteCompactPrompt(cb, `${assignment.model}'s request budget is too small for the full instructions, so the ${assignment.roleLabel} phase was sent the compact prompt: condensed instructions, project rules shortened, active skills left out.`);
+		}
 		if (truncated) {
 			// A cut-off plan or review feeds the next phase; say so rather than passing a
 			// half-finished document downstream silently.
@@ -304,6 +361,7 @@ export class AutoOrchestrator {
 		cb: AutoCallbacks,
 		sink: ChangeSink,
 		steering?: () => string[],
+		compactSystem?: string,
 	): Promise<void> {
 		let lastError: unknown;
 		for (let i = 0; i < candidates.length; i++) {
@@ -327,11 +385,14 @@ export class AutoOrchestrator {
 				// with no tool call is worth one push-back — the reading that lets a chat
 				// turn end on its first reply must not also let the implementer opt out.
 				expectsWork: true,
-				...this.budgetFor(a, maxTokens),
+				...this.budgetFor(provider, a, maxTokens),
 				keepHead: seed.length,
 				steering,
 				...this.runLimits(),
 				...this.keyResilienceOptions(a.providerId, a.model),
+				compactSystemPrompt: compactSystem,
+				onCompactPrompt: notice => this.noteCompactPrompt(cb, notice),
+				forceCompactPrompt: this.forceCompactPrompt,
 			});
 			try {
 				const outcome = await runner.run(
@@ -345,18 +406,26 @@ export class AutoOrchestrator {
 					},
 					agentCallbacks(cb, sink),
 				);
+				// A provider failure comes back as a result, not a throw — decided here by the
+				// same rule as a thrown one below.
+				const next = outcome.failure ? this.implementerFallback(candidates, i, outcome.failure, sink) : -1;
+				if (next >= 0) {
+					cb.note(fallbackNote(a, candidates[next], outcome.failure));
+					lastError = outcome.failure;
+					i = next - 1;
+					continue;
+				}
 				noteOutcome(cb, sink, outcome);
 				return;
 			} catch (err) {
 				if (signal.aborted) {
 					throw err;
 				}
-				const next = candidates[i + 1];
-				// Only safe to switch models if nothing has happened yet (model error on step 1).
-				const untouched = sink.narration.length === 0 && sink.changes.length === 0;
-				if (a.source === 'inferred' && isModelError(err) && untouched && next?.ready) {
-					cb.note(`${a.model} unavailable — trying ${next.model}.`);
+				const next = this.implementerFallback(candidates, i, err, sink);
+				if (next >= 0) {
+					cb.note(fallbackNote(a, candidates[next], err));
 					lastError = err;
+					i = next - 1;
 					continue;
 				}
 				throw a.source === 'configured' && isModelError(err) ? describePinnedModelError(a, err) : err;
@@ -376,9 +445,10 @@ export class AutoOrchestrator {
 		cb: AutoCallbacks,
 		sink: ChangeSink,
 	): Promise<void> {
-		const a = candidates.find(c => c.ready) ?? candidates[0];
+		let index = candidates.findIndex(c => c.ready);
+		let a = candidates[index] ?? candidates[0];
 		requireReady(a);
-		const provider = this.registry.getProvider(a.providerId);
+		let provider = this.registry.getProvider(a.providerId);
 		if (!provider) {
 			throw new Error(`Implementation provider "${a.providerId}" is unavailable.`);
 		}
@@ -386,7 +456,7 @@ export class AutoOrchestrator {
 		cb.note(`Decomposed the plan into ${steps.length} steps; running a sub-agent per step.`);
 
 		const budget = { spawned: 0 }; // shared cap across every step's sub-agents
-		const runParams = {
+		let runParams = {
 			model: a.model,
 			apiKey: await this.apiKey(a.providerId),
 			baseUrl: this.registry.getBaseUrl(a.providerId),
@@ -399,7 +469,7 @@ export class AutoOrchestrator {
 			}
 			cb.note(`Step ${i + 1}/${steps.length}: ${steps[i]}`);
 			const stepSeed: ChatMessage[] = [
-				{ role: 'system', content: codeSystem(params.baseSystemPrompt) },
+				{ role: 'system', content: codeSystem(params.baseSystemPrompt, false, params.thinking) },
 				...ctxMessages,
 				{ role: 'assistant', content: `Overall plan:\n\n${planText}` },
 				{ role: 'user', content: `Complete ONLY this step of the plan, using the tools:\n\n${steps[i]}` },
@@ -412,14 +482,49 @@ export class AutoOrchestrator {
 				guardrails: this.guardrails,
 				// One step of the same implementer — see runCode.
 				expectsWork: true,
-				...this.budgetFor(a, maxTokens),
+				...this.budgetFor(provider, a, maxTokens),
 				keepHead: stepSeed.length,
 				steering: params.steering,
 				...this.keyResilienceOptions(a.providerId, a.model),
 				...this.runLimits(),
+				compactSystemPrompt: compactOf(params, (base, compact) => codeSystem(base, compact, params.thinking)),
+				onCompactPrompt: notice => this.noteCompactPrompt(cb, notice),
+				forceCompactPrompt: this.forceCompactPrompt,
 			});
-			const outcome = await runner.run(stepSeed, runParams, agentCallbacks(cb, sink));
-			noteOutcome(cb, sink, outcome, `Step ${i + 1}/${steps.length}`);
+			// What this step had done when it failed decides whether another model may redo it.
+			const before = { narration: sink.narration.length, changes: sink.changes.length };
+			let outcome: RunResult | undefined;
+			let failure: unknown;
+			try {
+				outcome = await runner.run(stepSeed, runParams, agentCallbacks(cb, sink));
+				// A provider failure is reported, not thrown; it falls back by the same rule.
+				failure = outcome.failure;
+			} catch (err) {
+				failure = err;
+			}
+			if (failure !== undefined) {
+				const untouched = sink.narration.length === before.narration && sink.changes.length === before.changes;
+				const next = !params.signal.aborted && a.source === 'inferred' && untouched ? nextCandidate(candidates, index, failure) : -1;
+				const nextProvider = next >= 0 ? this.registry.getProvider(candidates[next].providerId) : undefined;
+				if (!nextProvider) {
+					if (!outcome) {
+						throw a.source === 'configured' && isModelError(failure) ? describePinnedModelError(a, failure) : failure;
+					}
+					noteOutcome(cb, sink, outcome, `Step ${i + 1}/${steps.length}`);
+					continue;
+				}
+				// The rest of the steps move to the next candidate too: the one that failed
+				// would most likely fail them the same way.
+				cb.note(fallbackNote(a, candidates[next], failure));
+				index = next;
+				a = candidates[next];
+				provider = nextProvider;
+				runParams = { ...runParams, model: a.model, apiKey: await this.apiKey(a.providerId), baseUrl: this.registry.getBaseUrl(a.providerId) };
+				cb.phase('code', a, false);
+				i--;
+				continue;
+			}
+			noteOutcome(cb, sink, outcome!, `Step ${i + 1}/${steps.length}`);
 		}
 	}
 
@@ -526,6 +631,51 @@ export function isModelError(err: unknown): boolean {
 		|| (msg.includes('model') && msg.includes('invalid'));
 }
 
+/**
+ * How far an inferred role may fall back after `err`: `'model'` when this model is the
+ * problem (not found, not entitled) and a sibling from the same provider may still serve;
+ * `'provider'` when the provider itself failed (quota, a rejected key, an outage, the network)
+ * and its other models would fail alike; undefined when no other model would do better (a
+ * cancellation, a malformed request).
+ *
+ * Only a model-not-found used to fall back at all, so a 429 on the first-ranked provider
+ * ended the whole Auto run while the user held keys for others ranked right behind it.
+ */
+export function fallbackScope(err: unknown): 'model' | 'provider' | undefined {
+	if (isAbortError(err)) {
+		return undefined;
+	}
+	if (isModelError(err)) {
+		return 'model';
+	}
+	const message = err instanceof Error ? err.message : String(err);
+	return isKeyFailure(message) || isTransientProviderError(message) ? 'provider' : undefined;
+}
+
+/**
+ * The index of the candidate to fall back to after candidate `from` failed with `err`, or -1.
+ * A provider-wide failure skips that provider's remaining models.
+ */
+export function nextCandidate(candidates: readonly RoleAssignment[], from: number, err: unknown): number {
+	const scope = fallbackScope(err);
+	if (!scope) {
+		return -1;
+	}
+	const failed = candidates[from];
+	for (let j = from + 1; j < candidates.length; j++) {
+		if (candidates[j].ready && (scope === 'model' || candidates[j].providerId !== failed.providerId)) {
+			return j;
+		}
+	}
+	return -1;
+}
+
+/** The note shown when a phase moves to its next candidate, naming why. */
+export function fallbackNote(failed: RoleAssignment, next: RoleAssignment, err: unknown): string {
+	const why = fallbackScope(err) === 'provider' ? `${failed.providerLabel} failed` : `${failed.model} unavailable`;
+	return `${why} — trying ${next.providerLabel} · ${next.model}.`;
+}
+
 function truncate(text: string, max: number): string {
 	return text.length > max ? text.slice(0, max) + `\n… [truncated, ${text.length} chars total]` : text;
 }
@@ -568,6 +718,11 @@ function recordChangeEnd(sink: ChangeSink, raw: ToolCall, result: string, _isErr
 	}
 }
 
+/** The compact variant of a phase's system prompt, when the host supplied a compact base. */
+function compactOf(params: AutoRunParams, phaseSystem: (base: string, compact: boolean) => string): string | undefined {
+	return params.compactBaseSystemPrompt === undefined ? undefined : phaseSystem(params.compactBaseSystemPrompt, true);
+}
+
 function planSystem(base: string): string {
 	return `${base}\n\nYou are the PLANNER in an automated plan→implement→review pipeline. ` +
 		`Read the user's request and produce a clear, concise, numbered plan: the concrete steps, ` +
@@ -575,11 +730,17 @@ function planSystem(base: string): string {
 		`call tools — output only the plan, as tightly as possible.`;
 }
 
-function codeSystem(base: string): string {
-	return `${base}\n\nYou are the IMPLEMENTER in AGENT mode, with tools to read, list, write and edit files ` +
-		`and run commands in the user's workspace (writes and commands require user approval). A plan has ` +
-		`already been prepared — follow it. Use tools to make the changes. Ask only when truly ambiguous. ` +
-		`When finished, briefly summarize what you changed.`;
+/**
+ * The implementer's prompt: the same Agent-mode doctrine a plain Agent run gets — locate
+ * before editing, never guess a path, verify before finishing — plus its role in the
+ * pipeline. It used to get only the role line, so Auto's implementer ran with less guidance
+ * than a plain Agent run on the same model, and was told writes need approval, which is
+ * false under the default policy.
+ */
+function codeSystem(base: string, compact = false, thinking?: boolean): string {
+	return `${base}\n\n${modeDoctrine('agent', { compact, thinking })}\n\n`
+		+ 'You are the IMPLEMENTER in an automated plan → implement → review pipeline. A plan has already been prepared — follow it, '
+		+ 'using your tools to make and verify the changes. When finished, briefly summarize what you changed.';
 }
 
 function reviewSystem(base: string): string {

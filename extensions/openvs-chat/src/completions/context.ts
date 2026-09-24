@@ -69,21 +69,72 @@ function countCrLf(text: string): number {
  *
  * Sent separately from the prefix because in any file longer than the prefix budget the
  * window has slid past the top, and without the imports the model invents library names
- * instead of using the ones the file actually pulls in. Scanning stops at the first
- * non-blank, non-import line so a file body is never swept up.
+ * instead of using the ones the file actually pulls in. Scanning stops at the first line that
+ * is neither an import nor file preamble, so a file body is never swept up.
+ *
+ * Preamble — block comments (a license header), `#` comments and preprocessor guards, a
+ * shebang, `'use strict'`-style directives, a Python module docstring — is stepped over, and
+ * an import is followed until its brackets close (`import {` … `} from 'x';`, Go's
+ * `import (` … `)`). Stopping at the first non-import line returned nothing for any file
+ * with a header comment and cut every multi-line import at its first name.
  */
 function extractImports(text: string, maxChars: number): string {
 	const kept: string[] = [];
+	let comment: string | undefined; // the terminator of the block comment/docstring we are in
+	let open = 0; // unclosed brackets of the import statement being followed
 	for (const line of text.split('\n')) {
-		if (!line.trim() || line.trimStart().startsWith('//')) {
+		const trimmed = line.trim();
+		if (open > 0) {
+			kept.push(line);
+			open += bracketBalance(line);
 			continue;
 		}
-		if (!IMPORT_LINE.test(line)) {
-			break;
+		if (comment) {
+			if (trimmed.includes(comment)) {
+				comment = undefined;
+			}
+			continue;
 		}
-		kept.push(line);
+		if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('#!') || DIRECTIVE.test(trimmed)) {
+			continue;
+		}
+		if (IMPORT_LINE.test(line)) {
+			kept.push(line);
+			open = Math.max(0, bracketBalance(line));
+			continue;
+		}
+		const opener = BLOCK_OPENERS.find(([start]) => trimmed.startsWith(start));
+		if (opener) {
+			if (!trimmed.slice(opener[0].length).includes(opener[1])) {
+				comment = opener[1];
+			}
+			continue;
+		}
+		if (trimmed.startsWith('#')) {
+			continue; // a `#` comment, or a preprocessor line that is not an #include
+		}
+		break;
 	}
 	return kept.join('\n').slice(0, maxChars);
+}
+
+/** `'use strict';`, `"use client"`, … */
+const DIRECTIVE = /^(['"])use [\w -]+\1;?$/;
+
+/** Block constructs that may precede the imports, each with its terminator. */
+const BLOCK_OPENERS: ReadonlyArray<readonly [string, string]> = [['/*', '*/'], ['"""', '"""'], ["'''", "'''"]];
+
+/** Opening minus closing brackets on a line. */
+function bracketBalance(line: string): number {
+	let balance = 0;
+	for (const ch of line) {
+		if (ch === '{' || ch === '(') {
+			balance++;
+		} else if (ch === '}' || ch === ')') {
+			balance--;
+		}
+	}
+	return balance;
 }
 
 /** Re-applies a document's end-of-line sequence to LF-normalized text before insertion. */

@@ -354,6 +354,43 @@ const sentIds = (bodies, n) => bodies[n].messages.flatMap(
 		],
 		'an in-band stream error is raised with what the provider said, not swallowed into an empty reply',
 	);
+	// The plain chat path (Ask, Plan, Edit, Auto's text phases) too. It used to check for the
+	// error inside the same catch that skips malformed chunks, so it swallowed every one.
+	const plain = [];
+	for (const payload of [{ error: { message: 'Internal server error' } }, { object: 'error', message: 'model is loading' }]) {
+		stubFetch([errorStream(payload)]);
+		let text = '';
+		await new NvidiaProvider().streamChat({ ...request(), onToken: t => { text += t; } }).then(
+			() => plain.push(`resolved with ${JSON.stringify(text)}`),
+			err => plain.push(err.message));
+	}
+	assert.deepStrictEqual(plain, ['NVIDIA (free models): Internal server error', 'NVIDIA (free models): model is loading']);
+}
+
+// 12. Sampling overrides are dropped for models that take only their default. Kimi K2.5+
+// rejects any temperature with HTTP 400 — every request to the Kimi provider's own suggested
+// models failed — and Gemini 3 / gpt-oss / OpenAI reasoning models degrade or refuse off it.
+{
+	const { GeminiProvider } = await import(new URL('../out/providers/gemini.js', import.meta.url));
+	const sampled = async (Provider, model) => {
+		const bodies = stubFetch([() => completion()]);
+		await new Provider().streamChat({ ...request(), model });
+		return [bodies[0].temperature, bodies[0].top_p];
+	};
+	assert.deepStrictEqual(
+		[
+			await sampled(KimiProvider, 'kimi-k2.6'), await sampled(KimiProvider, 'moonshot-v1-8k'),
+			await sampled(NvidiaProvider, 'openai/gpt-oss-20b'), await sampled(NvidiaProvider, 'moonshotai/kimi-k2.6'),
+			await sampled(NvidiaProvider, 'meta/llama-3.3-70b-instruct'),
+			await sampled(GeminiProvider, 'gemini-3.5-flash'), await sampled(GeminiProvider, 'gemini-2.5-flash'),
+		],
+		[
+			[undefined, undefined], [0.3, undefined],
+			[undefined, undefined], [undefined, undefined],
+			[0.2, 0.7],
+			[undefined, undefined], [0.3, undefined],
+		],
+	);
 }
 
 console.log('test-provider-messages.mjs: all assertions passed');

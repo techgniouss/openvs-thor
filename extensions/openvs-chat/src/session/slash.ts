@@ -24,6 +24,7 @@ export const SLASH_COMMANDS: readonly { cmd: string; desc: string }[] = [
 	{ cmd: 'skill', desc: 'Activate a skill — "off" clears all, "new" creates one' },
 	{ cmd: 'mcp', desc: 'MCP server status — "add" registers, "reconnect" retries' },
 	{ cmd: 'history', desc: 'Reopen a previous conversation' },
+	{ cmd: 'undo', desc: 'Restore the files the last run in this tab changed' },
 	{ cmd: 'clear', desc: 'Clear this chat tab (saved to History)' },
 	{ cmd: 'help', desc: 'Show all slash commands' },
 ];
@@ -105,6 +106,8 @@ export interface SlashEffects {
 	mcpReconnect(): void;
 	/** Opens the detached Settings window, scrolled to the MCP section — bare `/mcp`'s effect. */
 	openMcpSettings(): void;
+	/** Restores the files this tab's latest run changed (`/undo`). */
+	undoRun(): void;
 	/** Renders help/skills-list text back to whichever sink asked, via `bus.postTo`. */
 	reply(text: string): void;
 	/** The current skill catalog + active ids, for `/skills`' listing. */
@@ -125,6 +128,7 @@ export const SLASH_HELP_TEXT = [
 	'`/skills` — list skills   ·   `/skill <id>` — activate (stackable; `/skill off` clears all, `/skill new` creates)',
 	'`/mcp` — MCP server status   ·   `/mcp add` — register a server   ·   `/mcp reconnect`',
 	'`/history` — reopen a previous conversation (also the 🕘 button; closed tabs are saved there)',
+	'`/undo` — restore the files the last run in this tab changed',
 	'`/clear` — clear this chat tab (saved to History)   ·   `/help` — show this help',
 	'',
 	'**While a run is streaming**: keep typing! In Agent mode, Enter **steers** the live run; otherwise your message is **queued** and sent when the run finishes. The **+** tab button opens parallel chats.',
@@ -191,6 +195,13 @@ export function runSlash(text: string, effects: SlashEffects, remote = false): S
 	}
 	if (cmd === 'clear') {
 		effects.clearSession();
+		return { handled: true };
+	}
+	if (cmd === 'undo') {
+		// Allowed remotely, unlike the other commands that touch this instance's files: it can
+		// only take back what a run in this tab wrote, skips anything changed since, and sends
+		// created files to the trash — strictly less power than the run that made the changes.
+		effects.undoRun();
 		return { handled: true };
 	}
 	if (cmd === 'ask' || cmd === 'plan' || cmd === 'agent' || cmd === 'edit') {

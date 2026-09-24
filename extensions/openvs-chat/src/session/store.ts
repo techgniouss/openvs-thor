@@ -241,6 +241,17 @@ export class SessionStore {
 		this.history = mergeHistoryList(this.history, incoming);
 	}
 
+	/**
+	 * Removes one archived conversation. Returns whether it existed. The History panel's delete
+	 * used to send its whole list back instead, which this store could only *merge* — a union —
+	 * so the entry survived here and was written back to disk by the next archive save.
+	 */
+	deleteHistory(historyId: string): boolean {
+		const before = this.history.length;
+		this.history = this.history.filter(h => h.id !== historyId);
+		return this.history.length !== before;
+	}
+
 	// ---- Shadow mode (Phase 1b) --------------------------------------------------
 	// The methods below exist for `chatViewProvider.ts`'s shadow-mode wiring: the host builds
 	// its own copy of session state from traffic it already sees, while the webview stays

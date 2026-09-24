@@ -16,6 +16,21 @@ import { ChatMessage, ToolCall, ToolSpec } from '../providers/types';
 /** Marker left in place of content that was dropped, so the model knows it is missing. */
 export const TRIM_MARKER = '[earlier tool output trimmed to fit the context window]';
 
+/** Leads the turn that carries attached files/selection ahead of the conversation. */
+const CONTEXT_PREFIX = 'Context for the request:';
+
+/** Marker left where attached context was cut short to fit. */
+export const CONTEXT_CUT_MARKER = '[the rest of the attached context was cut to fit this model\'s request budget]';
+
+/**
+ * The user turn carrying attached context. Built here, and only here, so {@link trimMessages}
+ * can recognize it: it is protected like the task, yet unlike the task it may be cut down
+ * when nothing else is left to cut.
+ */
+export function contextTurn(content: string): ChatMessage {
+	return { role: 'user', content: `${CONTEXT_PREFIX}\n\n${content}` };
+}
+
 /**
  * How many trailing messages are protected from each pass. Shortening an old file dump
  * is cheap, so only the last couple of turns are off-limits; dropping whole turns loses
@@ -70,6 +85,136 @@ export function estimateToolsTokens(tools: ToolSpec[]): number {
 		total += estimateTokens(JSON.stringify({ name: tool.name, description: tool.description, parameters: tool.parameters }));
 	}
 	return total;
+}
+
+/**
+ * Largest share of a request's conversation budget that its fixed part — the system prompt
+ * plus the tool schemas, both re-sent on every request — may take before the compact prompt
+ * replaces the full one.
+ *
+ * The fixed part is the one thing {@link trimMessages} can never shrink, so past this share
+ * every request is either refused outright or left with too little room for a single file
+ * read to survive trimming. Half is where the conversation still gets the larger share.
+ */
+const MAX_FIXED_PROMPT_SHARE = 0.5;
+
+/**
+ * Whether a request whose system prompt and tool schemas cost the given tokens needs the
+ * compact prompt to leave the conversation room inside `budget`. A budget of 0 means
+ * trimming is disabled, and so is this.
+ */
+export function needsCompactPrompt(systemTokens: number, toolTokens: number, budget: number): boolean {
+	return budget > 0 && systemTokens + toolTokens > budget * MAX_FIXED_PROMPT_SHARE;
+}
+
+/** `messages` with its leading system prompt replaced by `system`; unchanged when it has none. */
+export function withSystemPrompt(messages: ChatMessage[], system: string): ChatMessage[] {
+	if (messages[0]?.role !== 'system' || messages[0].content === system) {
+		return messages;
+	}
+	return [{ ...messages[0], content: system }, ...messages.slice(1)];
+}
+
+/**
+ * The tool schemas the compact prompt sends: every description, at every depth, cut to its
+ * first sentence. Names, types and `required` are untouched, so every call that was valid
+ * stays valid; what goes is the advice, which the compact doctrine restates in brief.
+ * Saves about a third of the built-in set (~2.0k → ~1.3k tokens).
+ */
+export function compactToolSpecs(tools: ToolSpec[]): ToolSpec[] {
+	return tools.map(tool => ({
+		name: tool.name,
+		description: firstSentence(tool.description),
+		parameters: compactSchema(tool.parameters) as Record<string, unknown>,
+	}));
+}
+
+/**
+ * A sentence ends at terminal punctuation followed by a capital, so "e.g. \"src/**\"" and
+ * "path:line: text" survive intact — those examples are exactly what a model needs.
+ */
+function firstSentence(text: string): string {
+	return text.split(/(?<=[.!?])\s+(?=[A-Z])/)[0];
+}
+
+function compactSchema(node: unknown): unknown {
+	if (Array.isArray(node)) {
+		return node.map(compactSchema);
+	}
+	if (!node || typeof node !== 'object') {
+		return node;
+	}
+	const out: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(node)) {
+		out[key] = key === 'description' && typeof value === 'string' ? firstSentence(value) : compactSchema(value);
+	}
+	return out;
+}
+
+/** What {@link unfittableRequest} judges. */
+export interface RequestFloor {
+	readonly model: string;
+	/** The conversation budget for one request, in estimated tokens; 0 disables the check. */
+	readonly budget: number;
+	/** The smallest system prompt this request could be sent with. */
+	readonly instructions: string;
+	/** The user's own newest message (text only). */
+	readonly message: string;
+	/** Whole-file Edit mode's file, which must go in and come back whole. */
+	readonly wholeFile?: string;
+}
+
+/**
+ * Why a request cannot fit its budget however it is trimmed, with what to do about it; or
+ * undefined when it can.
+ *
+ * Trimming shrinks old turns and cuts attached context, but never the instructions (the
+ * compact prompt is their floor) or the user's own message, which is the task. Whole-file
+ * Edit mode must see and hand back the entire file, so cutting it would return the file with
+ * its tail missing. Sending any of these anyway only buys a provider refusal.
+ *
+ * Text only: the estimator counts an image's base64 length, which overstates what providers
+ * bill for it by orders of magnitude — judged that way, any screenshot would be refused.
+ */
+export function unfittableRequest(req: RequestFloor): string | undefined {
+	if (req.budget <= 0) {
+		return undefined;
+	}
+	const k = (tokens: number) => `~${Math.max(1, Math.round(tokens / 1000))}k`;
+	if (req.wholeFile !== undefined) {
+		// Half: the file goes in whole, and the reply carries it back whole, continuing over
+		// as many rounds as the reply limit needs — each of which resends what was written.
+		const file = estimateTokens(req.wholeFile);
+		if (file > req.budget / 2) {
+			return `This file is ${k(file)} tokens — too large for ${req.model} (${k(req.budget)} tokens per request) to rewrite whole. `
+				+ 'Select the part to change and use an inline action, use Agent mode (it edits in place), or pick a model with a larger context window.';
+		}
+	}
+	const message = estimateTokens(req.message);
+	if (estimateTokens(req.instructions) + message > req.budget) {
+		return `Your message is ${k(message)} tokens, and ${req.model} accepts ${k(req.budget)} per request including its instructions. `
+			+ 'Shorten or split the message, or pick a model with a larger context window.';
+	}
+	return undefined;
+}
+
+/**
+ * A tool result cut to `maxChars`, keeping its head and tail and saying what was left out.
+ *
+ * `read_file` and `fetch_url` page themselves to the run's budget; everything else did not.
+ * A 200-match search, a long listing or a verbose build log could each be larger than a small
+ * model's whole budget, so trimming cut it to 200 characters before the model saw it, and the
+ * model ran it again. The head carries what was asked for first; the tail carries a command's
+ * exit status and final errors.
+ */
+export function capToolOutput(text: string, maxChars: number): string {
+	if (maxChars <= 0 || text.length <= maxChars) {
+		return text;
+	}
+	const head = Math.floor(maxChars * 2 / 3);
+	const tail = maxChars - head;
+	const omitted = text.length - head - tail;
+	return `${text.slice(0, head)}\n\n[… ${omitted} characters omitted to fit this model's request budget — narrow the call (a glob, a path, a smaller range) to see them …]\n\n${text.slice(text.length - tail)}`;
 }
 
 /** Estimated token cost of a whole conversation, including per-message overhead. */
@@ -169,6 +314,26 @@ export function trimMessages(messages: ChatMessage[], budget: number): ChatMessa
 			}
 			const before = estimateMessageTokens(trimmed[i]);
 			trimmed[i] = { ...trimmed[i], content: `${trimmed[i].content.slice(0, 200)}\n\n${TRIM_MARKER}` };
+			total += estimateMessageTokens(trimmed[i]) - before;
+		}
+	}
+	// Pass 4: still over, so all that is left is the protected head and tail. Attached context
+	// (files the user or Ask's auto-attach put in front of the conversation) is the one part of
+	// that head which is reference material rather than the task: a request refused outright
+	// helps nobody, while the start of a file still answers most questions about it. Cut from
+	// the end, keeping the beginning. The system prompt and the user's own words stay whole.
+	if (total > budget) {
+		for (let i = 0; i < trimmed.length && total > budget; i++) {
+			const m = trimmed[i];
+			if (m.role !== 'user' || !m.content.startsWith(CONTEXT_PREFIX) || m.content.length < MIN_TRIMMABLE) {
+				continue;
+			}
+			const keep = Math.max(MIN_TRIMMABLE, m.content.length - (total - budget + estimateTokens(CONTEXT_CUT_MARKER) + 4) * 4);
+			if (keep >= m.content.length) {
+				continue;
+			}
+			const before = estimateMessageTokens(m);
+			trimmed[i] = { ...m, content: `${m.content.slice(0, keep)}\n\n${CONTEXT_CUT_MARKER}` };
 			total += estimateMessageTokens(trimmed[i]) - before;
 		}
 	}

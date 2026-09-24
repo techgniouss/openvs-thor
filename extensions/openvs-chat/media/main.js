@@ -35,7 +35,7 @@
 	 * @typedef {{ role: string, label?: string, provider?: string, model?: string, source?: string }} AutoPhase
 	 * @typedef {{ role: 'user'|'assistant', content: string, images?: {mimeType:string,data:string}[], kind?: 'info'|'error'|'auto', phases?: AutoPhase[], fromAgentSession?: {id:string,title:string} }} Msg
 	 * @typedef {{ content: string, status: 'pending'|'in_progress'|'completed' }} Todo
-	 * @typedef {{ id: string, title: string, messages: Msg[], streaming: boolean, pending: string|null, queue: string[], todos?: Todo[], runId?: string, runMode?: string, steerable?: boolean, compactSummary?: string, compactedUpTo?: number, mode?: string }} Session
+	 * @typedef {{ id: string, title: string, messages: Msg[], streaming: boolean, pending: string|null, queue: string[], todos?: Todo[], runId?: string, runMode?: string, steerable?: boolean, compactSummary?: string, compactedUpTo?: number, mode?: string, undo?: { runId: string, files: string[] } }} Session
 	 */
 	/**
 	 * All chat tabs — the RENDERING CACHE, not the source of truth. Session ownership lives
@@ -402,6 +402,7 @@
 			// is marked distinctly here instead, mirroring the `.steering` class below.
 			if (m.fromAgentSession) { body.parentElement?.classList.add('agent-message'); }
 		}
+		renderUndoBar(s);
 		// Re-attach the in-flight assistant bubble when switching back to a streaming tab.
 		if (s.pending !== null) {
 			activeAssistantBody = appendMessageEl('assistant', s.pending);
@@ -414,6 +415,31 @@
 		renderOpenPrompts();
 		scrollToBottom();
 	}
+	/**
+	 * The Undo bar under the tab's latest run that changed files (see the host's `checkpoint`
+	 * message). Kept on the session in memory only, like the host's own record of what to
+	 * restore, so it goes away on reload exactly when the undo itself stops being possible.
+	 */
+	function renderUndoBar(s) {
+		els.messages.querySelector('.undo-bar')?.remove();
+		if (!s.undo || !s.undo.files.length) { return; }
+		const undo = s.undo;
+		const bar = document.createElement('div');
+		bar.className = 'edit-apply undo-bar';
+		const label = document.createElement('span');
+		label.textContent = `This run changed ${undo.files.length} file${undo.files.length === 1 ? '' : 's'}: ${undo.files.join(', ')}`;
+		const button = document.createElement('button');
+		button.textContent = 'Undo';
+		button.title = 'Restore these files to how they were before this run';
+		button.addEventListener('click', () => {
+			button.disabled = true;
+			button.textContent = 'Undoing…';
+			vscode.postMessage({ type: 'undoRun', sessionId: s.id, runId: undo.runId });
+		});
+		bar.append(label, button);
+		els.messages.appendChild(bar);
+	}
+
 	function appendMessageEl(role, content, images) {
 		// The first real message replaces the empty-state hero.
 		els.messages.querySelector('.empty')?.remove();
@@ -640,14 +666,12 @@
 	}
 
 	/**
-	 * Mirrors a deletion to the extension host (workspace state) — the *only* thing this
-	 * still does. Archiving a closed/cleared tab into history is the host's own job now
-	 * (`SessionStore`, driven by `closeSession`/`clearSession` below); this is what's left
-	 * for the History panel's delete button, which removes an entry the host doesn't yet
-	 * have its own message for (see the report on this task for why that gap is left as is).
+	 * Deletes one archived conversation. Sent by id: the host owns the archive, and sending the
+	 * whole list back (the old `saveHistory`) could only be merged into it, so a deleted entry
+	 * came back with the next archive save. The host's `history` push confirms the removal.
 	 */
-	function syncHistory() {
-		vscode.postMessage({ type: 'saveHistory', history });
+	function deleteHistory(id) {
+		vscode.postMessage({ type: 'deleteHistory', historyId: id });
 	}
 
 	/**
@@ -849,6 +873,14 @@
 	 * entry is `{ id, free?, toolCapable? }` (see ModelEntry in src/providers/types.ts).
 	 */
 	const fetchedModels = {};
+	/** Why a provider's last catalog fetch failed, keyed by provider id — cleared by the next success. */
+	const modelErrors = {};
+	/** Providers whose catalog the user explicitly asked to reload (⟳) and is still waiting on. */
+	const refreshingModels = new Set();
+	/** Auto-Routing role rows' model pickers, by role — refilled in place when a catalog lands. */
+	const roleModelFillers = new Map();
+	/** Sentinel value of the "Custom model id…" entry in an Auto-Routing model picker. */
+	const CUSTOM_MODEL = '__custom__';
 
 	/** Model ids to offer for a provider: the live-fetched catalog wins once it exists,
 	 * falling back to the small hardcoded `suggestedModels` list before anything has been
@@ -896,9 +928,12 @@
 			els.modelSelect.appendChild(opt);
 		}
 		els.modelSelect.value = p.model;
-		els.modelSelect.title = live.length
-			? `${live.length} models fetched from the provider · 🔧 = supports Agent mode · "free" = no cost`
-			: 'Models marked 🔧 support Agent mode (tool calling)';
+		els.modelSelect.title = modelErrors[p.id]
+			? `Couldn't load ${p.label}'s models (${modelErrors[p.id]}) — showing suggested models`
+			: live.length
+				? `${live.length} models fetched from the provider · 🔧 = supports Agent mode · "free" = no cost`
+				: 'Suggested models — the live list has not loaded yet · 🔧 = supports Agent mode';
+		els.refreshModels.classList.toggle('busy', refreshingModels.has(p.id));
 	}
 
 	function updateModeAvailability() {
@@ -1049,6 +1084,13 @@
 				});
 			} else {
 				card.querySelector('.save-key')?.addEventListener('click', () => {
+					// The box is always blank after a refresh (keys never leave SecretStorage), and
+					// the host treats an empty key as "clear" — so Save on an empty box silently
+					// deleted a working key. "Clear key" is the explicit way to do that.
+					if (!keyInput.value.trim()) {
+						showNotice(`Paste a key for ${p.label} first — use "Clear key" to remove the saved one.`, true);
+						return;
+					}
 					vscode.postMessage({ type: 'saveKey', provider: p.id, key: keyInput.value });
 					keyInput.value = '';
 				});
@@ -1067,6 +1109,8 @@
 				card.querySelector('.save-extra-keys')?.addEventListener('click', () => {
 					const keys = extraKeysInput.value.split('\n').map(k => k.trim()).filter(Boolean);
 					vscode.postMessage({ type: 'saveExtraKeys', provider: p.id, keys });
+					// Like the primary key box: saved keys are not left sitting on screen.
+					extraKeysInput.value = '';
 				});
 			}
 			card.querySelector('.get-key')?.addEventListener('click', (e) => {
@@ -1156,6 +1200,7 @@
 
 	function renderAutoRouting() {
 		els.autoRoutingList.innerHTML = '';
+		roleModelFillers.clear();
 		for (const r of autoConfig.roles || []) {
 			const pinned = r.source === 'configured';
 			const row = document.createElement('div');
@@ -1164,7 +1209,6 @@
 				.concat(providers.map(p =>
 					`<option value="${escapeHtml(p.id)}"${pinned && p.id === r.providerId ? ' selected' : ''}>${escapeHtml(p.label)}</option>`))
 				.join('');
-			const listId = `auto-models-${r.role}`;
 			const sourceText = pinned
 				? 'pinned'
 				: `auto → ${escapeHtml(shortModel(r.model) || '—')}${r.ready ? '' : ' ⚠'}`;
@@ -1173,63 +1217,109 @@
 					<span class="role-source">${sourceText}</span></div>
 				<div class="role-controls">
 					<select class="role-provider">${provOpts}</select>
-					<input class="role-model" type="text" list="${listId}"
-						placeholder="${pinned ? 'model id' : 'model id (optional)'}"
-						value="${pinned ? escapeHtml(r.model) : ''}" />
-					<datalist id="${listId}"></datalist>
+					<select class="role-model"></select>
 				</div>
+				<input class="role-model-custom hidden" type="text" placeholder="Exact model id, e.g. vendor/model-name" />
 				${r.problem ? `<div class="role-problem">⚠ ${escapeHtml(r.problem)}</div>` : ''}`;
 			const provSel = /** @type {HTMLSelectElement} */ (row.querySelector('.role-provider'));
-			const modelInput = /** @type {HTMLInputElement} */ (row.querySelector('.role-model'));
-			const datalistEl = /** @type {HTMLElement} */ (row.querySelector('datalist'));
-			const fillDatalist = (providerId) => {
-				datalistEl.innerHTML = '';
-				for (const m of providerModelIds(providerId)) {
-					const o = document.createElement('option'); o.value = m; datalistEl.appendChild(o);
+			const modelSel = /** @type {HTMLSelectElement} */ (row.querySelector('.role-model'));
+			const customInput = /** @type {HTMLInputElement} */ (row.querySelector('.role-model-custom'));
+			/** The model this row is pinned to right now — survives catalog refreshes and provider re-renders. */
+			let pinnedModel = pinned ? r.model : '';
+			const save = () => {
+				vscode.postMessage(provSel.value && pinnedModel
+					? { type: 'setRole', role: r.role, provider: provSel.value, model: pinnedModel }
+					: { type: 'setRole', role: r.role, provider: '', model: '' });
+			};
+			// A <select> of what the provider actually offers, not a free-text box over a
+			// <datalist>: Chromium filters a datalist's suggestions by the text already in the
+			// box, so a pinned role only ever offered the one or two ids that happened to contain
+			// its current value — the list looked random and never showed the real catalog.
+			const fill = () => {
+				const providerId = provSel.value;
+				modelSel.innerHTML = '';
+				if (!providerId) {
+					const o = document.createElement('option');
+					o.value = '';
+					o.textContent = r.model ? `Auto → ${shortModel(r.model)}` : 'Chosen automatically';
+					modelSel.appendChild(o);
+					modelSel.disabled = true;
+					customInput.classList.add('hidden');
+					return;
 				}
+				modelSel.disabled = false;
+				const p = providers.find(x => x.id === providerId);
+				const live = fetchedModels[providerId] || [];
+				const ids = providerModelIds(providerId);
+				const add = (id, label) => {
+					const o = document.createElement('option');
+					o.value = id;
+					o.textContent = label;
+					modelSel.appendChild(o);
+				};
+				if (!ids.length) {
+					add('', modelErrors[providerId] ? 'Couldn’t load models'
+						: (p && p.requiresApiKey && !p.hasApiKey) ? 'Add a key to list models' : 'Loading models…');
+				}
+				const known = new Set(ids);
+				if (pinnedModel && !known.has(pinnedModel)) {
+					add(pinnedModel, `${pinnedModel}  · not in catalog`);
+				}
+				for (const id of ids) {
+					const entry = live.find(e => e.id === id);
+					add(id, id + (modelSupportsTools(p, id) ? '  🔧' : '') + (entry && entry.free ? '  · free' : ''));
+				}
+				add(CUSTOM_MODEL, 'Custom model id…');
+				modelSel.value = pinnedModel || '';
+				if (modelSel.value !== pinnedModel) { modelSel.selectedIndex = -1; }
+				modelSel.title = modelErrors[providerId]
+					? `Couldn't load models: ${modelErrors[providerId]} — showing suggested models`
+					: (live.length ? `${live.length} models from ${p ? p.label : providerId}` : 'Suggested models — the live catalog has not loaded yet');
 			};
 			const ensureLiveModels = (providerId) => {
 				if (!providerId || fetchedModels[providerId]) { return; }
-				// Skip providers with no credentials: listModels would just reject and, since
-				// nothing gets cached on failure, re-fires on every settings re-render (every
-				// setRole/setKey/postConfig round trip) — spamming the same error toast.
+				// Skip providers with no credentials: listModels would just fail — it's
+				// re-requested once a key is saved, since saving one re-posts the config.
 				const p = providers.find(x => x.id === providerId);
 				if (p && p.requiresApiKey && !p.hasApiKey) { return; }
 				vscode.postMessage({ type: 'listModels', provider: providerId });
 			};
-			fillDatalist(provSel.value);
+			roleModelFillers.set(r.role, { providerOf: () => provSel.value, fill });
+			fill();
 			ensureLiveModels(provSel.value);
 			provSel.addEventListener('change', () => {
-				fillDatalist(provSel.value);
 				ensureLiveModels(provSel.value);
-				if (!provSel.value) {
-					modelInput.value = '';
-					vscode.postMessage({ type: 'setRole', role: r.role, provider: '', model: '' });
+				customInput.classList.add('hidden');
+				// A model the previous provider offered cannot follow the switch: pinning
+				// `anthropic:meta/llama-3.3-70b-instruct` 404s on the first request of every
+				// Auto run and, being pinned, is never substituted. Keep it only if the new
+				// provider offers it too, else take that provider's first model.
+				const offered = providerModelIds(provSel.value);
+				if (!provSel.value || !offered.includes(pinnedModel)) {
+					pinnedModel = provSel.value ? (offered[0] || '') : '';
+				}
+				fill();
+				save();
+			});
+			modelSel.addEventListener('change', () => {
+				if (modelSel.value === CUSTOM_MODEL) {
+					customInput.classList.remove('hidden');
+					customInput.value = pinnedModel;
+					customInput.focus();
+					fill();
 					return;
 				}
-				// The model box carries whatever the *previous* provider left in it. Keeping it
-				// pinned the role to a pair that cannot exist — pick NVIDIA (which fills in
-				// `meta/llama-3.3-70b-instruct`), then switch to Anthropic, and the role was
-				// saved as `anthropic:meta/llama-3.3-70b-instruct`, which 404s on the first
-				// request of every Auto run and, being *pinned*, is never substituted. Only a
-				// model this provider actually offers survives the switch.
-				const offered = providerModelIds(provSel.value);
-				if (!modelInput.value.trim() || !offered.includes(modelInput.value.trim())) {
-					modelInput.value = offered[0] || '';
-				}
-				// A provider with nothing to offer leaves the pin incomplete; clearing it back to
-				// auto-select is the honest state, since leaving the *old* pair persisted would
-				// keep routing this role to the provider the user just switched away from.
-				vscode.postMessage(modelInput.value.trim()
-					? { type: 'setRole', role: r.role, provider: provSel.value, model: modelInput.value.trim() }
-					: { type: 'setRole', role: r.role, provider: '', model: '' });
+				customInput.classList.add('hidden');
+				pinnedModel = modelSel.value;
+				save();
 			});
-			modelInput.addEventListener('change', () => {
-				if (provSel.value && modelInput.value.trim()) {
-					vscode.postMessage({ type: 'setRole', role: r.role, provider: provSel.value, model: modelInput.value.trim() });
-				} else if (!provSel.value) {
-					vscode.postMessage({ type: 'setRole', role: r.role, provider: '', model: '' });
-				}
+			customInput.addEventListener('change', () => {
+				const value = customInput.value.trim();
+				if (!value) { return; }
+				pinnedModel = value;
+				customInput.classList.add('hidden');
+				fill();
+				save();
 			});
 			els.autoRoutingList.appendChild(row);
 		}
@@ -1269,7 +1359,7 @@
 			row.querySelector('.history-delete')?.addEventListener('click', (e) => {
 				e.stopPropagation();
 				history = history.filter(x => x.id !== h.id);
-				syncHistory();
+				deleteHistory(h.id);
 				renderHistoryPanel();
 			});
 			els.historyList.appendChild(row);
@@ -1375,6 +1465,17 @@
 	}
 
 	/** Renders the active session's queued messages as removable chips above the input. */
+	/**
+	 * Mirrors a session's queue to the host, which owns it and hands it to every client in each
+	 * `sessions` push. Nothing did after session state moved to the host — `saveState` keeps UI
+	 * preferences only — so the next `sessions` push (opening or switching a tab mid-run)
+	 * replaced this panel's queue with the host's empty one, and a follow-up typed during a run
+	 * silently never sent. `pwa/app.js`'s `persistQueue` is the same call.
+	 */
+	function persistQueue(s) {
+		vscode.postMessage({ type: 'setQueue', sessionId: s.id, queue: s.queue.slice() });
+	}
+
 	function renderQueueChips() {
 		if (!els.queueChips) { return; }
 		const s = cur();
@@ -1393,7 +1494,7 @@
 				e.preventDefault();
 				s.queue.splice(index, 1);
 				renderQueueChips();
-				saveState();
+				persistQueue(s);
 			});
 			els.queueChips.appendChild(chip);
 		});
@@ -1444,7 +1545,7 @@
 		if (s.streaming) {
 			s.queue.push(text);
 			if (s.id === activeSessionId) { renderQueueChips(); }
-			saveState();
+			persistQueue(s);
 			return;
 		}
 		saveState();
@@ -1872,6 +1973,8 @@
 		// `text`/`images` are the new turn itself — the host appends it to the session store
 		// before reading history back out, since `send` no longer carries the whole
 		// conversation. Must match what was just pushed into `s.messages` above.
+		// `fromQueue` marks a queue drain: a paired phone drains the same queue on the same
+		// `done`, and the host accepts only the first drain per finished run (see handleSend).
 		vscode.postMessage({
 			type: 'send',
 			sessionId: s.id,
@@ -1881,6 +1984,8 @@
 			model: els.modelSelect.value,
 			context: (isActiveSend && currentContext) || undefined,
 			inline: !!(opts && opts.inline),
+			fromEditor: !!(opts && opts.fromEditor),
+			fromQueue: !!(opts && opts.fromQueue),
 			text: text,
 			images: images,
 		});
@@ -1901,7 +2006,7 @@
 			} else {
 				s.queue.push(text);
 				renderQueueChips();
-				saveState();
+				persistQueue(s);
 			}
 			els.input.value = ''; autoSize();
 			return;
@@ -2139,7 +2244,12 @@
 		vscode.postMessage({ type: 'setModel', provider: selectedProvider, model: els.modelSelect.value });
 	});
 	els.refreshModels.addEventListener('click', () => {
-		vscode.postMessage({ type: 'listModels', provider: selectedProvider });
+		if (isAuto() || refreshingModels.has(selectedProvider)) { return; }
+		refreshingModels.add(selectedProvider);
+		els.refreshModels.classList.add('busy');
+		// `refresh` skips the host's cached catalog — without it ⟳ re-posted the very list
+		// it was pressed to replace.
+		vscode.postMessage({ type: 'listModels', provider: selectedProvider, refresh: true });
 	});
 	els.settingsButton.addEventListener('click', () => {
 		// From the sidebar chat, ⚙ opens Settings in its own editor tab (a proper, roomy
@@ -2176,6 +2286,12 @@
 			const file = item.getAsFile();
 			if (!file) { continue; }
 			resizeImage(file).then(resized => {
+				// Re-checked here: the slots above were counted before any resize finished, so two
+				// quick pastes could both claim them.
+				if (pendingImages.length >= MAX_IMAGES_PER_MESSAGE) {
+					showNotice(`You can attach at most ${MAX_IMAGES_PER_MESSAGE} images per message.`, true);
+					return;
+				}
 				pendingImages.push(resized);
 				renderImageChips();
 			}).catch(err => {
@@ -2189,6 +2305,10 @@
 	els.input.addEventListener('input', () => { autoSize(); updateSlashMenu(); });
 	els.input.addEventListener('blur', hideSlashMenu);
 	els.input.addEventListener('keydown', (e) => {
+		// An input method (Chinese, Japanese, Korean…) confirms its candidate with Enter; that
+		// keystroke belongs to the IME, and treating it as "send" sent a half-typed message.
+		// keyCode 229 is how some Chromium builds report the same keystroke instead.
+		if (e.isComposing || e.keyCode === 229) { return; }
 		if (slashMenuOpen()) {
 			if (e.key === 'ArrowDown') { e.preventDefault(); moveSlashSelection(1); return; }
 			if (e.key === 'ArrowUp') { e.preventDefault(); moveSlashSelection(-1); return; }
@@ -2352,7 +2472,7 @@
 		// plan): the detached Settings tab shares no live conversation, so a `sessions`/
 		// `transcript` push (or a run announcing itself via `runStart`) has nothing to attach
 		// to there.
-		'sessions', 'transcript', 'runStart', 'commands',
+		'sessions', 'transcript', 'runStart', 'userTurn', 'commands',
 	];
 
 	window.addEventListener('message', (event) => {
@@ -2406,25 +2526,26 @@
 				break;
 			case 'models':
 				fetchedModels[msg.provider] = normalizeModelEntries(msg.models);
+				if (typeof msg.error === 'string' && msg.error) {
+					modelErrors[msg.provider] = msg.error;
+					// Only an explicit ⟳ earns a notice; the background refresh after every
+					// settings change would otherwise repeat the same failure on each one.
+					if (refreshingModels.has(msg.provider)) { showNotice(msg.error, true); }
+				} else {
+					delete modelErrors[msg.provider];
+				}
+				if (refreshingModels.delete(msg.provider) && msg.provider === selectedProvider) {
+					els.refreshModels.classList.remove('busy');
+				}
 				if (msg.provider === selectedProvider) {
 					renderModelSelect(); updateModeAvailability();
 					// The live catalog may reveal the current model can't do tools.
 					if (curMode() === 'agent' && !isAuto()) { ensureAgentModel(); }
 				}
-				// Refresh any already-rendered Auto-Routing role datalist for this provider in
-				// place — not a full renderAutoRouting(), which would blow away an in-progress
-				// edit in the model text box.
-				if (els.autoRoutingList) {
-					for (const row of els.autoRoutingList.querySelectorAll('.role-row')) {
-						const provSel = /** @type {HTMLSelectElement | null} */ (row.querySelector('.role-provider'));
-						const datalistEl = row.querySelector('datalist');
-						if (provSel && datalistEl && provSel.value === msg.provider) {
-							datalistEl.innerHTML = '';
-							for (const m of providerModelIds(msg.provider)) {
-								const o = document.createElement('option'); o.value = m; datalistEl.appendChild(o);
-							}
-						}
-					}
+				// Refill any Auto-Routing role picker showing this provider in place — not a
+				// full renderAutoRouting(), which would drop an in-progress custom id.
+				for (const filler of roleModelFillers.values()) {
+					if (filler.providerOf() === msg.provider) { filler.fill(); }
 				}
 				break;
 			case 'token': {
@@ -2597,7 +2718,7 @@
 				bar.innerHTML = `<span>Proposed changes to <code>${escapeHtml(msg.path || 'file')}</code></span> <button id="applyEditBtn">Apply</button>`;
 				els.messages.appendChild(bar);
 				bar.querySelector('#applyEditBtn')?.addEventListener('click', () => {
-					vscode.postMessage({ type: 'applyEdit', content: msg.content });
+					vscode.postMessage({ type: 'applyEdit', proposalId: msg.proposalId });
 					bar.querySelector('button')?.setAttribute('disabled', 'true');
 				});
 				scrollToBottom();
@@ -2636,6 +2757,19 @@
 			case 'mcp':
 				renderMcpList(msg.status, msg.toolCount || 0);
 				break;
+			case 'checkpoint': {
+				const s = sessionFor(msg);
+				if (!s) { break; }
+				const files = Array.isArray(msg.files) ? msg.files.map(String) : [];
+				const runId = String(msg.checkpointRunId || '');
+				if (files.length) {
+					s.undo = { runId, files };
+				} else if (s.undo && s.undo.runId === runId) {
+					s.undo = undefined;
+				}
+				if (s.id === activeSessionId) { renderUndoBar(s); }
+				break;
+			}
 			case 'todos': {
 				const s = sessionFor(msg);
 				if (!s) { break; }
@@ -2676,9 +2810,9 @@
 				// A queued follow-up starts as soon as the tab is idle again.
 				if (s.queue.length) {
 					const next = s.queue.shift();
-					saveState();
+					persistQueue(s);
 					if (s.id === activeSessionId) { renderQueueChips(); }
-					sendText(next, s.runMode && s.runMode !== 'edit' ? { mode: s.runMode } : undefined, s);
+					sendText(next, s.runMode && s.runMode !== 'edit' ? { mode: s.runMode, fromQueue: true } : { fromQueue: true }, s);
 				}
 				break;
 			}
@@ -2686,7 +2820,9 @@
 				// Triggered by an editor command / code action. Runs in the requested mode
 				// ('edit' for Fix/Doc/Optimize/Edit, 'ask' for Explain) without touching the
 				// user's selected chat mode — 'edit' is no longer a selectable option.
-				sendText(msg.prompt, { inline: !!msg.inline, mode: msg.mode });
+				// `fromEditor`: the prompt embeds the desktop's selected code, which the host
+				// keeps off paired phones (see remoteSink.ts's redactForRemote).
+				sendText(msg.prompt, { inline: !!msg.inline, mode: msg.mode, fromEditor: true });
 				break;
 			case 'newChat':
 				// The + button opens a fresh tab; existing chats keep running in parallel.
@@ -2723,6 +2859,31 @@
 				if (!s) { break; }
 				s.runId = msg.runId;
 				s.runMode = msg.mode;
+				// A run this panel didn't start (a paired phone sent it) arrives with nothing set
+				// up locally: without this the tab never showed as running, Stop stayed hidden,
+				// and every agent step's commitPending took `!s.streaming` as the run being over
+				// and tore the working strip down mid-run. A local send already did all of it.
+				if (!s.streaming) {
+					s.streaming = true;
+					s.steerable = true;
+					if (s.id === activeSessionId) { startWorking(); }
+					renderTabs();
+					if (s.id === activeSessionId) { updateComposer(); }
+				}
+				break;
+			}
+			case 'userTurn': {
+				// A turn typed on another client — this panel's own sends are echoed by
+				// sendText and never come back (the host skips the sink that sent them).
+				const s = sessions.find(x => x.id === msg.sessionId);
+				if (!s) { break; }
+				const content = typeof msg.content === 'string' ? msg.content : '';
+				const images = Array.isArray(msg.images) && msg.images.length ? msg.images : undefined;
+				s.messages.push({ role: 'user', content, images });
+				if (s.id === activeSessionId) {
+					appendMessageEl('user', content, images);
+					scrollToBottom();
+				}
 				break;
 			}
 			case 'commands':

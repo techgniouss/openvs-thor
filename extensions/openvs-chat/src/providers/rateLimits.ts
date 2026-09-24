@@ -15,8 +15,17 @@
 
 /** A backend's stated token allowance, as of the response it was read from. */
 export interface RateLimitSnapshot {
-	/** Tokens one request may carry, when the backend states a ceiling. */
+	/** The window's token allowance — a quota gauge, together with {@link remainingTokens}. */
 	readonly limitTokens?: number;
+	/**
+	 * Tokens one whole request (prompt and reserved reply) may carry, or undefined when the
+	 * stated limit does not bound that. Only the `x-ratelimit-*` family does: those backends
+	 * charge the whole request against the window and refuse one larger than it. Anthropic's
+	 * input limit counts only *uncached* input and output is limited separately, so treating it
+	 * as a ceiling cut a tier-1 key (30k/min) to ~30k per request on a 200k-window model — and
+	 * compacted away the very cache that makes a large request cheap there.
+	 */
+	readonly requestCeiling?: number;
 	/** Tokens left in the current window. */
 	readonly remainingTokens?: number;
 	/** How long until the token window refills, in ms from when the header was read. */
@@ -86,7 +95,8 @@ export function parseRateLimitHeaders(headers: Headers, now = Date.now()): RateL
 	if (limitTokens === undefined && remainingTokens === undefined) {
 		return undefined;
 	}
-	return { limitTokens, remainingTokens, resetMs, at: now };
+	const wholeRequest = tokens(header(headers, [HEADERS.limit[0]])) !== undefined;
+	return { limitTokens, remainingTokens, resetMs, at: now, ...(wholeRequest ? { requestCeiling: limitTokens } : {}) };
 }
 
 /**
@@ -230,11 +240,17 @@ export class RateLimitTracker {
 		if (!snapshot || snapshot.remainingTokens === undefined || snapshot.resetMs === undefined) {
 			return 0;
 		}
+		// A stated limit that is not a request ceiling (Anthropic's uncached-input bucket) is not
+		// comparable with an estimate of the whole request: waiting on it only slowed every step
+		// whose prompt was mostly cache (see {@link RateLimitSnapshot.requestCeiling}).
+		if (snapshot.limitTokens !== undefined && snapshot.requestCeiling === undefined) {
+			return 0;
+		}
 		const age = now - snapshot.at;
 		if (age >= SNAPSHOT_TTL_MS || estimatedTokens <= snapshot.remainingTokens) {
 			return 0;
 		}
-		if (snapshot.limitTokens !== undefined && estimatedTokens > snapshot.limitTokens) {
+		if (snapshot.requestCeiling !== undefined && estimatedTokens > snapshot.requestCeiling) {
 			return 0;
 		}
 		return Math.min(MAX_PACE_MS, Math.max(0, snapshot.resetMs - age));

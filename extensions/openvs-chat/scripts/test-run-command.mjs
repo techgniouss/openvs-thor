@@ -99,5 +99,24 @@ fs.writeFileSync(noisy, [
 //    a card for every build and test it runs.
 assert.strictEqual(approvals, 0);
 
+// Stop reaches a running command: the call ends as a cancellation at once, and the process
+// tree is killed, rather than the run waiting out the command timeout (60s here).
+{
+	const controller = new AbortController();
+	const started = Date.now();
+	setTimeout(() => controller.abort(), 300);
+	await assert.rejects(
+		executeTool({ id: 's1', name: 'run_command', args: { command: 'node -e "setTimeout(() => {}, 60000)"' } }, approver, undefined, undefined, controller.signal),
+		err => err?.name === 'AbortError',
+		'Stop ends the call as a cancellation, not a failed command',
+	);
+	assert.ok(Date.now() - started < 10_000, `ended promptly (${Date.now() - started}ms), not at the timeout`);
+	// Already stopped before it starts: nothing is spawned at all.
+	await assert.rejects(
+		executeTool({ id: 's2', name: 'run_command', args: { command: 'node -e "0"' } }, approver, undefined, undefined, controller.signal),
+		err => err?.name === 'AbortError',
+	);
+}
+
 fs.rmSync(workspace, { recursive: true, force: true });
 console.log('test-run-command: all assertions passed');

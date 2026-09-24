@@ -50,6 +50,10 @@ class FakeChild extends EventEmitter {
 		this.stderr = new EventEmitter();
 		this.stderr.setEncoding = () => { };
 		this.killSignals = [];
+		// What the provider writes to the CLI's stdin — the prompt.
+		this.stdinText = '';
+		this.stdin = new EventEmitter();
+		this.stdin.end = text => { this.stdinText += text ?? ''; };
 	}
 	kill(signal) {
 		this.killSignals.push(signal);
@@ -102,6 +106,21 @@ function baseRequest(overrides = {}) {
 	});
 }
 
+// 2a'. Observed live against the real CLI: an expired sign-in is reported on *stdout* (exit 1,
+//      stderr empty), so reading stderr alone produced a bare "exited with code 1". The reason
+//      is quoted from stdout, with the fix named.
+{
+	const child = new FakeChild();
+	spawnImpl = () => child;
+	const promise = new ClaudeCodeCliProvider().streamChat(baseRequest());
+	child.stdout.emit('data', 'Failed to authenticate: OAuth session expired and could not be refreshed\n');
+	child.emit('close', 1, null);
+	await assert.rejects(promise, err => {
+		assert.strictEqual(err.message, 'Claude Code CLI exited with code 1: Failed to authenticate: OAuth session expired and could not be refreshed. Run `claude` in a terminal and sign in again (`/login`), then retry.');
+		return true;
+	});
+}
+
 // 2b. A spawn failure with ENOENT (CLI not installed / not on PATH) rejects with a friendly
 //     message pointing at installing the CLI and the cliPath setting, not a raw ENOENT.
 {
@@ -145,10 +164,39 @@ function baseRequest(overrides = {}) {
 	await promise;
 	cliPathSetting = '';
 	assert.equal(lastSpawn.binary, 'C:/tools/claude.exe');
-	assert.deepStrictEqual(lastSpawn.args.slice(0, 1).concat(lastSpawn.args.slice(2, 4)), ['-p', '--output-format', 'text']);
-	const modelIndex = lastSpawn.args.indexOf('--model');
-	assert.notEqual(modelIndex, -1);
-	assert.equal(lastSpawn.args[modelIndex + 1], 'opus');
+	assert.deepStrictEqual(lastSpawn.args, ['-p', '--output-format', 'text', '--model', 'opus']);
+	assert.ok(!lastSpawn.opts.shell, 'an .exe is spawned directly');
+}
+
+// 5. The prompt goes in on stdin, never on the command line: as an argument the whole
+//    conversation hit Windows' ~32k command-line cap and long chats could not start.
+{
+	const child = new FakeChild();
+	spawnImpl = () => child;
+	const long = 'x'.repeat(60_000);
+	const promise = new ClaudeCodeCliProvider().streamChat(baseRequest({ messages: [{ role: 'system', content: 'SYS' }, { role: 'user', content: long }] }));
+	child.emit('close', 0, null);
+	await promise;
+	// Through a shell the stub sees (command, options); directly it sees (binary, args, options).
+	const commandLine = Array.isArray(lastSpawn.args) ? [lastSpawn.binary, ...lastSpawn.args].join(' ') : lastSpawn.binary;
+	assert.ok(!commandLine.includes('xxxx'), 'no conversation on the command line');
+	assert.match(child.stdinText, /System instructions:\nSYS/);
+	assert.ok(child.stdinText.includes(long));
+	// Windows reaches npm's `claude.cmd` only through a shell, as one command string (DEP0190);
+	// elsewhere nothing changes.
+	if (process.platform === 'win32') {
+		assert.strictEqual(lastSpawn.binary, '"claude" -p --output-format text');
+		assert.strictEqual(lastSpawn.args.shell, true, 'the options object is the second argument');
+	} else {
+		assert.ok(!lastSpawn.opts?.shell);
+	}
+}
+
+// 6. A model name that could mean something to a shell is refused before anything runs.
+{
+	lastSpawn = null;
+	await assert.rejects(new ClaudeCodeCliProvider().streamChat(baseRequest({ model: 'opus & calc' })), /not a valid model name/);
+	assert.strictEqual(lastSpawn, null);
 }
 
 console.log('test-claude-code-cli: all assertions passed');

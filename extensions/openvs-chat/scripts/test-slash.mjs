@@ -26,6 +26,7 @@ function makeEffects(skillsSnapshot) {
 		mcpReconnect: () => calls.push({ fn: 'mcpReconnect' }),
 		openMcpSettings: () => calls.push({ fn: 'openMcpSettings' }),
 		reply: text => calls.push({ fn: 'reply', text }),
+		undoRun: () => calls.push({ fn: 'undoRun' }),
 		listSkills: () => skillsSnapshot ?? { skills: [], active: [] },
 	};
 	return { effects, calls };
@@ -213,6 +214,14 @@ const CLIENT_ONLY_COMMANDS = new Set(['history', 'enhance']);
 		assert.deepStrictEqual(remoteResult, localResult, `"${text}" must behave the same whether remote or not`);
 		assert.deepStrictEqual(remote.calls, local.calls, `"${text}" must call the same effects whether remote or not`);
 	}
+}
+
+// /undo restores the last run's files. Allowed remotely too: it can only take back what a run
+// in this tab wrote, which is strictly less than the run itself could do.
+for (const remote of [false, true]) {
+	const { effects, calls } = makeEffects();
+	assert.deepStrictEqual(runSlash('/undo', effects, remote), { handled: true });
+	assert.deepStrictEqual(calls, [{ fn: 'undoRun' }], `remote=${remote}`);
 }
 
 console.log('test-slash: all assertions passed');

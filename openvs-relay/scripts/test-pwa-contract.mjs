@@ -52,7 +52,7 @@ const hostSends = new Set([
 	// e.g. a local-only reply like 'inline'/'context' that must never reach a remote sink (see
 	// `src/chatViewProvider.ts`'s `runInline`/`handleAttachContext`) — is still real host
 	// traffic this contract has to know about, same as `test-webview.mjs`'s own copy of this line.
-	...captures(host, /postTo\([^,]*,\s*\{\s*type:\s*'([a-zA-Z]+)'/g),
+	...captures(host, /post(?:To|Except)\([^,]*,\s*\{\s*type:\s*'([a-zA-Z]+)'/g),
 ]);
 assert.ok(hostSends.size > 20, `expected the host's outbound message set to be found, got ${hostSends.size}`);
 

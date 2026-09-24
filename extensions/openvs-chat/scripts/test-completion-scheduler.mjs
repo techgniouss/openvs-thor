@@ -47,6 +47,21 @@ const schedMod = await import(new URL('../out/completions/scheduler.js', import.
 	// Recovery needs no restart.
 	for (let i = 0; i < 5; i++) { health.record(300); }
 	assert.strictEqual(health.isSlow(), false);
+
+	// Failures back automatic requests off, doubling to a minute; one success clears it.
+	const t0 = 1_000_000;
+	assert.strictEqual(health.backoffSeconds(t0), 0);
+	health.recordFailure(t0);
+	assert.strictEqual(health.backoffSeconds(t0), 2);
+	health.recordFailure(t0);
+	health.recordFailure(t0);
+	assert.strictEqual(health.backoffSeconds(t0), 8);
+	for (let i = 0; i < 10; i++) { health.recordFailure(t0); }
+	assert.strictEqual(health.backoffSeconds(t0), 60, 'capped at a minute');
+	assert.strictEqual(health.backoffSeconds(t0 + 61_000), 0, 'and it expires');
+	health.record(200);
+	health.recordFailure(t0);
+	assert.strictEqual(health.backoffSeconds(t0), 2, 'a success restarts the doubling');
 	health.record(9000);
 	health.reset();
 	assert.strictEqual(health.isSlow(), false, 'reset forgets history on a model change');

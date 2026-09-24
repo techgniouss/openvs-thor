@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { DeviceFlowConfig } from '../deviceAuth';
-import { OAuthProxyChatProvider } from './oauthProxy';
+import { OAuthProxyChatProvider, WireSession } from './oauthProxy';
 import { AgentRequest, AgentStep, ChatRequest, ModelEntry, ProviderInfo, StreamChatResult } from './types';
 
 /** The credential this provider stores (as a JSON string via `registry.setApiKey`). Kept as
@@ -134,7 +134,7 @@ export class GrokProvider extends OAuthProxyChatProvider {
 		};
 	}
 
-	protected async mintToken(storedCredential: string, signal: AbortSignal): Promise<{ token: string; expiresAt: number }> {
+	protected async mintToken(storedCredential: string, signal: AbortSignal): Promise<WireSession> {
 		const cred = parseCredential(storedCredential);
 		if (cred.accessToken && cred.expiresAt - Date.now() > 5 * 60_000) {
 			return { token: cred.accessToken, expiresAt: cred.expiresAt };
@@ -152,21 +152,25 @@ export class GrokProvider extends OAuthProxyChatProvider {
 		if (!response.ok) {
 			throw new Error(`xAI Grok: token refresh HTTP ${response.status}`);
 		}
-		const body = await response.json() as { access_token?: string; expires_in?: number };
+		const body = await response.json() as { access_token?: string; expires_in?: number; refresh_token?: string };
 		if (!body.access_token) {
 			throw new Error('xAI Grok: token refresh returned no access_token.');
 		}
-		return { token: body.access_token, expiresAt: Date.now() + (body.expires_in ?? 3600) * 1000 };
+		const expiresAt = Date.now() + (body.expires_in ?? 3600) * 1000;
+		// Saved back (see `setCredentialPersister`), with the new refresh token when the issuer
+		// rotated it: the old one is then spent, and refreshing from it forced a new sign-in.
+		const updated: GrokCredential = { accessToken: body.access_token, refreshToken: body.refresh_token || cred.refreshToken, expiresAt };
+		return { token: body.access_token, expiresAt, updatedCredential: JSON.stringify(updated) };
 	}
 
 	override async streamChat(request: ChatRequest): Promise<StreamChatResult> {
-		const token = await this.wireToken(request.apiKey, request.signal);
-		return super.streamChat({ ...request, apiKey: token, baseUrl: GrokProvider.API_BASE_URL });
+		return this.withWireSession(request.apiKey, request.signal,
+			session => super.streamChat({ ...request, apiKey: session.token, baseUrl: GrokProvider.API_BASE_URL }));
 	}
 
 	override async runAgentStep(request: AgentRequest): Promise<AgentStep> {
-		const token = await this.wireToken(request.apiKey, request.signal);
-		return super.runAgentStep({ ...request, apiKey: token, baseUrl: GrokProvider.API_BASE_URL });
+		return this.withWireSession(request.apiKey, request.signal,
+			session => super.runAgentStep({ ...request, apiKey: session.token, baseUrl: GrokProvider.API_BASE_URL }));
 	}
 
 	// No documented /models endpoint for this gateway, and the inherited

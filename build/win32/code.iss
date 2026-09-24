@@ -90,6 +90,7 @@ Name: "addcontextmenufolders"; Description: "{cm:AddContextMenuFolders,{#NameSho
 Name: "associatewithfiles"; Description: "{cm:AssociateWithFiles,{#NameShort}}"; GroupDescription: "{cm:Other}"
 Name: "addtopath"; Description: "{cm:AddToPath}"; GroupDescription: "{cm:Other}"
 Name: "runcode"; Description: "{cm:RunAfter,{#NameShort}}"; GroupDescription: "{cm:Other}"; Check: WizardSilent
+Name: "installcloudflared"; Description: "Install Cloudflare Tunnel (cloudflared) to activate OpenVS Remote"; GroupDescription: "OpenVS Remote:"; Check: CloudflaredMissing
 
 [Dirs]
 Name: "{app}"; AfterInstall: DisableAppDirInheritance
@@ -115,6 +116,7 @@ Name: "{autodesktop}\{#NameLong}"; Filename: "{app}\{#ExeBasename}.exe"; Tasks: 
 Name: "{userappdata}\Microsoft\Internet Explorer\Quick Launch\{#NameLong}"; Filename: "{app}\{#ExeBasename}.exe"; Tasks: quicklaunchicon; AppUserModelID: "{#AppUserId}"; Check: ShouldUpdateShortcut(ExpandConstant('{userappdata}\Microsoft\Internet Explorer\Quick Launch\{#NameLong}.lnk'))
 
 [Run]
+Filename: "{cmd}"; Parameters: "/c winget install --id Cloudflare.cloudflared --exact --silent --accept-source-agreements --accept-package-agreements --disable-interactivity"; StatusMsg: "Installing Cloudflare Tunnel for OpenVS Remote..."; Tasks: installcloudflared; Check: WingetAvailable; Flags: runhidden waituntilterminated runasoriginaluser
 Filename: "{app}\{#ExeBasename}.exe"; Description: "{cm:LaunchProgram,{#NameLong}}"; Tasks: runcode; Flags: nowait postinstall; Check: ShouldRunAfterUpdate
 Filename: "{app}\{#ExeBasename}.exe"; Description: "{cm:LaunchProgram,{#NameLong}}"; Flags: nowait postinstall; Check: WizardNotSilent
 
@@ -1307,6 +1309,25 @@ Root: {#EnvironmentRootKey}; Subkey: "Software\Microsoft\Windows\CurrentVersion\
 Root: {#EnvironmentRootKey}; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\{#ApplicationName}.exe"; ValueType: none; ValueName: "Path"; Flags: deletevalue
 
 [Code]
+// OpenVS Remote hosts its relay on this machine and reaches the user's phone through
+// Cloudflare Tunnel (cloudflared). The extension installs cloudflared itself the first time
+// remote control is turned on, so this task is a convenience, not a requirement: it saves that
+// download later and puts cloudflared on PATH for the user's own use. See
+// extensions/openvs-chat/src/remote/local/tunnel.ts.
+function CloudflaredMissing(): Boolean;
+begin
+  Result := not (FileExists(ExpandConstant('{commonpf32}\cloudflared\cloudflared.exe'))
+    or FileExists(ExpandConstant('{commonpf}\cloudflared\cloudflared.exe'))
+    or FileExists(ExpandConstant('{localappdata}\Microsoft\WinGet\Links\cloudflared.exe')));
+end;
+
+// winget ships with Windows 10 1809+ and 11 as part of App Installer; without it the task
+// quietly does nothing and the extension's own install covers it.
+function WingetAvailable(): Boolean;
+begin
+  Result := FileExists(ExpandConstant('{localappdata}\Microsoft\WindowsApps\winget.exe'));
+end;
+
 function IsBackgroundUpdate(): Boolean;
 begin
   Result := ExpandConstant('{param:update|false}') <> 'false';

@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { ChatMessage, ChatProvider, streamChatWithContinuation } from '../providers/types';
-import { isContextLengthError, parseTokenLimit, trimMessages } from './context';
+import { estimateTokens, isContextLengthError, needsCompactPrompt, parseTokenLimit, trimMessages, withSystemPrompt } from './context';
 import { budgetsForCeiling } from './contextWindow';
 
 export interface BudgetedStreamRequest {
@@ -16,6 +16,11 @@ export interface BudgetedStreamRequest {
 	readonly maxTokens: number;
 	/** Estimated-token ceiling for the conversation; anything above it is trimmed away. */
 	readonly contextBudget: number;
+	/**
+	 * The condensed system prompt to send instead of the leading one when that one leaves the
+	 * conversation no room inside the budget — trimming never shrinks a system prompt.
+	 */
+	readonly compactSystem?: string;
 	readonly signal: AbortSignal;
 	readonly onToken: (delta: string) => void;
 	readonly onNotice: (text: string) => void;
@@ -38,9 +43,18 @@ export interface BudgetedStreamRequest {
 export async function streamBudgeted(
 	provider: ChatProvider,
 	request: BudgetedStreamRequest,
-): Promise<{ text: string; truncated: boolean }> {
-	const send = (contextBudget: number, maxTokens: number) => streamChatWithContinuation(provider, {
-		messages: trimMessages(request.messages, contextBudget),
+): Promise<{ text: string; truncated: boolean; compactPrompt: boolean }> {
+	let compactPrompt = false;
+	const fit = (contextBudget: number): ChatMessage[] => {
+		const system = request.messages[0]?.role === 'system' ? request.messages[0].content : '';
+		if (request.compactSystem === undefined || !needsCompactPrompt(estimateTokens(system), 0, contextBudget)) {
+			return request.messages;
+		}
+		compactPrompt = true;
+		return withSystemPrompt(request.messages, request.compactSystem);
+	};
+	const send = async (contextBudget: number, maxTokens: number) => ({ ...await streamChatWithContinuation(provider, {
+		messages: trimMessages(fit(contextBudget), contextBudget),
 		model: request.model,
 		apiKey: request.apiKey,
 		baseUrl: request.baseUrl,
@@ -48,7 +62,7 @@ export async function streamBudgeted(
 		signal: request.signal,
 		onToken: request.onToken,
 		onNotice: request.onNotice,
-	});
+	}), compactPrompt });
 	try {
 		return await send(request.contextBudget, request.maxTokens);
 	} catch (err) {

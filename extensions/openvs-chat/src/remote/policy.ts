@@ -55,6 +55,8 @@ export const REMOTE_ALLOWED: readonly string[] = [
 	'setQueue',
 	'sync',
 	'fetchTranscript',
+	// The Undo button: the same effect as `/undo`, which is allowed remotely (see runSlash).
+	'undoRun',
 	// Host-side slash-command dispatch (Phase 6a): everything it can do (mode/provider
 	// switches, clear, skills, MCP) is already reachable individually through the allowed
 	// types above — `slash` is just one more way to reach the same, already-vetted effects.
@@ -107,7 +109,7 @@ export const REMOTE_ALLOWED: readonly string[] = [
  *    desktop-only, same reasoning as `requestPairing` immediately above.
  */
 export const REMOTE_DENIED: readonly string[] = [
-	'saveHistory',
+	'deleteHistory',
 	'requestOpenSettings',
 	'closeSettingsWindow',
 	'saveKey',
@@ -138,6 +140,7 @@ export const REMOTE_DENIED: readonly string[] = [
 	'openExternal',
 	'adopt',
 	'requestPairing',
+	'setRemoteEnabled',
 	'listDevices',
 	'revokeDevice',
 ];

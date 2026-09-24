@@ -75,6 +75,12 @@ export interface TranscriptEntry {
 	 * it from {@link SessionStore.sendableMessages} same as an 'info'/'error' notice.
 	 */
 	readonly fromAgentSession?: { readonly id: string; readonly title: string };
+	/**
+	 * Set on a user turn an editor action wrote (Explain/Fix/… on a selection): its content
+	 * embeds the desktop's selected code, which is kept off remote devices — `remoteSink.ts`'s
+	 * `redactForRemote` replaces it, live and in every transcript sent to a phone.
+	 */
+	readonly fromEditor?: boolean;
 }
 
 /** A task-checklist item the agent loop tracks for a run, rendered as the session's todo panel. */

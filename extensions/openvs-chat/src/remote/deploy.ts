@@ -207,6 +207,14 @@ export async function deployRelay(options: DeployRelayOptions): Promise<DeployRe
 	const list = await runProcess('npx --no-install wrangler secret list', relayDir, undefined, env, signal);
 	log.push(list.output);
 	const pepperAlreadySet = list.code === 0 && /RELAY_PEPPER/.test(list.output);
+	// A failed list means "no pepper yet" only when the Worker itself does not exist (a first
+	// deploy). Any other failure — network, auth, rate limit — used to be read the same way, and
+	// minting a new pepper over the old one invalidates every stored device token and pairing
+	// code: one transient error signed out every paired phone.
+	if (list.code !== 0 && !/not found|does not exist|\b10007\b/i.test(list.output)) {
+		log.push('Could not read the relay\'s existing secrets, so RELAY_PEPPER was left untouched (replacing it would sign out every paired device). Fix the error above and deploy again.');
+		return { ok: false, step: 'secret', output: log.join('\n') };
+	}
 
 	if (!pepperAlreadySet) {
 		const secret = await runProcess('npx --no-install wrangler secret put RELAY_PEPPER', relayDir, randomPepper(), env, signal);

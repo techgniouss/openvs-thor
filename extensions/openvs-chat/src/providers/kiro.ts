@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { OAuthProxyChatProvider } from './oauthProxy';
+import { OAuthProxyChatProvider, WireSession } from './oauthProxy';
 import { ChatRequest, ModelEntry, ProviderInfo, StreamChatResult, apiFetch, describeHttpError } from './types';
 
 const CONTENT_FRAGMENT = /"content"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
@@ -121,7 +121,7 @@ export class KiroProvider extends OAuthProxyChatProvider {
 		visionModelPatterns: [],
 	};
 
-	protected async mintToken(storedCredential: string, signal: AbortSignal): Promise<{ token: string; expiresAt: number }> {
+	protected async mintToken(storedCredential: string, signal: AbortSignal): Promise<WireSession> {
 		const cred = parseKiroCredential(storedCredential);
 		if (cred.accessToken && cred.expiresAt - Date.now() > 5 * 60_000) {
 			return { token: cred.accessToken, expiresAt: cred.expiresAt };
@@ -138,20 +138,26 @@ export class KiroProvider extends OAuthProxyChatProvider {
 		if (!response.ok) {
 			throw new Error(await describeHttpError('AWS Kiro', response));
 		}
-		const body = await response.json() as { accessToken?: string; expiresAt?: string | number };
+		const body = await response.json() as { accessToken?: string; expiresAt?: string | number; refreshToken?: string };
 		if (!body.accessToken) {
 			throw new Error('AWS Kiro: refreshToken returned no accessToken.');
 		}
 		const expiresAt = typeof body.expiresAt === 'number' ? body.expiresAt
 			: typeof body.expiresAt === 'string' ? (Date.parse(body.expiresAt) || (Date.now() + 45 * 60_000))
 				: Date.now() + 45 * 60_000;
-		return { token: body.accessToken, expiresAt };
+		// Saved back, with a rotated refresh token when one came back — see Grok's `mintToken`.
+		const updated: KiroCredential = { accessToken: body.accessToken, refreshToken: body.refreshToken || cred.refreshToken, expiresAt, region: cred.region };
+		return { token: body.accessToken, expiresAt, updatedCredential: JSON.stringify(updated) };
 	}
 
 	// Not OpenAI-compatible at all — CodeWhisperer's own envelope — so this bypasses
 	// OpenAICompatibleProvider's streamChat entirely rather than delegating to `super`.
 	override async streamChat(request: ChatRequest): Promise<StreamChatResult> {
-		const token = await this.wireToken(request.apiKey, request.signal);
+		return this.withWireSession(request.apiKey, request.signal, session => this.generate(session.token, request));
+	}
+
+	/** One `generateAssistantResponse` call with an already-minted token. */
+	private async generate(token: string, request: ChatRequest): Promise<StreamChatResult> {
 		const response = await apiFetch('https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },

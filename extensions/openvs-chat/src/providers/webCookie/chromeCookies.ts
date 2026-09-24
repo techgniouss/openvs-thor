@@ -5,6 +5,7 @@
 
 import * as crypto from 'crypto';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import initSqlJs from 'sql.js';
 import { dpapiUnprotectCurrentUser } from './dpapi';
@@ -183,7 +184,10 @@ export async function readCookies(profilePath: string, hostSuffixes: readonly st
 		return [];
 	}
 	const source = path.join(profilePath, 'Default', 'Network', 'Cookies');
-	const tmp = path.join(path.dirname(source), `_openvs_live_read_${process.pid}.tmp`);
+	// In the OS temp directory, not beside the source: that wrote into the user's own Chrome
+	// profile (leaving a stray file there if the host died before cleanup), and a fixed per-pid
+	// name let two concurrent reads in one process overwrite and delete each other's copy.
+	const tmp = path.join(os.tmpdir(), `openvs-cookies-${crypto.randomBytes(8).toString('hex')}.tmp`);
 	let bytes: Buffer;
 	try {
 		await fs.promises.copyFile(source, tmp);

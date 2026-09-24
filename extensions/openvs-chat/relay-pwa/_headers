@@ -1,0 +1,9 @@
+# Security headers for the phone app, which can approve the agent's writes and commands:
+# no framing by another site (a clickjacked Approve), no MIME sniffing, no referrer carrying
+# the room id off-site. The local relay (extensions/openvs-chat/src/remote/local/relayServer.ts)
+# sends the same four.
+/*
+  X-Frame-Options: DENY
+  Content-Security-Policy: frame-ancestors 'none'
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer

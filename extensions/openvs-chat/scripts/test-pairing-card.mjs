@@ -301,4 +301,28 @@ const pairing = {
 	assert.ok(line.classList.contains('hidden'), 'a cleared error goes back to hidden');
 }
 
+// The on/off switch: flipping it asks the host, and only the host's answer moves it — a switch
+// that couldn't turn on (hosted mode with no relay URL) must not keep claiming "on".
+{
+	const h = harness();
+	const input = h.container.find('remote-toggle-input');
+	assert.strictEqual(input.checked, false, 'off until the host says otherwise');
+	input.checked = true;
+	input.fire('change');
+	assert.deepStrictEqual(h.posted.at(-1), { type: 'setRemoteEnabled', enabled: true });
+	h.api.update({ enabled: false, connected: false });
+	assert.strictEqual(input.checked, false, 'the host said it stayed off, so the switch flips back');
+	h.api.update({ enabled: true, connected: true });
+	assert.strictEqual(input.checked, true);
+}
+
+// A pairing hint (the quick-tunnel DNS help) is shown under the code; none when there isn't one.
+{
+	const h = harness();
+	h.api.update({ enabled: true, connected: true, pairing: { code: 'ABCD2345', expiresAt: Date.now() + 60_000, url: 'https://x.trycloudflare.com/p/R#ABCD2345', hint: 'Set Private DNS to one.one.one.one' } });
+	assert.match(h.container.find('remote-pairing-hint').textContent, /Private DNS/);
+	h.api.update({ enabled: true, connected: true, pairing: { code: 'ABCD2346', expiresAt: Date.now() + 60_000, url: 'https://remote.example.com/p/R#ABCD2346' } });
+	assert.strictEqual(h.container.find('remote-pairing-hint'), undefined, 'a named tunnel needs no hint');
+}
+
 console.log('test-pairing-card: all assertions passed');

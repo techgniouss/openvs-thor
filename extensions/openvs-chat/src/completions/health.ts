@@ -15,6 +15,11 @@
  * A single slow sample is never a verdict: a cold model's first request is expected to be
  * slow, and disabling on it would disable the feature on every fresh session.
  */
+/** First pause after a failed completion request, doubled per further failure. */
+const BASE_BACKOFF_MS = 2_000;
+/** Longest pause between automatic attempts while a backend keeps failing. */
+const MAX_BACKOFF_MS = 60_000;
+
 export class HealthTracker {
 	private readonly samples: number[] = [];
 
@@ -26,7 +31,14 @@ export class HealthTracker {
 	) { }
 
 	/** Records one completed request's round-trip time. */
+	/** Consecutive failed requests; see {@link recordFailure}. */
+	private failures = 0;
+	/** Until when automatic requests stand down after a failure, epoch ms. */
+	private pausedUntil = 0;
+
 	record(ms: number): void {
+		this.failures = 0;
+		this.pausedUntil = 0;
 		this.samples.push(ms);
 		if (this.samples.length > this.window) {
 			this.samples.shift();
@@ -55,7 +67,27 @@ export class HealthTracker {
 	}
 
 	/** Forgets history — used when the model changes, since the old latency says nothing. */
+	/**
+	 * Records a failed request and backs automatic requests off: 2s, then doubling to a
+	 * minute while failures continue.
+	 *
+	 * Only successes were recorded, so a backend failing every request — a 429, a revoked
+	 * key, a local endpoint that is down — was asked again on every pause in typing, each
+	 * attempt spending quota (and, on a rate limit, deepening it) to show nothing.
+	 */
+	recordFailure(now = Date.now()): void {
+		this.failures++;
+		this.pausedUntil = now + Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2 ** (this.failures - 1));
+	}
+
+	/** Seconds automatic requests are still standing down for, or 0 when they are not. */
+	backoffSeconds(now = Date.now()): number {
+		return now < this.pausedUntil ? Math.ceil((this.pausedUntil - now) / 1000) : 0;
+	}
+
 	reset(): void {
 		this.samples.length = 0;
+		this.failures = 0;
+		this.pausedUntil = 0;
 	}
 }

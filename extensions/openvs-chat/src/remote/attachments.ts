@@ -59,17 +59,52 @@ export const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
 /** Per-session byte ceiling, counted cumulatively across every upload that session has ever completed or has in flight. */
 export const MAX_SESSION_BYTES = 32 * 1024 * 1024;
 
+/**
+ * Most chunks one upload may declare. The PWA sends 64k-character slices, so an 8 MB image is
+ * ~171; without a bound, empty chunks (zero bytes against both caps) grew the map without limit.
+ */
+export const MAX_UPLOAD_CHUNKS = 1024;
+
+/** An upload with no chunk for this long is abandoned (the phone dropped mid-upload). */
+export const UPLOAD_IDLE_MS = 2 * 60 * 1000;
+
+/** Base64 alphabet, padding only at the end. `Buffer.from(…, 'base64')` never throws — it skips what it cannot read. */
+const BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
+
 /** Decoded byte length of a base64 string. Not required to be 4-aligned — good enough for cap enforcement, which does not need to be byte-exact. */
 function decodedLength(base64: string): number {
 	return Buffer.from(base64, 'base64').length;
 }
 
+/**
+ * The image type `data` actually is, read from its leading bytes, or undefined when it is none
+ * of the types every vision backend takes. The client's own claim is not used: the type is
+ * stored with the image and re-sent on every later request, and a provider refuses an image
+ * whose data does not match its stated type, so a wrong label broke that session for good.
+ */
+function sniffImageType(data: string): string | undefined {
+	const head = Buffer.from(data.slice(0, 24), 'base64');
+	if (head.length >= 3 && head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) {
+		return 'image/jpeg';
+	}
+	if (head.length >= 8 && head.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+		return 'image/png';
+	}
+	if (head.length >= 6 && /^GIF8[79]a$/.test(head.subarray(0, 6).toString('latin1'))) {
+		return 'image/gif';
+	}
+	if (head.length >= 12 && head.subarray(0, 4).toString('latin1') === 'RIFF' && head.subarray(8, 12).toString('latin1') === 'WEBP') {
+		return 'image/webp';
+	}
+	return undefined;
+}
+
 interface UploadState {
 	sessionId: string;
-	mimeType?: string;
 	total: number;
 	chunks: Map<number, string>;
 	receivedBytes: number;
+	lastChunkAt: number;
 }
 
 /**
@@ -88,12 +123,20 @@ export class UploadAssembler {
 	/** sessionId -> cumulative accepted bytes, across every upload (completed or in-flight) this instance has ever admitted for that session. Never decremented on completion — it is a lifetime ceiling on attachment volume per session, not a watermark. */
 	private readonly sessionBytes = new Map<string, number>();
 
+	/** @param now Clock for {@link UPLOAD_IDLE_MS}; injectable for tests. */
+	constructor(private readonly now: () => number = Date.now) { }
+
 	/** Feeds one chunk in. See {@link AddChunkResult} for the three outcomes. */
 	addChunk(input: AttachImageChunk): AddChunkResult {
-		const { sessionId, uploadId, index, total, chunk, mimeType } = input;
-		if (!Number.isInteger(total) || total <= 0 || !Number.isInteger(index) || index < 0 || index >= total) {
+		const { sessionId, uploadId, index, total, chunk } = input;
+		this.dropAbandoned();
+		if (!Number.isInteger(total) || total <= 0 || total > MAX_UPLOAD_CHUNKS || !Number.isInteger(index) || index < 0 || index >= total) {
 			this.dropUpload(uploadId);
 			return { status: 'rejected', reason: `invalid chunk index ${index} of ${total}` };
+		}
+		if (!BASE64.test(chunk)) {
+			this.dropUpload(uploadId);
+			return { status: 'rejected', reason: 'malformed base64 chunk' };
 		}
 		let upload = this.uploads.get(uploadId);
 		if (upload && upload.total !== total) {
@@ -104,19 +147,12 @@ export class UploadAssembler {
 			return { status: 'rejected', reason: 'chunk total changed mid-upload' };
 		}
 		if (!upload) {
-			upload = { sessionId, mimeType, total, chunks: new Map(), receivedBytes: 0 };
+			upload = { sessionId, total, chunks: new Map(), receivedBytes: 0, lastChunkAt: 0 };
 			this.uploads.set(uploadId, upload);
-		} else if (mimeType && !upload.mimeType) {
-			upload.mimeType = mimeType;
 		}
+		upload.lastChunkAt = this.now();
 
-		let newBytes: number;
-		try {
-			newBytes = decodedLength(chunk);
-		} catch {
-			this.dropUpload(uploadId);
-			return { status: 'rejected', reason: 'malformed base64 chunk' };
-		}
+		const newBytes = decodedLength(chunk);
 		// A resend of an already-received index must not be double-counted against either cap.
 		const previousBytesForIndex = upload.chunks.has(index) ? decodedLength(upload.chunks.get(index) as string) : 0;
 		const deltaBytes = newBytes - previousBytesForIndex;
@@ -144,12 +180,31 @@ export class UploadAssembler {
 		for (let i = 0; i < upload.total; i++) {
 			combined += upload.chunks.get(i);
 		}
+		const mimeType = sniffImageType(combined);
+		if (!mimeType || !BASE64.test(combined)) {
+			this.dropUpload(uploadId);
+			return { status: 'rejected', reason: 'not a JPEG, PNG, GIF or WebP image' };
+		}
 		this.uploads.delete(uploadId);
 		return {
 			status: 'complete',
 			sessionId: upload.sessionId,
-			image: { mimeType: upload.mimeType ?? 'image/jpeg', data: combined },
+			image: { mimeType, data: combined },
 		};
+	}
+
+	/**
+	 * Drops uploads that stopped arriving. Nothing else ever removed one, so every upload a phone
+	 * abandoned stayed in memory and kept its bytes counted against the session's lifetime cap —
+	 * enough dropped uploads and that tab could never attach an image again.
+	 */
+	private dropAbandoned(): void {
+		const cutoff = this.now() - UPLOAD_IDLE_MS;
+		for (const [id, upload] of this.uploads) {
+			if (upload.lastChunkAt < cutoff) {
+				this.dropUpload(id);
+			}
+		}
 	}
 
 	/** Drops an upload (rejection or abandonment), rolling its bytes back out of the session's running total so a rejected upload cannot itself count toward the very cap that rejected it. */

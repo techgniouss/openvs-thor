@@ -100,4 +100,41 @@ function fakeSink(id, kind, wantsChat) {
 	assert.deepStrictEqual(bus.sinksOfKind('webview').map(s => s.id), ['webview']);
 }
 
+// 7. `postExcept` skips the sink that already applied the change itself (a user turn it echoed
+// on Send) and still honors the chat-only filter for everyone else.
+{
+	const bus = new SessionBus();
+	bus.setChatOnlyTypes(new Set(['userTurn']));
+	const webview = fakeSink('webview', 'webview', true);
+	const settings = fakeSink('settings', 'settings', false);
+	const remote = fakeSink('remote', 'remote', true);
+	bus.addSink(webview);
+	bus.addSink(settings);
+	bus.addSink(remote);
+	bus.postExcept('remote', { type: 'userTurn', content: 'hi' });
+	assert.deepStrictEqual(
+		[webview.received.length, settings.received.length, remote.received.length],
+		[1, 0, 0],
+		'the other chat client hears about it; the sender and the Settings tab do not');
+}
+
+// A sink that throws neither starves the sinks after it nor reaches the caller — which is
+// usually a running agent's callback, and would otherwise end the run over a display.
+{
+	const bus = new SessionBus();
+	const broken = { ...fakeSink('bad', 'remote', true), post: () => { throw new Error('closed'); } };
+	const good = fakeSink('good', 'webview', true);
+	bus.addSink(broken);
+	bus.addSink(good);
+	const warn = console.warn;
+	console.warn = () => { };
+	try {
+		assert.doesNotThrow(() => bus.post({ type: 'token', delta: 'x' }));
+		assert.doesNotThrow(() => bus.postTo('bad', { type: 'token', delta: 'y' }));
+	} finally {
+		console.warn = warn;
+	}
+	assert.deepStrictEqual(good.received, [{ type: 'token', delta: 'x' }]);
+}
+
 console.log('test-session-bus: all assertions passed');

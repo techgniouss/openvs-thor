@@ -32,6 +32,35 @@ const MESSAGE_SHAPE_REJECTION =
 	/assistant|consecutive|alternat|message.*(order|sequence|role)|role.*(order|sequence)/i;
 
 /**
+ * Model ids a `/models` endpoint lists that cannot answer a chat request: embeddings, speech,
+ * image and video generation, moderation, rerankers, realtime-only and legacy-completions
+ * models. OpenAI's own catalog is mostly these (whisper, tts, dall-e, text-embedding,
+ * omni-moderation, davinci-002…), sorted alphabetically in among the chat models, so the
+ * picker read as a random list and a pick from it failed on the first request. DashScope,
+ * Copilot and local servers (an Ollama `nomic-embed-text`) have the same problem. Providers
+ * with sharper knowledge of their own catalog still filter on top of this.
+ */
+const NON_CHAT_MODEL = /(embed|whisper|dall-e|gpt-image|moderation|transcribe|realtime|rerank|-tts|tts-|\btts\b|audio|speech|sora|davinci|babbage|turbo-instruct|computer-use|wanx|cosyvoice|paraformer|sambert)/i;
+
+/** Models that take only their default sampling; see `OpenAICompatibleProvider.requestExtras`. */
+const DEFAULT_SAMPLING_ONLY = /(^|\/)(o[1-9]|gpt-5)|kimi-k2\.[5-9]|kimi-k[3-9]|kimi-k2-thinking|gpt-oss|gemini-[3-9]/i;
+
+/**
+ * Whether `model` must be sent with its own default sampling (no `temperature`/`top_p`):
+ * the vendor fixes it (Kimi K2.5+ rejects anything else), rejects overrides (OpenAI's
+ * reasoning models), or documents degradation below it (Gemini 3's looping, gpt-oss).
+ */
+export function takesDefaultSamplingOnly(model: string): boolean {
+	return DEFAULT_SAMPLING_ONLY.test(model);
+}
+
+/** Drops {@link NON_CHAT_MODEL} ids — unless that would empty the list, since an unfamiliar catalog shown whole beats an empty picker. */
+function chatModelsOnly(entries: ModelEntry[]): ModelEntry[] {
+	const chat = entries.filter(e => !NON_CHAT_MODEL.test(e.id));
+	return chat.length ? chat : entries;
+}
+
+/**
  * Base implementation for any backend that speaks the OpenAI Chat Completions API
  * (OpenAI itself, NVIDIA's `integrate.api.nvidia.com`, local gateways, etc.).
  * Subclasses only need to supply `info`.
@@ -42,6 +71,26 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 	/** Extra request body fields (e.g. sampling defaults). Overridable by subclasses. */
 	protected extraBody(): Record<string, unknown> {
 		return {};
+	}
+
+	/**
+	 * {@link extraBody} for one request, minus any sampling override the model does not take.
+	 *
+	 * Several families fix their sampling or require the default, whatever gateway serves
+	 * them: Kimi K2.5 and later reject any `temperature` outright (HTTP 400, "only 1 is
+	 * allowed") — which made every request to the Kimi provider's own suggested models fail —
+	 * OpenAI's reasoning models reject non-default sampling, and Gemini 3 and gpt-oss are
+	 * documented to degrade, looping included, below their default temperature. A provider's
+	 * sampling default is a preference; this is the model's own constraint, so it wins.
+	 */
+	private requestExtras(model: string): Record<string, unknown> {
+		const extra = { ...this.extraBody() };
+		if (takesDefaultSamplingOnly(model)) {
+			delete extra.temperature;
+			delete extra.top_p;
+			delete extra.top_k;
+		}
+		return extra;
 	}
 
 	/** Extra request headers (e.g. OpenRouter's app attribution). Overridable by subclasses. */
@@ -259,7 +308,7 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 				messages: serializeMessages(request.messages, mode, this.wantsCacheBreakpoints(request.model), id => this.toolCallId(id, request.model)),
 				[this.tokenLimitField(request.model)]: request.maxTokens,
 				stream: true,
-				...this.extraBody(),
+				...this.requestExtras(request.model),
 			}),
 			request.signal,
 			this.effectiveFetchOpts(request),
@@ -272,39 +321,49 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 		// Reasoning models (DeepSeek-R1, QwQ, some Nemotrons) stream their chain of
 		// thought as `reasoning_content` before any `content`. Dropping it made those
 		// models look dead for minutes; surface it, separated from the final answer.
-		let phase: 'idle' | 'reasoning' | 'answer' = 'idle';
+		let phase = 'idle' as 'idle' | 'reasoning' | 'answer';
 		let truncated = false;
 		let finishReason: FinishReason | undefined;
 		await readSSE(response, data => {
+			// Only the parse is guarded. `throwStreamError` used to sit inside the same catch
+			// that skips malformed chunks, so on this path — Ask, Plan, Edit and Auto's text
+			// phases — a backend's in-band error was swallowed and the reply simply ended
+			// empty, the exact failure the agent path's placement of it had already fixed.
+			let json: any;
 			try {
-				const json = JSON.parse(data);
-				throwStreamError(this.info.label, json);
-				const raw = json?.choices?.[0]?.finish_reason;
-				if (raw) {
-					finishReason = normalizeFinishReason(raw);
-					truncated = finishReason === 'length';
-				}
-				const delta = json?.choices?.[0]?.delta;
-				const reasoning = reasoningDelta(delta);
-				if (reasoning) {
-					if (phase === 'idle') {
-						request.onToken(OPEN_MARK);
-						phase = 'reasoning';
-					}
-					request.onToken(reasoning);
-				}
-				const content: string | undefined = delta?.content;
-				if (typeof content === 'string' && content) {
-					if (phase === 'reasoning') {
-						request.onToken(CLOSE_MARK);
-					}
-					phase = 'answer';
-					request.onToken(content);
-				}
+				json = JSON.parse(data);
 			} catch {
-				// Skip malformed chunks.
+				return;
+			}
+			throwStreamError(this.info.label, json);
+			const raw = json?.choices?.[0]?.finish_reason;
+			if (raw) {
+				finishReason = normalizeFinishReason(raw);
+				truncated = finishReason === 'length';
+			}
+			const delta = json?.choices?.[0]?.delta;
+			const reasoning = reasoningDelta(delta);
+			if (reasoning) {
+				if (phase === 'idle') {
+					request.onToken(OPEN_MARK);
+					phase = 'reasoning';
+				}
+				request.onToken(reasoning);
+			}
+			const content: string | undefined = delta?.content;
+			if (typeof content === 'string' && content) {
+				if (phase === 'reasoning') {
+					request.onToken(CLOSE_MARK);
+				}
+				phase = 'answer';
+				request.onToken(content);
 			}
 		}, request.signal, { label: this.info.label, sawTerminal: () => finishReason !== undefined });
+		// A reply that ended while still reasoning (cut off, or a model that answered only in
+		// its reasoning) still closes the block, or the thinking parser holds the rest open.
+		if (phase === 'reasoning') {
+			request.onToken(CLOSE_MARK);
+		}
 		return { truncated, finishReason };
 	}
 
@@ -320,7 +379,7 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 		const ids: string[] = (json?.data ?? [])
 			.map((m: { id?: string }) => m?.id)
 			.filter((id: unknown): id is string => typeof id === 'string');
-		return ids.sort((a, b) => a.localeCompare(b)).map(id => ({ id }));
+		return chatModelsOnly(ids.sort((a, b) => a.localeCompare(b)).map(id => ({ id })));
 	}
 
 	async runAgentStep(request: AgentRequest): Promise<AgentStep> {
@@ -337,7 +396,7 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 				})),
 				tool_choice: 'auto',
 				stream: true,
-				...this.extraBody(),
+				...this.requestExtras(request.model),
 			}),
 			request.signal,
 			this.streamFetchOpts(request.model, request.onNotice),

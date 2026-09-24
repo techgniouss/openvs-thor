@@ -43,11 +43,7 @@ export class RulesProvider {
 			}
 		}
 
-		const joined = parts.join('\n\n').trim();
-		if (joined.length > MAX_RULES_CHARS) {
-			return joined.slice(0, MAX_RULES_CHARS) + '\n\n…[rules truncated]';
-		}
-		return joined;
+		return capRules(parts.join('\n\n').trim(), MAX_RULES_CHARS, '…[rules truncated]');
 	}
 
 	/**
@@ -55,11 +51,7 @@ export class RulesProvider {
 	 * appended after it. Used as the foundation every mode builds on.
 	 */
 	async composeSystem(base: string): Promise<string> {
-		const rules = await this.getRules();
-		if (!rules) {
-			return base;
-		}
-		return `${base}\n\n## Project rules (must follow)\n${rules}`;
+		return appendRules(base, await this.getRules());
 	}
 
 	private async tryReadFile(root: vscode.Uri, name: string): Promise<string | undefined> {
@@ -70,4 +62,21 @@ export class RulesProvider {
 			return undefined; // file not present — that's fine
 		}
 	}
+}
+
+/**
+ * Rules cap for the compact system prompt, sent when a model's per-request budget cannot
+ * carry the full prompt. Earlier sources win, as with {@link MAX_RULES_CHARS}, so the
+ * `openvsChat.ruleFiles` order still decides what survives.
+ */
+export const COMPACT_RULES_CHARS = 2_000;
+
+/** `base` followed by the rules block (from {@link RulesProvider.getRules}), capped to `maxChars` when given. */
+export function appendRules(base: string, rules: string, maxChars?: number): string {
+	const text = maxChars === undefined ? rules : capRules(rules, maxChars, '…[rules truncated to fit this model\'s request budget]');
+	return text ? `${base}\n\n## Project rules (must follow)\n${text}` : base;
+}
+
+function capRules(rules: string, maxChars: number, marker: string): string {
+	return rules.length > maxChars ? `${rules.slice(0, maxChars)}\n\n${marker}` : rules;
 }

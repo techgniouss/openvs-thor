@@ -12,9 +12,14 @@
 import assert from 'node:assert/strict';
 import { MAX_SESSION_BYTES, MAX_UPLOAD_BYTES, UploadAssembler } from '../out/remote/attachments.js';
 
-/** Builds a base64 string that decodes to exactly `bytes` raw bytes. */
-function base64OfSize(bytes) {
-	return Buffer.alloc(bytes, 'a').toString('base64');
+/** Leading bytes of each image type; the assembler reads the type from these, not from the client's claim. */
+const MAGIC = { jpeg: [0xff, 0xd8, 0xff], png: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] };
+
+/** Builds a base64 string that decodes to exactly `bytes` raw bytes, starting as an image of `kind`. */
+function base64OfSize(bytes, kind = 'jpeg') {
+	const buffer = Buffer.alloc(bytes, 'a');
+	Buffer.from(MAGIC[kind]).copy(buffer);
+	return buffer.toString('base64');
 }
 
 /** Splits `base64` into chunks of at most `size` base64 characters, preserving order. */
@@ -111,7 +116,7 @@ function splitBase64(base64, size) {
 {
 	const assembler = new UploadAssembler();
 	const originalA = base64OfSize(100_000);
-	const originalB = base64OfSize(150_000);
+	const originalB = base64OfSize(150_000, 'png');
 	const partsA = splitBase64(originalA, 40_000);
 	const partsB = splitBase64(originalB, 40_000);
 
@@ -159,6 +164,40 @@ function splitBase64(base64, size) {
 {
 	assert.strictEqual(MAX_UPLOAD_BYTES, 8 * 1024 * 1024);
 	assert.strictEqual(MAX_SESSION_BYTES, 32 * 1024 * 1024);
+}
+
+// 7. What arrives must be an image, typed by its bytes rather than the client's label: the type
+// is stored and re-sent on every later request, and a provider refuses a mismatch — so a wrong
+// label, or a non-image, broke that session for good. Malformed base64 is refused (Buffer's
+// decoder never throws, so the old check could not fire), and so are absurd chunk counts.
+{
+	const one = (assembler, chunk, extra = {}) => assembler.addChunk({ sessionId: 's7', uploadId: 'u7', index: 0, total: 1, chunk, mimeType: 'image/jpeg', ...extra });
+	const outcome = r => r.status === 'complete' ? r.image.mimeType : r.reason;
+	assert.deepStrictEqual([
+		outcome(one(new UploadAssembler(), base64OfSize(64, 'png'))),
+		outcome(one(new UploadAssembler(), Buffer.from('<html>not an image</html>').toString('base64'))),
+		outcome(one(new UploadAssembler(), '!!!not base64!!!')),
+		outcome(one(new UploadAssembler(), base64OfSize(8), { total: 5000 })),
+	], [
+		'image/png',
+		'not a JPEG, PNG, GIF or WebP image',
+		'malformed base64 chunk',
+		'invalid chunk index 0 of 5000',
+	]);
+}
+
+// 8. An upload the phone abandoned is dropped after UPLOAD_IDLE_MS, and its bytes stop counting
+// against the session: nothing used to remove one, so enough dropped uploads locked the tab out.
+{
+	let now = 0;
+	const assembler = new UploadAssembler(() => now);
+	const big = base64OfSize(7 * 1024 * 1024);
+	for (let n = 0; n < 5; n++) {
+		assert.strictEqual(assembler.addChunk({ sessionId: 's8', uploadId: `lost${n}`, index: 0, total: 2, chunk: big }).status, 'progress');
+		now += 3 * 60 * 1000; // the phone went away; the next upload starts later
+	}
+	const fresh = base64OfSize(1000);
+	assert.strictEqual(assembler.addChunk({ sessionId: 's8', uploadId: 'ok', index: 0, total: 1, chunk: fresh }).status, 'complete');
 }
 
 console.log('test-attachments: all assertions passed');

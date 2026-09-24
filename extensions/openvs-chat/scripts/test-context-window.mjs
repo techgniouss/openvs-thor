@@ -93,6 +93,29 @@ assert.strictEqual(m.contextWindowFor('open-mistral-7b'), 32_000);
 assert.strictEqual(m.contextWindowFor('z-ai/glm-5.2'), 200_000);
 assert.strictEqual(m.contextWindowFor('z-ai/glm-4.6'), 128_000, 'GLM-5 must not shadow GLM-4');
 assert.strictEqual(m.contextWindowFor('@cf/google/gemma-4-26b-a4b-it'), 256_000);
-assert.strictEqual(m.contextWindowFor('google/gemma-3-12b-it'), 8_000, 'Gemma 4 must not shadow Gemma 3');
+assert.strictEqual(m.contextWindowFor('google/gemma-3-12b-it'), 128_000, 'Gemma 4 must not shadow Gemma 3');
+assert.strictEqual(m.contextWindowFor('google/gemma-3n-e4b-it'), 32_000);
+assert.strictEqual(m.contextWindowFor('google/gemma-3-1b-it'), 32_000);
+assert.strictEqual(m.contextWindowFor('google/gemma-2-9b-it'), 8_000);
+
+// requestBudgets on a window too small for the configured reply plus a usable conversation.
+// Before, an 8k model got an 8k conversation floor AND the full 8192 reservation — a request
+// twice its window — and the context-length retry only ever shrank the conversation.
+{
+	const small = m.requestBudgets({ model: 'llama-2-7b', maxOutputTokens: 8_192 });
+	assert.deepStrictEqual(small, { maxTokens: 1_800, contextBudget: 5_400 }, 'split like a stated 8k allowance');
+	assert.ok(small.maxTokens + small.contextBudget <= 8_000, 'the request fits the window');
+	// A window that fits the configured reply comfortably is sized exactly as before.
+	assert.deepStrictEqual(m.requestBudgets({ model: 'claude-fable-5', maxOutputTokens: 8_192 }),
+		{ maxTokens: 8_192, contextBudget: Math.floor(200_000 * 0.8) - 8_192 });
+	// A stated allowance on a small window is bounded by the smaller of the two.
+	assert.deepStrictEqual(m.requestBudgets({ model: 'llama-2-7b', maxOutputTokens: 8_192, stated: 30_000 }), small);
+	// A pinned budget is the user's decision, small window or not.
+	assert.deepStrictEqual(m.requestBudgets({ model: 'llama-2-7b', maxOutputTokens: 8_192, override: 6_000 }),
+		{ maxTokens: 8_192, contextBudget: 6_000 });
+	// An unknown model asked for a huge reply no longer overshoots its 32k default window.
+	const huge = m.requestBudgets({ model: 'totally-unknown-model', maxOutputTokens: 30_000 });
+	assert.ok(huge.maxTokens + huge.contextBudget <= 32_000, `fits the window: ${JSON.stringify(huge)}`);
+}
 
 console.log('test-context-window: all assertions passed');

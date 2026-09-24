@@ -11,6 +11,7 @@ import { ClaudeCodeCliProvider } from './claudeCodeCli';
 import { CLOUDFLARE_ACCOUNT_PLACEHOLDER, CloudflareProvider } from './cloudflare';
 import { CooldownTracker } from './cooldown';
 import { CopilotProvider } from './copilot';
+import { OAuthProxyChatProvider } from './oauthProxy';
 import { CustomProvider } from './custom';
 import { GeminiProvider } from './gemini';
 import { GrokProvider } from './grok';
@@ -121,8 +122,11 @@ export class ProviderRegistry {
 
 	constructor(private readonly secrets: vscode.SecretStorage) {
 		this.oauth = new OAuthTokenStore(secrets);
-		for (const provider of [new NvidiaProvider(), new OpenAIProvider(), new AnthropicProvider(), new GeminiProvider(), new AntigravityProvider(), new OpenRouterProvider(), new GroqProvider(), new MistralProvider(), new CloudflareProvider(), new KimiProvider(), new QwenProvider(), new ZaiProvider(), new OpenCodeZenProvider(), new XkiroProvider(), new CopilotProvider(), new GrokProvider(), new KiroProvider(), new GeminiWebProvider(), new ClaudeCodeCliProvider(), new CustomProvider()]) {
+		for (const provider of [new NvidiaProvider(), new OpenAIProvider(), new AnthropicProvider(() => vscode.workspace.getConfiguration('openvsChat').get<string>('anthropic.thinking') === 'off' ? 'off' : 'auto'), new GeminiProvider(), new AntigravityProvider(), new OpenRouterProvider(), new GroqProvider(), new MistralProvider(), new CloudflareProvider(), new KimiProvider(), new QwenProvider(), new ZaiProvider(), new OpenCodeZenProvider(), new XkiroProvider(), new CopilotProvider(), new GrokProvider(), new KiroProvider(), new GeminiWebProvider(), new ClaudeCodeCliProvider(), new CustomProvider()]) {
 			this.providers.set(provider.info.id, provider);
+			if (provider instanceof OAuthProxyChatProvider) {
+				provider.setCredentialPersister((previous, next) => this.replaceStoredKey(provider.info.id, previous, next));
+			}
 		}
 	}
 
@@ -279,6 +283,25 @@ export class ProviderRegistry {
 			return 'oauth';
 		}
 		return 'none';
+	}
+
+	/**
+	 * Replaces one stored credential with its refreshed form, wherever it sits in `id`'s pool
+	 * (the primary key or a backup), leaving the rest untouched. For providers whose stored
+	 * "key" is a refreshable token pair — see `OAuthProxyChatProvider.setCredentialPersister`.
+	 * A credential no longer stored (removed or replaced meanwhile) is left alone.
+	 */
+	async replaceStoredKey(id: string, previous: string, next: string): Promise<void> {
+		if (await this.secrets.get(SECRET_PREFIX + id) === previous) {
+			await this.secrets.store(SECRET_PREFIX + id, next);
+			return;
+		}
+		const extra = await this.getExtraApiKeys(id);
+		const index = extra.indexOf(previous);
+		if (index >= 0) {
+			extra[index] = next;
+			await this.setExtraApiKeys(id, extra);
+		}
 	}
 
 	async setApiKey(id: string, key: string): Promise<void> {

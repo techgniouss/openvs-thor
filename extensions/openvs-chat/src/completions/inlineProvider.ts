@@ -7,6 +7,7 @@ import * as vscode from 'vscode';
 import { RoleAssignment, RoleRouter } from '../auto/router';
 import { ChatProvider } from '../providers/types';
 import { ProviderRegistry } from '../providers/registry';
+import { isKeyFailure } from '../providers/resilience';
 import { FIM_STOP, buildChatPrompt } from './prompt';
 import { CompletionCache } from './cache';
 import { CompletionModelResolver, ResolvedCompletionModel } from './completionModel';
@@ -136,6 +137,13 @@ export class OpenVSInlineCompletionProvider implements vscode.InlineCompletionIt
 		// both: the user is saying they will wait, and refusing it would leave no way to use a
 		// slow or nearly-spent backend deliberately.
 		if (cached === undefined) {
+			// An explicit invoke is the user asking now, so it is always tried; only the
+			// automatic triggers stand down.
+			const backoff = invoked ? 0 : this.health.backoffSeconds();
+			if (backoff) {
+				this.status.setOutcome('error', `retrying in ${backoff}s`);
+				return undefined;
+			}
 			if (!invoked && this.health.isSlow(settings.slowMs)) {
 				this.status.setOutcome('paused-slow');
 				return undefined;
@@ -229,6 +237,12 @@ export class OpenVSInlineCompletionProvider implements vscode.InlineCompletionIt
 				const message = err instanceof Error ? err.message : String(err);
 				this.log.appendLine(`${new Date().toISOString()} ${resolved.providerId}/${resolved.model} failed: ${message}`);
 				this.status.setOutcome('error', message);
+				this.health.recordFailure();
+				// Quota or a rejected key: the same cooldown chat records, so an automatically
+				// chosen completion model moves to the next candidate instead of retrying this one.
+				if (isKeyFailure(message)) {
+					this.registry.cooldowns.markCooldown(resolved.providerId, resolved.model, message);
+				}
 				return undefined;
 			});
 		} finally {

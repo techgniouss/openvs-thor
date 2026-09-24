@@ -156,5 +156,28 @@ function fakeFetch(responses) {
 	assert.equal(ticks, 2);
 }
 
+// Any other stated error is terminal (RFC 8628 §3.5): polling on left the user watching
+// "waiting for approval" for the code's whole fifteen-minute life over an invalid client.
+{
+	let calls = 0;
+	globalThis.fetch = async () => { calls++; return { ok: false, status: 401, json: async () => ({ error: 'invalid_client', error_description: 'bad id' }) }; };
+	await assert.rejects(() => m.pollDeviceToken(CONFIG, DEVICE, new AbortController().signal), /invalid_client: bad id/);
+	assert.equal(calls, 1);
+}
+
+// A dropped connection, or a 5xx page with no stated error, is transient: the user may already
+// have approved in the browser, so the poll carries on rather than failing the sign-in.
+{
+	let calls = 0;
+	globalThis.fetch = async () => {
+		calls++;
+		if (calls === 1) { throw new TypeError('fetch failed'); }
+		if (calls === 2) { return { ok: false, status: 502, json: async () => { throw new SyntaxError('html'); } }; }
+		return { ok: true, status: 200, json: async () => ({ access_token: 'tok-4', expires_in: 60 }) };
+	};
+	const result = await m.pollDeviceToken(CONFIG, DEVICE, new AbortController().signal);
+	assert.deepStrictEqual([result.accessToken, calls], ['tok-4', 3]);
+}
+
 globalThis.fetch = originalFetch;
 console.log('All device-auth assertions passed.');

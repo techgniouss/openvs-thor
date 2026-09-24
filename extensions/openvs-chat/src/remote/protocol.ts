@@ -43,6 +43,19 @@ export interface HelloFrame {
 export interface WelcomeFrame {
 	readonly c: 'welcome';
 	readonly lastSeq: number;
+	/** Sent to a *client* only: whether a host (VS Code) is connected to this room right now — see {@link HostStatusFrame}. */
+	readonly hostOnline?: boolean;
+}
+
+/**
+ * Sent by the DO to every client when the room's host connects or its last host socket
+ * closes. Without it a phone whose relay link was fine but whose VS Code was closed showed
+ * "Connected" over an app that could never answer — and a `ready` it sent into that empty
+ * room was lost, so it stayed empty after VS Code came back too.
+ */
+export interface HostStatusFrame {
+	readonly c: 'hostStatus';
+	readonly online: boolean;
 }
 
 /** Requests replay from `lastSeq` after a reconnect. */
@@ -147,12 +160,13 @@ export type ControlFrame =
 	| RevokedFrame
 	| PushFrame
 	| ByeFrame
-	| DeviceConnectedFrame;
+	| DeviceConnectedFrame
+	| HostStatusFrame;
 
 /** The full set of valid `ControlFrame['c']` values, used by {@link isControlFrame}. */
 const CONTROL_VERBS: ReadonlySet<string> = new Set([
 	'hello', 'welcome', 'resume', 'snapshotNeeded', 'ping', 'pong', 'pair', 'paired', 'revoke', 'revoked', 'push', 'bye',
-	'deviceConnected',
+	'deviceConnected', 'hostStatus',
 ]);
 
 /** Type guard for {@link Envelope}. Checks shape only — `p`'s inner shape is validated separately by `isControlFrame` when `t === 'c'`. */

@@ -116,9 +116,46 @@ function overlapLength(a: string, b: string): number {
  * Drops a restated prefix. Models frequently echo the code they were given before adding
  * to it; inserted verbatim that duplicates whatever is already on screen. The longest
  * suffix of the prefix that the output opens with is the overlap to remove.
+ *
+ * Except when the overlap is the completion's own opening bracket: at `arr.map(` the correct
+ * continuation `(x) => x * 2)` begins with the `(` the prefix ends with, and stripping it
+ * produced `x) => x * 2)`. Brackets tell the two apart — a real restatement leaves the
+ * completion closing no more than the prefix has open, a stripped opener leaves one extra.
  */
 function stripRestatedPrefix(text: string, prefix: string): string {
-	return text.slice(overlapLength(prefix, text));
+	const stripped = text.slice(overlapLength(prefix, text));
+	if (stripped === text) {
+		return text;
+	}
+	const open = unclosedBrackets(prefix);
+	return excessClosers(stripped) > open && excessClosers(text) <= open ? text : stripped;
+}
+
+/** Brackets `text` leaves open at its end. Strings and comments are not modeled — this only arbitrates an ambiguous overlap. */
+function unclosedBrackets(text: string): number {
+	let depth = 0;
+	for (const ch of text) {
+		if (ch === '(' || ch === '[' || ch === '{') {
+			depth++;
+		} else if (ch === ')' || ch === ']' || ch === '}') {
+			depth = Math.max(0, depth - 1);
+		}
+	}
+	return depth;
+}
+
+/** How many brackets `text` closes that it did not itself open — the ones it closes of the surrounding code. */
+function excessClosers(text: string): number {
+	let depth = 0;
+	let lowest = 0;
+	for (const ch of text) {
+		if (ch === '(' || ch === '[' || ch === '{') {
+			depth++;
+		} else if (ch === ')' || ch === ']' || ch === '}') {
+			lowest = Math.min(lowest, --depth);
+		}
+	}
+	return -lowest;
 }
 
 /**

@@ -57,8 +57,14 @@ function openAuthenticated(url: string, bearerToken: string): WebSocket {
 /** Close code the relay sends to a displaced host — see `room.ts`'s `HOST_TAKEOVER_CLOSE_CODE`. Duplicated as a literal for the same reason as `protocol.ts`: no cross-package import. */
 const HOST_TAKEOVER_CLOSE_CODE = 4003;
 
-const HEARTBEAT_INTERVAL_MS = 25_000;
-const HEARTBEAT_TIMEOUT_MS = 10_000;
+/** How often to ping, how long a pong may take, and how long an opening handshake may take. */
+export interface SocketTiming {
+	readonly heartbeatMs: number;
+	readonly pongTimeoutMs: number;
+	readonly connectTimeoutMs: number;
+}
+
+const DEFAULT_TIMING: SocketTiming = { heartbeatMs: 25_000, pongTimeoutMs: 10_000, connectTimeoutMs: 20_000 };
 const RECONNECT_BASE_MS = 1_000;
 const RECONNECT_MAX_MS = 30_000;
 
@@ -115,6 +121,8 @@ export interface RemoteSocketOptions {
 	readonly relayUrl: string;
 	readonly publicRoomId: string;
 	readonly hostToken: string;
+	/** Overrides for {@link DEFAULT_TIMING}; tests only. */
+	readonly timing?: Partial<SocketTiming>;
 }
 
 /**
@@ -135,6 +143,7 @@ export class RemoteSocket {
 	private seq = 0;
 	private reconnectAttempt = 0;
 	private reconnectTimer?: ReturnType<typeof setTimeout>;
+	private connectTimer?: ReturnType<typeof setTimeout>;
 	private heartbeatTimer?: ReturnType<typeof setInterval>;
 	private pongTimeoutTimer?: ReturnType<typeof setTimeout>;
 	private pingSentAt = 0;
@@ -146,7 +155,11 @@ export class RemoteSocket {
 	private statusHandler?: (status: RemoteSocketStatus) => void;
 	private rttHandler?: (rttMs: number) => void;
 
-	constructor(private readonly options: RemoteSocketOptions) { }
+	private readonly timing: SocketTiming;
+
+	constructor(private readonly options: RemoteSocketOptions) {
+		this.timing = { ...DEFAULT_TIMING, ...options.timing };
+	}
 
 	/** Registers a handler for every incoming envelope, control frames included. Returns a disposer that unregisters just this handler. */
 	onMessage(handler: (envelope: Envelope) => void): Unsubscribe {
@@ -177,7 +190,15 @@ export class RemoteSocket {
 		const url = `${this.options.relayUrl}/ws/host?room=${encodeURIComponent(this.options.publicRoomId)}`;
 		const socket = openAuthenticated(url, this.options.hostToken);
 		this.ws = socket;
+		// A handshake can hang as long as the OS's TCP timeout; give up sooner and retry.
+		this.connectTimer = setTimeout(() => this.abandon(socket, 'connect timeout'), this.timing.connectTimeoutMs);
+		// Every handler checks it is still the current socket: an abandoned one can deliver its
+		// events long after a replacement has taken over, and must not act on the new one's state.
 		socket.addEventListener('open', () => {
+			if (this.ws !== socket) {
+				return;
+			}
+			this.clearConnectTimer();
 			this.reconnectAttempt = 0;
 			this.setStatus('connected');
 			// Auth already happened at the upgrade header, but `HelloFrame.roomToken` exists for
@@ -186,8 +207,12 @@ export class RemoteSocket {
 			this.send(buildHelloEnvelope(this.nextSeq(), this.options.hostToken));
 			this.startHeartbeat();
 		});
-		socket.addEventListener('message', event => this.handleRawMessage((event as MessageEvent).data));
-		socket.addEventListener('close', event => this.handleClose((event as CloseEvent).code));
+		socket.addEventListener('message', event => {
+			if (this.ws === socket) {
+				this.handleRawMessage((event as MessageEvent).data);
+			}
+		});
+		socket.addEventListener('close', event => this.handleClose(socket, (event as CloseEvent).code));
 		// The 'close' handler carries the code and reason; nothing further to do on 'error'
 		// beyond letting the close that follows drive reconnect bookkeeping.
 		socket.addEventListener('error', () => { /* handled by the close event that follows */ });
@@ -218,6 +243,7 @@ export class RemoteSocket {
 		}
 		this.disposed = true;
 		this.stopHeartbeat();
+		this.clearConnectTimer();
 		if (this.reconnectTimer !== undefined) {
 			clearTimeout(this.reconnectTimer);
 			this.reconnectTimer = undefined;
@@ -267,8 +293,12 @@ export class RemoteSocket {
 		}
 	}
 
-	private handleClose(code: number): void {
+	private handleClose(socket: WebSocket, code: number): void {
+		if (this.ws !== socket) {
+			return; // an abandoned socket's close, arriving after its replacement was dialed
+		}
 		this.stopHeartbeat();
+		this.clearConnectTimer();
 		this.ws = undefined;
 		if (this.disposed) {
 			return;
@@ -284,6 +314,28 @@ export class RemoteSocket {
 		this.scheduleReconnect();
 	}
 
+	/**
+	 * Treats `socket` as closed now rather than when its close handshake completes. On a dead
+	 * link (a sleeping laptop, a network switch) that handshake never completes — `close()` only
+	 * *starts* it — and the close event can take minutes to arrive, all of which the phone spent
+	 * disconnected when heartbeat timeout used to just call `close()` and wait.
+	 */
+	private abandon(socket: WebSocket, reason: string): void {
+		try {
+			socket.close(4000, reason);
+		} catch {
+			// already closing
+		}
+		this.handleClose(socket, 4000);
+	}
+
+	private clearConnectTimer(): void {
+		if (this.connectTimer !== undefined) {
+			clearTimeout(this.connectTimer);
+			this.connectTimer = undefined;
+		}
+	}
+
 	private scheduleReconnect(): void {
 		const delay = nextBackoffMs(this.reconnectAttempt);
 		this.reconnectAttempt++;
@@ -296,7 +348,7 @@ export class RemoteSocket {
 	private startHeartbeat(): void {
 		this.stopHeartbeat();
 		this.missedPongs = 0;
-		this.heartbeatTimer = setInterval(() => this.sendPing(), HEARTBEAT_INTERVAL_MS);
+		this.heartbeatTimer = setInterval(() => this.sendPing(), this.timing.heartbeatMs);
 	}
 
 	private stopHeartbeat(): void {
@@ -314,11 +366,15 @@ export class RemoteSocket {
 	private sendPing(): void {
 		this.pingSentAt = Date.now();
 		this.awaitingPong = true;
-		this.send(buildPingEnvelope(this.nextSeq()));
+		// Always seq 0: the relay answers a ping by exact-string match
+		// (`setWebSocketAutoResponse(HEARTBEAT_PING_JSON, …)` in openvs-relay/src/room.ts), and
+		// that string is the seq-0 envelope. Stamped with a real seq, no ping was ever answered,
+		// so the missed-pong check below tore this connection down about once a minute.
+		this.send(buildPingEnvelope(0));
 		if (this.pongTimeoutTimer !== undefined) {
 			clearTimeout(this.pongTimeoutTimer);
 		}
-		this.pongTimeoutTimer = setTimeout(() => this.handleMissedPong(), HEARTBEAT_TIMEOUT_MS);
+		this.pongTimeoutTimer = setTimeout(() => this.handleMissedPong(), this.timing.pongTimeoutMs);
 	}
 
 	private handlePong(): void {
@@ -336,8 +392,8 @@ export class RemoteSocket {
 		}
 		this.missedPongs++;
 		this.awaitingPong = false;
-		if (this.missedPongs >= 2) {
-			this.ws?.close(4000, 'heartbeat timeout');
+		if (this.missedPongs >= 2 && this.ws) {
+			this.abandon(this.ws, 'heartbeat timeout');
 		}
 	}
 }

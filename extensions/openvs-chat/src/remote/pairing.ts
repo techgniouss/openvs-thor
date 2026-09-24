@@ -26,6 +26,8 @@ export interface PairingCode {
 /** {@link PairingCode} plus the full URL the pairing card's QR code encodes — what `RemoteService.pair()` actually returns. */
 export interface PairingResult extends PairingCode {
 	readonly url: string;
+	/** Help shown under the QR code when the address may not open on the phone — see `RemoteService.pair`. */
+	readonly hint?: string;
 }
 
 /**
@@ -70,30 +72,35 @@ const REVOKE_TIMEOUT_MS = 10_000;
  * Used to be fire-and-forget, which gave a caller no way to tell "the relay has actually
  * processed this" from "the message is still in flight" — `remoteService.ts`'s device list
  * refresh right after a revoke click raced that gap and could show the just-revoked device as
- * still active. Resolves on timeout rather than rejecting: the revoke was still sent, and a
- * caller that only wants to know when it's safe to refresh the list should not treat "the ack
- * was slow" as "the revoke failed" — `sweepDeviceAge`'s unattended background call and the
- * in-panel button both just want to proceed once this settles, either way.
+ * still active. Resolves `false` on timeout rather than rejecting: the revoke was sent and may
+ * yet land, and a caller refreshing the list (the relay's list is the truth) should proceed —
+ * but one telling the user "revoked" needs to know it was not confirmed.
+ *
+ * Rejects at once when the socket is not connected: `sendControl` is then a no-op, so the old
+ * "resolve after the timeout" reported a revoke that was never sent as done.
  */
-export function revokeDevice(socket: RemoteSocket, deviceId: string): Promise<void> {
-	return new Promise<void>(resolve => {
+export function revokeDevice(socket: RemoteSocket, deviceId: string): Promise<boolean> {
+	if (socket.getStatus() !== 'connected') {
+		return Promise.reject(new Error('Remote control is not connected to its relay, so the device was not revoked. Try again once it reconnects.'));
+	}
+	return new Promise<boolean>(resolve => {
 		let settled = false;
-		const finish = () => {
+		const finish = (confirmed: boolean) => {
 			if (settled) {
 				return;
 			}
 			settled = true;
 			clearTimeout(timer);
 			subscription.dispose();
-			resolve();
+			resolve(confirmed);
 		};
 		const subscription = socket.onMessage((envelope: Envelope) => {
 			if (envelope.t !== 'c' || !isControlFrame(envelope.p) || envelope.p.c !== 'revoked' || envelope.p.deviceId !== deviceId) {
 				return;
 			}
-			finish();
+			finish(true);
 		});
-		const timer = setTimeout(finish, REVOKE_TIMEOUT_MS);
+		const timer = setTimeout(() => finish(false), REVOKE_TIMEOUT_MS);
 		socket.sendControl({ c: 'revoke', deviceId });
 	});
 }

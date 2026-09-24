@@ -12,11 +12,12 @@ import { ChatViewProvider, InlineKind } from './chatViewProvider';
 import { registerInlineCompletions } from './completions/inlineProvider';
 import { StatsRow } from './completions/stats';
 import { generateCommitMessage } from './git/commitMessage';
-import { McpManager } from './mcp/manager';
+import { McpManager, promptingConsent, rememberProjectConsent } from './mcp/manager';
 import { loadEnvFile } from './oauth';
 import { ProviderRegistry } from './providers/registry';
 import { setStreamIdleTimeout } from './providers/types';
 import { getRelayUrl, isRemoteEnabled } from './remote/config';
+import { ensureCloudflared, getRelayMode, TUNNEL_TOKEN_KEY } from './remote/local/localHosting';
 import { deployRelay } from './remote/deploy';
 import { RemoteService } from './remote/remoteService';
 import { SkillRegistry } from './skills';
@@ -50,7 +51,7 @@ export function activate(context: vscode.ExtensionContext): void {
 	const registry = new ProviderRegistry(context.secrets);
 	const router = new RoleRouter(registry);
 	const auth = new WebAuthManager(registry);
-	const mcp = new McpManager();
+	const mcp = new McpManager(promptingConsent(context.workspaceState));
 	const viewProvider = new ChatViewProvider(context, registry, auth, mcp);
 	activeViewProvider = viewProvider;
 	context.subscriptions.push(mcp);
@@ -105,9 +106,11 @@ export function activate(context: vscode.ExtensionContext): void {
 		}),
 		vscode.commands.registerCommand('openvsChat.selectSkill', () => selectSkill(viewProvider, context.extensionUri)),
 		vscode.commands.registerCommand('openvsChat.createSkill', () => createSkill(viewProvider)),
-		vscode.commands.registerCommand('openvsChat.mcpAdd', () => mcpAdd(mcp)),
+		vscode.commands.registerCommand('openvsChat.mcpAdd', () => mcpAdd(mcp, context.workspaceState)),
 		vscode.commands.registerCommand('openvsChat.mcpOpenConfig', () => mcpOpenConfig()),
-		vscode.commands.registerCommand('openvsChat.remoteEnable', () => remoteEnable()),
+		vscode.commands.registerCommand('openvsChat.remoteEnable', (options?: { quiet?: boolean }) => remoteEnable(remoteService, options?.quiet === true)),
+		vscode.commands.registerCommand('openvsChat.remoteInstallCloudflared', () => remoteInstallCloudflared(context)),
+		vscode.commands.registerCommand('openvsChat.remoteSetTunnel', () => remoteSetTunnel(context)),
 		vscode.commands.registerCommand('openvsChat.remoteStatus', () => remoteStatus(remoteService)),
 		vscode.commands.registerCommand('openvsChat.remoteDeployRelay', () => remoteDeployRelay(context, registry)),
 		vscode.commands.registerCommand('openvsChat.generateCommitMessage', (rootUri?: vscode.Uri, _resourceGroups?: unknown, token?: vscode.CancellationToken) => {
@@ -150,7 +153,7 @@ export function activate(context: vscode.ExtensionContext): void {
 	// starting settings: the Settings UI (or a hand edit of settings.json) can flip
 	// `remote.enabled` on, or clear `relayUrl`, without ever going through `remoteEnable()`.
 	context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
-		if (e.affectsConfiguration('openvsChat.remote.enabled') || e.affectsConfiguration('openvsChat.remote.relayUrl')) {
+		if (['enabled', 'relayUrl', 'relayMode'].some(key => e.affectsConfiguration(`openvsChat.remote.${key}`))) {
 			void warnIfRemoteMisconfigured(context);
 		}
 	}));
@@ -181,7 +184,8 @@ const REMOTE_DEPLOY_NUDGE_DISMISSED_KEY = 'openvsChat.remote.deployNudgeDismisse
  * in `remote/config.ts`), so a window with nothing to pair has nothing this nudge would unblock.
  */
 async function warnIfRemoteMisconfigured(context: vscode.ExtensionContext): Promise<void> {
-	if (!isRemoteEnabled() || getRelayUrl()) {
+	// Local hosting needs no relay URL — only an explicit "hosted" choice with none set is broken.
+	if (!isRemoteEnabled() || getRelayMode() === 'local' || getRelayUrl()) {
 		// Resolved, or no longer enabled — reset so a later re-enable-without-relay nudges again.
 		await context.globalState.update(REMOTE_DEPLOY_NUDGE_DISMISSED_KEY, false);
 		return;
@@ -419,7 +423,7 @@ async function createSkill(view: ChatViewProvider): Promise<void> {
  * settings), the server id and the launch command, then reconnects so its tools are
  * available to the agent right away.
  */
-async function mcpAdd(mcp: McpManager): Promise<void> {
+async function mcpAdd(mcp: McpManager, workspaceState: vscode.Memento): Promise<void> {
 	const root = vscode.workspace.workspaceFolders?.[0]?.uri;
 	const target = await vscode.window.showQuickPick(
 		[
@@ -493,6 +497,8 @@ async function mcpAdd(mcp: McpManager): Promise<void> {
 		}
 		config.servers[id] = entry;
 		await vscode.workspace.fs.writeFile(file, new TextEncoder().encode(JSON.stringify(config, null, '\t') + '\n'));
+		// Added by the user, here and now: not a repository's server to ask them about.
+		await rememberProjectConsent(workspaceState, id, JSON.parse(JSON.stringify(entry)));
 	} else {
 		const cfg = vscode.workspace.getConfiguration('openvsChat');
 		const servers = { ...(cfg.get<Record<string, unknown>>('mcp.servers') ?? {}) };
@@ -527,11 +533,28 @@ async function mcpOpenConfig(): Promise<void> {
  * configured yet — explains what's missing instead. There is no default relay; the user
  * deploys their own via `wrangler deploy` first.
  */
-async function remoteEnable(): Promise<void> {
+async function remoteEnable(remoteService: RemoteService, quiet = false): Promise<void> {
+	if (getRelayMode() === 'local') {
+		// The user asked for remote: local hosting may install cloudflared without asking again.
+		remoteService.enableRequested();
+		await vscode.workspace.getConfiguration('openvsChat').update('remote.enabled', true, vscode.ConfigurationTarget.Global);
+		// `quiet`: turned on from the Settings panel's own switch, which is already showing
+		// where to pair — the "Pair a Device" nudge would only point back at it.
+		if (quiet) {
+			return;
+		}
+		const choice = await vscode.window.showInformationMessage(
+			'OpenVS remote control is on. OpenVS runs the relay on this machine and reaches your phone through Cloudflare Tunnel — pair a device from Settings → Remote control.',
+			'Pair a Device');
+		if (choice) {
+			await vscode.commands.executeCommand('openvsChat.openSettings');
+		}
+		return;
+	}
 	if (!getRelayUrl()) {
 		const action = await vscode.window.showWarningMessage(
-			'Set "openvsChat.remote.relayUrl" to your own deployed relay before enabling remote control — there is no default relay. '
-			+ 'Run "OpenVS Thor: Remote: Deploy Your Own Relay" to do that in one step.',
+			'Remote relay mode is set to "hosted", but no relay URL is set. Set "openvsChat.remote.relayMode" to "auto" to have OpenVS host the relay on this computer, '
+			+ 'or run "OpenVS Thor: Remote: Deploy Your Own Relay" to deploy one to Cloudflare.',
 			'Deploy Your Own Relay');
 		if (action) {
 			await vscode.commands.executeCommand('openvsChat.remoteDeployRelay');
@@ -541,6 +564,60 @@ async function remoteEnable(): Promise<void> {
 	await vscode.workspace.getConfiguration('openvsChat').update('remote.enabled', true, vscode.ConfigurationTarget.Global);
 	vscode.window.showInformationMessage(
 		'OpenVS remote control is enabled. Open ⚙ Providers & settings → Remote control to pair a device.');
+}
+
+/**
+ * `openvsChat.remoteInstallCloudflared`: installs Cloudflare's official `cloudflared` into this
+ * extension's storage (or reports the one already on the machine) — the manual path to what
+ * local hosting otherwise does on its own the first time remote is turned on.
+ */
+async function remoteInstallCloudflared(context: vscode.ExtensionContext): Promise<void> {
+	const binary = await ensureCloudflared(context, false);
+	if (binary) {
+		vscode.window.showInformationMessage(`Cloudflare Tunnel is ready: ${binary}`);
+	}
+}
+
+/**
+ * `openvsChat.remoteSetTunnel`: switches local hosting from a quick tunnel (a random address
+ * that changes on every restart, so phones re-pair) to the user's own named tunnel, whose
+ * hostname never changes. Takes the hostname and the tunnel's connector token from the
+ * Cloudflare dashboard (Zero Trust → Networks → Tunnels → the tunnel's install command); the
+ * token goes to SecretStorage, never settings. An empty hostname goes back to a quick tunnel.
+ */
+async function remoteSetTunnel(context: vscode.ExtensionContext): Promise<void> {
+	const cfg = vscode.workspace.getConfiguration('openvsChat');
+	const hostname = await vscode.window.showInputBox({
+		title: 'Use My Cloudflare Tunnel (1/2)',
+		prompt: 'Public hostname of your named tunnel, routed to http://localhost:8787 (or your "openvsChat.remote.localPort"). Leave empty to go back to a quick tunnel.',
+		placeHolder: 'remote.example.com',
+		value: cfg.get<string>('remote.tunnelHostname') ?? '',
+		ignoreFocusOut: true,
+	});
+	if (hostname === undefined) {
+		return;
+	}
+	const clean = hostname.trim().replace(/^https?:\/\//, '').replace(/\/+$/, '');
+	if (!clean) {
+		await context.secrets.delete(TUNNEL_TOKEN_KEY);
+		await cfg.update('remote.tunnelHostname', '', vscode.ConfigurationTarget.Global);
+		vscode.window.showInformationMessage('OpenVS Remote is back on a quick tunnel.');
+		return;
+	}
+	const token = await vscode.window.showInputBox({
+		title: 'Use My Cloudflare Tunnel (2/2)',
+		prompt: 'Your tunnel connector token: the long value after "--token" in the install command the dashboard shows.',
+		password: true,
+		ignoreFocusOut: true,
+		validateInput: value => value.trim().length > 20 ? undefined : 'Paste the full tunnel token.',
+	});
+	if (!token) {
+		return;
+	}
+	await context.secrets.store(TUNNEL_TOKEN_KEY, token.trim());
+	// Written last: this change is what restarts local hosting, and it must find the token.
+	await cfg.update('remote.tunnelHostname', clean, vscode.ConfigurationTarget.Global);
+	vscode.window.showInformationMessage(`OpenVS Remote will use https://${clean}. Pair your phone once more; after that the address never changes.`);
 }
 
 /**
@@ -656,7 +733,7 @@ async function remoteDeployRelay(context: vscode.ExtensionContext, registry: Pro
 	const choice = await vscode.window.showInformationMessage(
 		`OpenVS relay deployed at ${result.url}. Enable remote control now?`, 'Enable Remote Control');
 	if (choice) {
-		await remoteEnable();
+		await vscode.commands.executeCommand('openvsChat.remoteEnable');
 	}
 }
 

@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { randomBytes } from 'crypto';
 import * as vscode from 'vscode';
 import { signInAnthropic, signInAntigravity, signInOpenAI, signInOpenRouter, supportsNativeSignIn } from './oauth';
 import { ProviderRegistry } from './providers/registry';
@@ -58,7 +59,9 @@ export class WebAuthManager implements vscode.UriHandler {
 			throw new Error('No web sign-in URL is configured for this provider. Set "openvsChat.' + providerId + '.authUrl" or add an API key instead.');
 		}
 
-		const state = `${providerId}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		// The only thing standing between a crafted `vscode://…/auth-callback` link (any web page
+		// can open one) and the key store, so it must be unguessable — not Math.random.
+		const state = `${providerId}-${randomBytes(24).toString('hex')}`;
 		const callbackUri = await vscode.env.asExternalUri(
 			vscode.Uri.parse(`${vscode.env.uriScheme}://openvs.openvs-chat${CALLBACK_PATH}?state=${encodeURIComponent(state)}`),
 		);

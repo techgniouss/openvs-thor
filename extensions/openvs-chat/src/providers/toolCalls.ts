@@ -145,7 +145,19 @@ function* repairs(text: string): Generator<string> {
 	if (body !== unfenced) {
 		yield body;
 	}
-	const literals = body
+	// A Python dict (`{'path': 'a.ts'}`), then raw control characters inside strings — a
+	// `write_file` whose content carries literal line breaks, the commonest malformation of all
+	// from weak models, which JSON.parse refuses outright. Each is yielded on its own too, so
+	// an input that needed only that fix parses before a later rewrite can touch it.
+	const quoted = pythonQuotes(body);
+	if (quoted !== body) {
+		yield quoted;
+	}
+	const escaped = escapeControlChars(quoted);
+	if (escaped !== quoted) {
+		yield escaped;
+	}
+	const literals = escaped
 		.replace(/(^|[[{,:]\s*)True(\s*[,}\]]|$)/g, '$1true$2')
 		.replace(/(^|[[{,:]\s*)False(\s*[,}\]]|$)/g, '$1false$2')
 		.replace(/(^|[[{,:]\s*)(None|NaN|undefined)(\s*[,}\]]|$)/g, '$1null$3');
@@ -157,6 +169,68 @@ function* repairs(text: string): Generator<string> {
 	if (closed !== commas) {
 		yield closed;
 	}
+}
+
+/**
+ * Rewrites single-quoted strings as double-quoted ones, leaving double-quoted strings (and the
+ * apostrophes inside them) untouched. Only ever tried on text that already failed to parse.
+ */
+function pythonQuotes(text: string): string {
+	if (!text.includes('\'')) {
+		return text;
+	}
+	let out = '';
+	let quote: string | undefined;
+	let escaped = false;
+	for (const ch of text) {
+		if (!quote) {
+			if (ch === '"' || ch === '\'') {
+				quote = ch;
+				out += '"';
+			} else {
+				out += ch;
+			}
+		} else if (escaped) {
+			escaped = false;
+			// `\'` means nothing in JSON; inside a single-quoted string it is just the quote.
+			out += quote === '\'' && ch === '\'' ? '\'' : `\\${ch}`;
+		} else if (ch === '\\') {
+			escaped = true;
+		} else if (ch === quote) {
+			quote = undefined;
+			out += '"';
+		} else {
+			out += quote === '\'' && ch === '"' ? '\\"' : ch;
+		}
+	}
+	return out;
+}
+
+/** Escapes raw control characters (line breaks, tabs, …) found inside double-quoted strings. */
+function escapeControlChars(text: string): string {
+	let out = '';
+	let inString = false;
+	let escaped = false;
+	for (const ch of text) {
+		if (!inString) {
+			inString = ch === '"';
+			out += ch;
+		} else if (escaped) {
+			escaped = false;
+			out += ch;
+		} else if (ch === '\\') {
+			escaped = true;
+			out += ch;
+		} else if (ch === '"') {
+			inString = false;
+			out += ch;
+		} else if (ch < ' ') {
+			out += ch === '\n' ? '\\n' : ch === '\r' ? '\\r' : ch === '\t' ? '\\t' : `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`;
+		} else {
+			out += ch;
+		}
+	}
+	return out;
 }
 
 /** Removes a surrounding ``` fence, with or without a language tag. */

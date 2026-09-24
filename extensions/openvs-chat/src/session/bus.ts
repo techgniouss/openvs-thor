@@ -70,13 +70,31 @@ export class SessionBus {
 			if (chatOnly && !sink.wantsChat) {
 				continue;
 			}
-			sink.post(message);
+			deliver(sink, message);
+		}
+	}
+
+	/**
+	 * Broadcasts like {@link post}, skipping the sink `exceptId` — for state a client already
+	 * applied to itself optimistically (a user turn it echoed the moment it hit Send), which
+	 * every *other* client still has to be told about.
+	 */
+	postExcept(exceptId: string, message: Record<string, unknown> & { type: string }): void {
+		const chatOnly = this.chatOnlyTypes.has(message.type);
+		for (const sink of this.sinks.values()) {
+			if (sink.id === exceptId || (chatOnly && !sink.wantsChat)) {
+				continue;
+			}
+			deliver(sink, message);
 		}
 	}
 
 	/** Posts to exactly one sink by id. Silently no-ops if that sink isn't registered. */
 	postTo(sinkId: string, message: Record<string, unknown> & { type: string }): void {
-		this.sinks.get(sinkId)?.post(message);
+		const sink = this.sinks.get(sinkId);
+		if (sink) {
+			deliver(sink, message);
+		}
 	}
 
 	/** True if any registered sink can render chat traffic. */
@@ -92,5 +110,18 @@ export class SessionBus {
 	/** Every registered sink of a given kind. Unused before a later phase adds a remote sink. */
 	sinksOfKind(kind: MessageSink['kind']): MessageSink[] {
 		return [...this.sinks.values()].filter(sink => sink.kind === kind);
+	}
+}
+
+/**
+ * Posts to one sink without letting it fail the others. A sink that throws (a transport
+ * that closed mid-post) would otherwise skip every sink after it and surface in whatever
+ * posted — typically a running agent's callback, which would end the run over a display.
+ */
+function deliver(sink: MessageSink, message: Record<string, unknown> & { type: string }): void {
+	try {
+		sink.post(message);
+	} catch (err) {
+		console.warn(`OpenVS: could not deliver "${message.type}" to ${sink.kind} sink ${sink.id}.`, err);
 	}
 }

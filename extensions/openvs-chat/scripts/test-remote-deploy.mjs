@@ -267,6 +267,16 @@ const DEPLOYED = { code: 0, output: 'Deployed openvs-relay triggers\n  https://o
 	assert.strictEqual(runProcess.calls.length, 3, 'a failed list must not skip minting a pepper on first deploy');
 }
 
+// 12b. Any *other* list failure stops before a pepper is minted: replacing the existing one
+// invalidates every device token and pairing code, so a network blip or an expired login used
+// to sign out every paired phone.
+{
+	const runProcess = fakeRunner([{ code: 1, output: '✘ [ERROR] fetch failed: ETIMEDOUT' }]);
+	const result = await deployRelay({ relayDir: '/repo/openvs-relay', skipInstall: true, env: {}, runProcess, randomPepper: () => 'p' });
+	assert.deepStrictEqual([result.ok, result.step, runProcess.calls.length], [false, 'secret', 1]);
+	assert.match(result.output, /RELAY_PEPPER was left untouched/);
+}
+
 // 13. The cancellation signal, when supplied, is forwarded to every process invocation
 // unchanged — deployRelay adds no cancellation logic of its own; a killed step's process
 // simply reports a non-zero/null exit code, which the existing step-failure checks already

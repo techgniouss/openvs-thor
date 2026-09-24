@@ -85,7 +85,7 @@ export const CHAT_APP_HTML = `
 			<label class="review-toggle"><input type="checkbox" id="completionsEnabled" /> Inline completions — suggest code as you type</label>
 
 			<div class="settings-header"><h2>Remote control</h2></div>
-			<p class="hint">Pair a phone or another device to drive this chat panel remotely — send messages, steer runs, and answer approval prompts from anywhere. Requires <code>openvsChat.remote.enabled</code> and your own deployed relay (<code>openvsChat.remote.relayUrl</code>) — run <strong>OpenVS Thor: Remote: Deploy Your Own Relay</strong> from the Command Palette to set one up in one step, then <strong>OpenVS Thor: Remote: Enable Remote Control</strong>.</p>
+			<p class="hint">Pair a phone to drive this chat panel from anywhere: send messages, switch and create chats, steer runs, and answer approval prompts. Turn it on below. By default OpenVS runs the relay on this computer and reaches your phone through Cloudflare Tunnel (installed for you if needed), so there is nothing to deploy. To use a relay you deployed to Cloudflare instead, set <code>openvsChat.remote.relayUrl</code>.</p>
 			<div id="remotePanel"></div>
 		</section>
 

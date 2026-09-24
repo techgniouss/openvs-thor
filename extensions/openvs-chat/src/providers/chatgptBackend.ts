@@ -9,6 +9,7 @@ import {
 	StreamChatResult, ToolCall, apiFetch, describeHttpError, readSSE, retryNotice,
 } from './types';
 import { parseToolArgs } from './toolCalls';
+import { CLOSE_MARK, OPEN_MARK } from '../persona/thinking';
 
 /**
  * Transport for ChatGPT subscription sign-ins (no API key): talks to the ChatGPT
@@ -70,9 +71,21 @@ function headers(accessToken: string): Record<string, string> {
 }
 
 /** The backend only serves Codex models; map anything else onto the default. */
-function normalizeModel(model: string): string {
-	return CHATGPT_MODELS.includes(model) ? model : CHATGPT_MODELS[0];
+/**
+ * The model to request: `model` when a ChatGPT sign-in can serve it, otherwise the first
+ * that can — said out loud, since the reply would otherwise be credited to a model that
+ * never ran (a model setting left over from an API key, say).
+ */
+function normalizeModel(model: string, onNotice?: (text: string) => void): string {
+	if (CHATGPT_MODELS.includes(model)) {
+		return model;
+	}
+	onNotice?.(`${model} isn't available with a ChatGPT sign-in, so ${CHATGPT_MODELS[0]} answered instead. Pick one of ${CHATGPT_MODELS.join(', ')}.`);
+	return CHATGPT_MODELS[0];
 }
+
+/** Asks for the reasoning summary Codex streams, so a long think is visible rather than a silent pause. */
+const REASONING = { summary: 'auto' };
 
 type ResponseItem = Record<string, unknown>;
 
@@ -147,14 +160,26 @@ async function streamResponses(
 	onToken?: (delta: string) => void,
 	onNotice?: (text: string) => void,
 ): Promise<StreamResult> {
-	const response = await apiFetch(CHATGPT_RESPONSES_URL, {
+	const post = (payload: Record<string, unknown>) => apiFetch(CHATGPT_RESPONSES_URL, {
 		method: 'POST',
 		headers: headers(accessToken),
-		body: JSON.stringify(body),
+		body: JSON.stringify(payload),
 	}, signal, {
 		...STREAM_FETCH_OPTS,
 		onRetry: info => onNotice?.(retryNotice(label, info)),
 	});
+	let response = await post(body);
+	// The reasoning summary is what Codex itself asks for, but this backend is undocumented:
+	// if it ever refuses the field, the request is worth more than the summary.
+	if (!response.ok && response.status === 400 && body.reasoning !== undefined) {
+		const text = await response.clone().text().catch(() => '');
+		if (/reasoning/i.test(text)) {
+			await response.body?.cancel().catch(() => { /* already closed */ });
+			const withoutReasoning = { ...body };
+			delete withoutReasoning.reasoning;
+			response = await post(withoutReasoning);
+		}
+	}
 	if (!response.ok) {
 		throw new Error(await describeHttpError(label, response));
 	}
@@ -163,6 +188,15 @@ async function streamResponses(
 	let truncated = false;
 	let finishReason: FinishReason | undefined;
 	const toolCalls: ToolCall[] = [];
+	// The reasoning summary streams between the transcript's thinking marks, as every other
+	// provider's reasoning does; it is never part of `content`.
+	let reasoningOpen = false;
+	const closeReasoning = () => {
+		if (reasoningOpen) {
+			onToken?.(CLOSE_MARK);
+			reasoningOpen = false;
+		}
+	};
 	await readSSE(response, data => {
 		let event: any;
 		try {
@@ -171,8 +205,18 @@ async function streamResponses(
 			return;
 		}
 		switch (event?.type) {
+			case 'response.reasoning_summary_text.delta':
+				if (typeof event.delta === 'string' && event.delta) {
+					if (!reasoningOpen) {
+						onToken?.(OPEN_MARK);
+						reasoningOpen = true;
+					}
+					onToken?.(event.delta);
+				}
+				break;
 			case 'response.output_text.delta':
 				if (typeof event.delta === 'string') {
+					closeReasoning();
 					content += event.delta;
 					onToken?.(event.delta);
 				}
@@ -200,14 +244,16 @@ async function streamResponses(
 				throw new Error(`${label}: ${event?.response?.error?.message ?? event?.message ?? 'stream error'}`);
 		}
 	}, signal, { label, sawTerminal: () => finishReason !== undefined });
+	closeReasoning();
 	return { content, toolCalls, truncated, finishReason };
 }
 
 export async function chatgptStreamChat(label: string, request: ChatRequest): Promise<StreamChatResult> {
 	const { truncated, finishReason } = await streamResponses(label, request.apiKey, {
-		model: normalizeModel(request.model),
+		model: normalizeModel(request.model, request.onNotice),
 		instructions: systemText(request.messages),
 		input: toInputItems(request.messages),
+		reasoning: REASONING,
 		store: false,
 		stream: true,
 	}, request.signal, request.onToken, request.onNotice);
@@ -216,9 +262,10 @@ export async function chatgptStreamChat(label: string, request: ChatRequest): Pr
 
 export async function chatgptAgentStep(label: string, request: AgentRequest): Promise<AgentStep> {
 	return streamResponses(label, request.apiKey, {
-		model: normalizeModel(request.model),
+		model: normalizeModel(request.model, request.onNotice),
 		instructions: systemText(request.messages),
 		input: toInputItems(request.messages),
+		reasoning: REASONING,
 		tools: request.tools.map(t => ({
 			type: 'function',
 			name: t.name,

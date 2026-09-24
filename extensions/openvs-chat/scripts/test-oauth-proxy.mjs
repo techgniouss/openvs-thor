@@ -84,4 +84,64 @@ class FakeProxy extends m.OAuthProxyChatProvider {
 	assert.equal(p.mintCalls, 1, 'concurrent calls for the same credential share one mint');
 }
 
+// The shared mint is not tied to the first caller's signal: a Stop in the tab that happened
+// to start it used to fail the same request in every other tab waiting on it.
+{
+	class SlowProxy extends m.OAuthProxyChatProvider {
+		constructor() { super(); this.release = undefined; this.sawAbort = false; }
+		get info() { return FAKE_INFO; }
+		mintToken(cred, signal) {
+			signal.addEventListener('abort', () => { this.sawAbort = true; });
+			return new Promise(resolve => { this.release = () => resolve({ token: `wire-${cred}`, expiresAt: Date.now() + 30 * 60_000 }); });
+		}
+		testWireToken(cred, signal) { return this.wireToken(cred, signal); }
+	}
+	const p = new SlowProxy();
+	const first = new AbortController();
+	const a = p.testWireToken('cred', first.signal);
+	const b = p.testWireToken('cred', new AbortController().signal);
+	first.abort();
+	await assert.rejects(a, err => err.name === 'AbortError', 'the tab that stopped stops');
+	p.release();
+	assert.equal(await b, 'wire-cred', 'the other tab still gets its token');
+	assert.equal(p.sawAbort, false, 'and the mint itself was never cancelled');
+}
+
+// A 401 drops the cached token and re-mints once; any other failure is not retried.
+{
+	const p = new FakeProxy();
+	const used = [];
+	const result = await p.withWireSession('cred', new AbortController().signal, async session => {
+		used.push(session.token);
+		if (used.length === 1) { throw new Error('Fake: authentication failed (HTTP 401). token revoked'); }
+		return 'ok';
+	});
+	assert.deepStrictEqual([result, used], ['ok', ['wire-cred-1', 'wire-cred-2']]);
+	let calls = 0;
+	await assert.rejects(p.withWireSession('cred', new AbortController().signal, async () => { calls++; throw new Error('Fake: rate limited (HTTP 429)'); }), /429/);
+	assert.equal(calls, 1);
+}
+
+// A refreshed credential is saved over the old one, and later requests still carrying the old
+// string mint from the new one — a rotated refresh token is single-use.
+{
+	class RotatingProxy extends m.OAuthProxyChatProvider {
+		constructor() { super(); this.minted = []; }
+		get info() { return FAKE_INFO; }
+		async mintToken(cred) {
+			this.minted.push(cred);
+			return { token: `wire-for-${cred}`, expiresAt: Date.now() + 60_000, updatedCredential: `${cred}+` };
+		}
+		testWireToken(cred, signal) { return this.wireToken(cred, signal); }
+	}
+	const p = new RotatingProxy();
+	const saved = [];
+	p.setCredentialPersister(async (previous, next) => { saved.push([previous, next]); });
+	await p.testWireToken('rt1', new AbortController().signal);
+	// Inside the 5-minute margin, so the next call mints again — from the successor.
+	await p.testWireToken('rt1', new AbortController().signal);
+	assert.deepStrictEqual(p.minted, ['rt1', 'rt1+']);
+	assert.deepStrictEqual(saved, [['rt1', 'rt1+'], ['rt1+', 'rt1++']]);
+}
+
 console.log('All oauth-proxy assertions passed.');
