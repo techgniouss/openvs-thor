@@ -290,4 +290,84 @@ assert.strictEqual(m.parseTokenLimit('Rate limit reached, retry limit 3 exceeded
 	assert.strictEqual(m.estimateToolsTokens(tools), described + bare, 'tools sum');
 }
 
+// The compact-prompt fallback: when the fixed part of a request (system prompt + tool
+// schemas) takes more than half the budget, the compact prompt is used instead.
+{
+	assert.strictEqual(m.needsCompactPrompt(1_000, 2_000, 20_000), false, 'a roomy budget keeps the full prompt');
+	assert.strictEqual(m.needsCompactPrompt(3_000, 2_000, 5_400), true, 'Groq 8k: 5k fixed of a 5.4k budget');
+	assert.strictEqual(m.needsCompactPrompt(100_000, 0, 0), false, 'budget 0 means trimming is off, and so is this');
+
+	const msgs = [{ role: 'system', content: 'FULL' }, { role: 'user', content: 'go' }];
+	const swapped = m.withSystemPrompt(msgs, 'SHORT');
+	assert.deepStrictEqual(swapped.map(x => x.content), ['SHORT', 'go']);
+	assert.strictEqual(msgs[0].content, 'FULL', 'the caller\'s array is never rewritten');
+	const noSystem = [{ role: 'user', content: 'go' }];
+	assert.strictEqual(m.withSystemPrompt(noSystem, 'SHORT'), noSystem, 'nothing to replace, nothing changes');
+
+	const [compact] = m.compactToolSpecs([{
+		name: 'grep',
+		description: 'Search files. Returns matching lines. Use sparingly.',
+		parameters: {
+			type: 'object',
+			properties: {
+				glob: { type: 'string', description: 'Glob, e.g. "src/**/*.ts". Defaults to all files.' },
+				// A parameter literally named "description" is a schema, not prose.
+				description: { type: 'string', description: 'A label. Optional.' },
+			},
+			required: ['glob'],
+		},
+	}]);
+	assert.deepStrictEqual(compact, {
+		name: 'grep',
+		description: 'Search files.',
+		parameters: {
+			type: 'object',
+			properties: {
+				glob: { type: 'string', description: 'Glob, e.g. "src/**/*.ts".' },
+				description: { type: 'string', description: 'A label.' },
+			},
+			required: ['glob'],
+		},
+	}, 'first sentence only, examples after "e.g." kept, structure untouched');
+}
+
+// Attached context is the last resort of trimming: cut from the end once nothing else is
+// left, while the system prompt and the user's own words stay whole.
+{
+	const msgs = [
+		{ role: 'system', content: 'SYS' },
+		m.contextTurn('FILE HEAD ' + 'x'.repeat(40_000)),
+		{ role: 'user', content: 'explain this file' },
+	];
+	const out = m.trimMessages(msgs, 2_000);
+	assert.ok(m.estimateMessagesTokens(out) <= 2_000, `fits: ${m.estimateMessagesTokens(out)}`);
+	assert.strictEqual(out[0].content, 'SYS');
+	assert.strictEqual(out[2].content, 'explain this file', 'the request is untouched');
+	assert.ok(out[1].content.startsWith('Context for the request:\n\nFILE HEAD'), 'the context keeps its beginning');
+	assert.ok(out[1].content.endsWith(m.CONTEXT_CUT_MARKER), 'and says it was cut');
+	// A plain user turn of the same size is never cut — it is the task.
+	const task = [{ role: 'system', content: 'SYS' }, { role: 'user', content: 'y'.repeat(40_000) }];
+	assert.strictEqual(m.trimMessages(task, 2_000)[1].content.length, 40_000);
+}
+
+// The preflight: refuse up front, with a fix, what trimming can never make fit.
+{
+	const base = { model: 'tiny', budget: 5_400, instructions: 'x'.repeat(4_000) };
+	assert.strictEqual(m.unfittableRequest({ ...base, message: 'hello' }), undefined);
+	assert.match(m.unfittableRequest({ ...base, message: 'y'.repeat(40_000) }) ?? '', /Your message is ~10k tokens, and tiny accepts ~5k/);
+	assert.match(m.unfittableRequest({ ...base, message: 'fix it', wholeFile: 'z'.repeat(20_000) }) ?? '', /too large for tiny .* to rewrite whole/);
+	assert.strictEqual(m.unfittableRequest({ ...base, message: 'fix it', wholeFile: 'z'.repeat(8_000) }), undefined, 'a file within half the budget is fine');
+	assert.strictEqual(m.unfittableRequest({ ...base, budget: 0, message: 'y'.repeat(400_000) }), undefined, 'budget 0 disables it');
+}
+
+// capToolOutput keeps a result's head and tail and names what it dropped.
+{
+	assert.strictEqual(m.capToolOutput('short', 100), 'short');
+	assert.strictEqual(m.capToolOutput('x'.repeat(1_000), 0), 'x'.repeat(1_000), '0 means no cap');
+	const out = m.capToolOutput('HEAD' + 'm'.repeat(10_000) + 'TAIL exit code 1', 900);
+	assert.ok(out.startsWith('HEAD') && out.endsWith('TAIL exit code 1'), 'head and tail (a command\'s exit status) survive');
+	assert.match(out, /9\d{3} characters omitted/);
+	assert.ok(out.length < 1_100);
+}
+
 console.log('test-context: all assertions passed');

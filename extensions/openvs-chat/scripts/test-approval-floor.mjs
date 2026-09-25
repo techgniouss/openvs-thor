@@ -107,7 +107,7 @@ const { APPROVAL_POLICIES, applyApprovalFloor } = await import(new URL('../out/a
 	// feature a no-op while every static pin above still passes. `runAgent`/`runReadOnlyAgent`
 	// both take `guardrails` as their trailing argument; `new AutoOrchestrator(...)` takes it
 	// as its trailing constructor argument.
-	assert.ok(/runAgent\(provider, messages, \{ \.\.\.params, signal: controller\.signal \}, post, sessionId, runId, keepHead, guardrails\)/.test(handleSend),
+	assert.ok(/runAgent\(provider, messages, \{ \.\.\.params, signal: controller\.signal \}, post, sessionId, runId, keepHead, prompts\.compact, guardrails\)/.test(handleSend),
 		'handleSend must pass the resolved guardrails as the trailing argument to runAgent(...)');
 	assert.ok(/new AutoOrchestrator\([\s\S]*?,\s*guardrails\);/.test(handleAutoSend),
 		'handleAutoSend must pass the resolved guardrails as the trailing argument to new AutoOrchestrator(...)');

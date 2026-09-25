@@ -593,4 +593,62 @@ function reset(initial = {}, options = {}) {
 	}
 }
 
+// Every write that succeeds is reported to the approver with the text either side of it,
+// which is what `/undo` restores from. A refused or failed write reports nothing.
+{
+	files = new Map([[`${ROOT}/keep.ts`, 'const a = 1;\n']]);
+	settings = {};
+	setFolders([[ROOT, 'repo']]);
+	const writes = [];
+	const recording = { ...approver, recordWrite: w => writes.push({ path: w.path, before: w.before, after: w.after }) };
+	const g = loadGuardrails();
+	await executeTool({ id: 'w1', name: 'write_file', args: { path: 'new.ts', content: 'x\n' } }, recording, g);
+	await executeTool({ id: 'w2', name: 'edit_file', args: { path: 'keep.ts', oldText: 'a = 1', newText: 'a = 2' } }, recording, g);
+	await executeTool({ id: 'w3', name: 'edit_file', args: { path: 'keep.ts', oldText: 'not there', newText: 'y' } }, recording, g);
+	assert.deepStrictEqual(writes, [
+		{ path: 'new.ts', before: undefined, after: 'x\n' },
+		{ path: 'keep.ts', before: 'const a = 1;\n', after: 'const a = 2;\n' },
+	]);
+}
+
+// A write that resolves through a link to outside the workspace is refused; one inside is
+// not. A directory junction is used because it needs no elevation on Windows.
+{
+	const osMod = await import('node:os');
+	const fsMod = await import('node:fs');
+	const pathMod = await import('node:path');
+	const base = fsMod.mkdtempSync(pathMod.join(osMod.tmpdir(), 'openvs-link-'));
+	const ws = pathMod.join(base, 'ws');
+	const outside = pathMod.join(base, 'outside');
+	fsMod.mkdirSync(ws);
+	fsMod.mkdirSync(outside);
+	let linked = true;
+	try {
+		fsMod.symlinkSync(outside, pathMod.join(ws, 'link'), 'junction');
+	} catch {
+		linked = false; // no permission to create links here: nothing to assert about them
+	}
+	const wsUri = { fsPath: ws, path: ws, scheme: 'file', toString: () => `file://${ws}` };
+	vscodeStub.workspace.workspaceFolders = [{ uri: wsUri, name: 'ws', index: 0 }];
+	const savedJoin = vscodeStub.Uri.joinPath;
+	vscodeStub.Uri.joinPath = (b, ...parts) => {
+		const p = pathMod.join(b.fsPath, ...parts);
+		return { fsPath: p, path: p, scheme: 'file', toString: () => `file://${p}` };
+	};
+	settings = {};
+	try {
+		if (linked) {
+			const out = await executeTool({ id: 'l1', name: 'write_file', args: { path: 'link/evil.ts', content: 'x' } }, approver, loadGuardrails());
+			assert.strictEqual(out.isError, true);
+			assert.match(out.result, /resolves through a link .* outside the workspace/);
+		}
+		const ok = await executeTool({ id: 'l2', name: 'write_file', args: { path: 'inside.ts', content: 'x' } }, approver, loadGuardrails());
+		assert.strictEqual(ok.isError, false, ok.result);
+	} finally {
+		vscodeStub.Uri.joinPath = savedJoin;
+		setFolders([[ROOT, 'repo']]);
+		fsMod.rmSync(base, { recursive: true, force: true });
+	}
+}
+
 console.log('test-tools: all assertions passed');

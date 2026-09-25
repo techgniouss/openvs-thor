@@ -105,7 +105,7 @@ const hostSends = new Set([
 	// e.g. a local-only reply like 'inline'/'context' that must never reach a remote sink (see
 	// `src/chatViewProvider.ts`'s `runInline`/`handleAttachContext`) — is still traffic the
 	// webview itself has to recognize whenever `sinkId` is (or could be) `WEBVIEW_SINK_ID`.
-	...captures(host, /postTo\([^,]*,\s*\{\s*type:\s*'([a-zA-Z]+)'/g),
+	...captures(host, /post(?:To|Except)\([^,]*,\s*\{\s*type:\s*'([a-zA-Z]+)'/g),
 ]);
 /** Message `type` values the webview's dispatcher handles. */
 const webviewHandles = new Set(captures(main, /^\s*case '([a-zA-Z]+)':/gm));
@@ -124,8 +124,9 @@ const hostHandles = new Set(captures(host, /^\s*case '([a-zA-Z]+)':/gm));
  * Message types a remote (Phase 6c+) client's own reply never needs an equivalent for on the
  * desktop webview — `attachOk` confirms a chunked `attachImage` upload (see
  * `chatViewProvider.ts`'s `handleAttachImageChunk`), which only a client without a native file
- * input (the PWA) ever sends in the first place; the desktop webview attaches images locally via
- * its own file picker and never sends `attachImage` chunks to get this reply to. Kept as an
+ * input (the PWA) ever sends in the first place; the desktop webview attaches images by paste or
+ * through the host's own file dialog (`pickImages` → `pickedImages`) and never sends
+ * `attachImage` chunks to get this reply to. Kept as an
  * explicit, named exception (mirroring `test-pwa-contract.mjs`'s `EXCLUDED_FROM_PWA` for the
  * opposite asymmetry) rather than silently filtered, so a *new* sink-scoped reply type failing
  * to reach the webview fails loudly here instead of quietly joining this list.
@@ -229,9 +230,10 @@ for (const excluded of EXCLUDED_FROM_WEBVIEW) {
 {
 	const handler = /provSel\.addEventListener\('change'[\s\S]*?\n\t\t\t\}\);/.exec(main);
 	assert.ok(handler, 'the role-provider change handler is still there');
-	assert.match(handler[0], /offered\.includes\(modelInput\.value\.trim\(\)\)/,
+	assert.match(handler[0], /offered\.includes\(pinnedModel\)/,
 		'a model the new provider does not offer is replaced, not carried over');
-	assert.match(handler[0], /provider: '', model: ''/,
+	const save = /const save = \(\) => \{[\s\S]*?\n\t\t\t\};/.exec(main);
+	assert.ok(save && /provSel\.value && pinnedModel/.test(save[0]) && /provider: '', model: ''/.test(save[0]),
 		'and a provider with nothing to offer clears the pin instead of leaving the old pair');
 }
 
@@ -361,6 +363,35 @@ for (const excluded of EXCLUDED_FROM_WEBVIEW) {
 		'opening a new bubble flushes the queued frame');
 	assert.match(main, /function renderAll\(\) \{[\s\S]{0,300}?cancelStreamRender\(\)/,
 		'a full rebuild drops the queued frame instead of painting doomed DOM');
+}
+
+// Edit-mode Apply names a stored proposal; it never carries content for the host to write
+// into whatever file happens to be current. That field used to be one per view, reset by
+// every send, so with tabs streaming in parallel an edit could land in the wrong file.
+{
+	assert.match(main, /type: 'applyEdit', proposalId: msg\.proposalId/, 'the Apply button sends the proposal id');
+	assert.ok(!/type: 'applyEdit', content:/.test(main), 'and no longer sends content for the host to write');
+	assert.match(host, /type: 'editProposal',[\s\S]{0,80}proposalId,/, 'the host includes the id in the proposal');
+	assert.match(host, /case 'applyEdit':\s*await this\.applyProposal\(message\.proposalId/, 'and applies by that id');
+	assert.ok(!/this\.editTarget\b|this\.editRange\b|this\.inlineEditActive\b/.test(host), 'no view-wide edit target remains');
+}
+
+// The Undo button names the run it undoes, and the host's messages about it carry that run
+// in `checkpointRunId` — never `runId`, which the webview uses to drop a superseded run's
+// stragglers, so the "undone" reply arriving after a newer run started would be discarded.
+{
+	assert.match(main, /type: 'undoRun', sessionId: s\.id, runId: undo\.runId/);
+	assert.match(host, /type: 'checkpoint', checkpointRunId: runId, files/);
+	assert.match(host, /type: 'checkpoint', sessionId, checkpointRunId: entry\.runId, files: \[\]/);
+	assert.match(host, /case 'undoRun':[\s\S]{0,120}undoLastRun\(message\.sessionId, origin, message\.runId\)/);
+}
+
+// An input method confirms its candidate with Enter. The composer's keydown must hand that
+// keystroke back before anything else reads it, or CJK users send half-typed messages.
+{
+	const handler = main.slice(main.indexOf("els.input.addEventListener('keydown'"));
+	const guard = handler.indexOf('if (e.isComposing || e.keyCode === 229) { return; }');
+	assert.ok(guard !== -1 && guard < handler.indexOf("e.key === 'Enter'"), 'IME composition is ignored before Enter is read');
 }
 
 console.log('test-webview: all assertions passed');

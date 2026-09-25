@@ -44,11 +44,14 @@ const host = fs.readFileSync(new URL('../src/chatViewProvider.ts', import.meta.u
 	const method = /private async handleSend\([\s\S]*?\n\tprivate /.exec(host)?.[0] ?? '';
 	assert.ok(method, 'expected to find handleSend\'s body');
 	const seedAt = method.indexOf('seedSession(sessionId');
-	const appendAt = method.indexOf('appendMessage(sessionId');
+	// Through `appendUserTurn`, which also tells the other connected clients about the turn.
+	const appendAt = method.indexOf('appendUserTurn(sessionId');
 	const sendableAt = method.indexOf('sendableMessages(sessionId)');
 	assert.ok(seedAt >= 0, 'handleSend must seed the session before reading history back out of it');
 	assert.ok(appendAt >= 0, 'handleSend must append the new turn (text/images) into the store');
 	assert.ok(sendableAt >= 0, 'handleSend must read history from the store');
+	const helper = /private appendUserTurn\([\s\S]*?\n\t\}/.exec(host)?.[0] ?? '';
+	assert.ok(/this\.sessionStore\.appendMessage\(sessionId/.test(helper), 'appendUserTurn must append into the store');
 	assert.ok(seedAt < appendAt && appendAt < sendableAt,
 		'seed, then append the new turn, then read history — any other order either has ' +
 		'nowhere to append into or reads history from before the new turn arrived');
@@ -116,6 +119,20 @@ function makeDeps() {
 	store.appendMessage('never-created', { role: 'user', content: 'hello' });
 	assert.deepStrictEqual(store.sendableMessages('never-created').map(m => m.content), ['hello'],
 		'seedSession must make an unknown session id appendable, not a silent no-op');
+}
+
+// The store is seeded from what was saved, at construction — never done before, so a restart
+// lost the open tabs and the first archive save afterwards wiped History — and History
+// deletes go to the store by id rather than as a whole list it could only merge.
+{
+	const ctor = host.slice(host.indexOf('constructor('), host.indexOf('private environmentEnabled('));
+	assert.deepStrictEqual([
+		/this\.restoreSessionState\(\);/.test(ctor),
+		/restoredSessions\(loadState\(this\.sessionMemento\)\)|restoredSessions\(saved\)/.test(host),
+		/HISTORY_KEY\) \?\? \[\]\)/.test(host.slice(host.indexOf('private restoreSessionState('))),
+		/case 'deleteHistory':[\s\S]{0,400}this\.sessionStore\.deleteHistory\(/.test(host),
+		/case 'saveHistory'/.test(host),
+	], [true, true, true, true, false]);
 }
 
 console.log('test-send-history: all assertions passed');

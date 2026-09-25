@@ -15,12 +15,14 @@ import { memoize } from '../../../base/common/decorators.js';
 import { hash } from '../../../base/common/hash.js';
 import * as path from '../../../base/common/path.js';
 import { basename } from '../../../base/common/path.js';
+import { escapeRegExpCharacters } from '../../../base/common/strings.js';
 import { transform } from '../../../base/common/stream.js';
 import { URI } from '../../../base/common/uri.js';
 import { checksum } from '../../../base/node/crypto.js';
 import * as pfs from '../../../base/node/pfs.js';
 import { killTree } from '../../../base/node/processes.js';
 import { getWindowsRelease } from '../../../base/node/windowsVersion.js';
+import { localize } from '../../../nls.js';
 import { IConfigurationService } from '../../configuration/common/configuration.js';
 import { IEnvironmentMainService } from '../../environment/electron-main/environmentMainService.js';
 import { IFileService } from '../../files/common/files.js';
@@ -33,6 +35,7 @@ import { asJson, IRequestService } from '../../request/common/request.js';
 import { IApplicationStorageMainService } from '../../storage/electron-main/storageMainService.js';
 import { ITelemetryService } from '../../telemetry/common/telemetry.js';
 import { AvailableForDownload, DisablementReason, IUpdate, State, StateType, UpdateType } from '../common/update.js';
+import { gitHubLatestReleaseUrl, IGitHubRelease, parseGitHubReleasesRepo, releaseToUpdate } from '../common/githubReleases.js';
 import { AbstractUpdateService, createUpdateURL, getUpdateRequestHeaders, IUpdateURLOptions, UpdateErrorClassification } from './abstractUpdateService.js';
 
 interface IAvailableUpdate {
@@ -43,6 +46,9 @@ interface IAvailableUpdate {
 	/** The Inno Setup process that is applying the update in the background */
 	updateProcess?: ChildProcess;
 }
+
+/** How long a passive check may reuse the last GitHub reply. */
+const GITHUB_PASSIVE_CHECK_TTL = 15 * 60 * 1000;
 
 let _updateType: UpdateType | undefined = undefined;
 function getUpdateType(): UpdateType {
@@ -64,9 +70,30 @@ export class Win32UpdateService extends AbstractUpdateService implements IRelaun
 	private readonly updatingMutexName: string;
 	private readonly setupMutexName: string;
 
+	/** `owner/repo` when updates come from GitHub Releases rather than an update server. */
+	private readonly gitHubRepo: string | undefined;
+
+	/**
+	 * The last latest-release answer, reused by passive checks (`isLatestVersion`). Every
+	 * window asks that at startup for its timing metrics, and the overwrite check every five
+	 * minutes while an update waits - all against GitHub's unauthenticated limit of 60
+	 * requests an hour, shared by everyone behind the same IP. Conditional requests would not
+	 * help: GitHub only exempts 304s from the limit for authenticated requests.
+	 */
+	private gitHubReleaseCache: { readonly release: IGitHubRelease | null; readonly fetchedAt: number } | undefined;
+
+	/**
+	 * Names update files and the cache folder. Falls back to the application name because
+	 * product.json in this fork has no `quality`, and `vscode-undefined-…` in the temp folder
+	 * would be shared with every other build that lacks one.
+	 */
+	private get qualityTag(): string {
+		return this.productService.quality ?? this.productService.applicationName;
+	}
+
 	@memoize
 	get cachePath(): Promise<string> {
-		const result = path.join(tmpdir(), `vscode-${this.productService.quality}-${this.productService.target}-${process.arch}`);
+		const result = path.join(tmpdir(), `vscode-${this.qualityTag}-${this.productService.target}-${process.arch}`);
 		return mkdir(result, { recursive: true }).then(() => result);
 	}
 
@@ -93,6 +120,7 @@ export class Win32UpdateService extends AbstractUpdateService implements IRelaun
 		this.readyMutexName = `${productService.win32MutexName}-ready`;
 		this.updatingMutexName = `${productService.win32MutexName}-updating`;
 		this.setupMutexName = `${productService.win32MutexName}setup`;
+		this.gitHubRepo = parseGitHubReleasesRepo(productService.updateUrl);
 
 		lifecycleMainService.setRelaunchHandler(this);
 	}
@@ -187,7 +215,15 @@ export class Win32UpdateService extends AbstractUpdateService implements IRelaun
 		}
 	}
 
+	protected override supportsGitHubReleases(): boolean {
+		return true;
+	}
+
 	protected buildUpdateFeedUrl(quality: string, commit: string, options?: IUpdateURLOptions): string | undefined {
+		if (this.gitHubRepo) {
+			return gitHubLatestReleaseUrl(this.gitHubRepo);
+		}
+
 		let platform = `win32-${process.arch}`;
 
 		if (getUpdateType() === UpdateType.Archive) {
@@ -213,9 +249,7 @@ export class Win32UpdateService extends AbstractUpdateService implements IRelaun
 			this.setState(State.CheckingForUpdates(explicit));
 		}
 
-		const headers = getUpdateRequestHeaders(this.productService.version);
-		this.requestService.request({ url, headers, callSite: 'updateService.win32.checkForUpdates' }, CancellationToken.None)
-			.then<IUpdate | null>(asJson)
+		this.fetchUpdate(url, pendingCommit, false, CancellationToken.None)
 			.then(update => {
 				const updateType = getUpdateType();
 
@@ -319,6 +353,87 @@ export class Win32UpdateService extends AbstractUpdateService implements IRelaun
 			});
 	}
 
+	/**
+	 * Asks the feed for an update newer than `pendingVersion` (an update already downloaded)
+	 * or else the running build. Resolves `null` when there is none. `passive` lets a GitHub
+	 * feed answer from a recent reply instead of spending a request.
+	 */
+	private async fetchUpdate(url: string | undefined, pendingVersion: string | undefined, passive: boolean, token: CancellationToken): Promise<IUpdate | null> {
+		const headers = getUpdateRequestHeaders(this.productService.version);
+
+		if (!this.gitHubRepo) {
+			const context = await this.requestService.request({ url, headers, callSite: 'updateService.win32.checkForUpdates' }, token);
+			return asJson<IUpdate>(context);
+		}
+
+		const cached = this.gitHubReleaseCache;
+		const release = passive && cached && Date.now() - cached.fetchedAt < GITHUB_PASSIVE_CHECK_TTL
+			? cached.release
+			: await this.fetchLatestGitHubRelease(url, headers, token);
+		return (release && releaseToUpdate(release, pendingVersion ?? this.productService.version, this.gitHubAssetName())) ?? null;
+	}
+
+	private async fetchLatestGitHubRelease(url: string | undefined, headers: Record<string, string> | undefined, token: CancellationToken): Promise<IGitHubRelease | null> {
+		const context = await this.requestService.request({
+			url,
+			headers: {
+				// api.github.com refuses requests without a User-Agent.
+				'User-Agent': `${this.productService.applicationName}/${this.productService.version}`,
+				...headers,
+				'Accept': 'application/vnd.github+json',
+				'X-GitHub-Api-Version': '2022-11-28',
+			},
+			callSite: 'updateService.win32.checkForUpdates'
+		}, token);
+
+		const status = context.res.statusCode;
+		let release: IGitHubRelease | null;
+		if (status === 404) {
+			// A repository with no published release yet: nothing to update to.
+			release = null;
+		} else if (status === 429 || (status === 403 && context.res.headers['x-ratelimit-remaining'] === '0')) {
+			// Shown only for an explicit check; otherwise the next scheduled one retries.
+			throw new Error(localize('gitHubRateLimited', "GitHub's limit on update checks from this network has been reached. Please try again later."));
+		} else {
+			release = await asJson<IGitHubRelease>(context);
+		}
+
+		this.gitHubReleaseCache = { release, fetchedAt: Date.now() };
+		return release;
+	}
+
+	/**
+	 * The installer the release workflow attaches for this kind of install, or `undefined` for
+	 * a zip install, which cannot update itself and is sent to the release page instead.
+	 */
+	private gitHubAssetName(): ((version: string) => string) | undefined {
+		if (getUpdateType() === UpdateType.Archive) {
+			return undefined;
+		}
+		const prefix = this.productService.target === 'user' ? 'OpenVSUserSetup' : 'OpenVSSetup';
+		return version => `${prefix}-${process.arch}-${version}.exe`;
+	}
+
+	override async isLatestVersion(commit?: string, token: CancellationToken = CancellationToken.None): Promise<boolean | undefined> {
+		if (!this.gitHubRepo) {
+			return super.isLatestVersion(commit, token);
+		}
+
+		if (!this.quality || this.configurationService.getValue('update.mode') === 'none') {
+			return undefined;
+		}
+
+		// `commit` is the pending update's version here: a GitHub update's `version` is the
+		// release version, since a release carries no build commit.
+		try {
+			return !(await this.fetchUpdate(gitHubLatestReleaseUrl(this.gitHubRepo), commit, true, token));
+		} catch (error) {
+			this.logService.error('update#isLatestVersion(): failed to check for updates');
+			this.logService.error(error);
+			return undefined;
+		}
+	}
+
 	protected override async doDownloadUpdate(state: AvailableForDownload): Promise<void> {
 		if (state.update.url) {
 			this.nativeHostMainService.openExternal(undefined, state.update.url);
@@ -328,11 +443,11 @@ export class Win32UpdateService extends AbstractUpdateService implements IRelaun
 
 	private async getUpdatePackagePath(version: string): Promise<string> {
 		const cachePath = await this.cachePath;
-		return path.join(cachePath, `CodeSetup-${this.productService.quality}-${version}.exe`);
+		return path.join(cachePath, `CodeSetup-${this.qualityTag}-${version}.exe`);
 	}
 
 	private async cleanup(exceptVersion: string | null = null): Promise<void> {
-		const filter = exceptVersion ? (one: string) => !(new RegExp(`${this.productService.quality}-${exceptVersion}\\.exe$`).test(one)) : () => true;
+		const filter = exceptVersion ? (one: string) => !(new RegExp(`${this.qualityTag}-${escapeRegExpCharacters(exceptVersion)}\\.exe$`).test(one)) : () => true;
 
 		const cachePath = await this.cachePath;
 		const versions = await pfs.Promises.readdir(cachePath);
@@ -358,7 +473,7 @@ export class Win32UpdateService extends AbstractUpdateService implements IRelaun
 		const sessionEndFlagPath = path.join(cachePath, 'session-ending.flag');
 		const cancelFilePath = path.join(cachePath, `cancel.flag`);
 		const progressFilePath = path.join(cachePath, `update-progress`);
-		this.availableUpdate.updateFilePath = path.join(cachePath, `CodeSetup-${this.productService.quality}-${update.version}.flag`);
+		this.availableUpdate.updateFilePath = path.join(cachePath, `CodeSetup-${this.qualityTag}-${update.version}.flag`);
 		this.availableUpdate.cancelFilePath = cancelFilePath;
 
 		const mutex = await this.mutex;

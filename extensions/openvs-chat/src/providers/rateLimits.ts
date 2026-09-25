@@ -15,8 +15,17 @@
 
 /** A backend's stated token allowance, as of the response it was read from. */
 export interface RateLimitSnapshot {
-	/** Tokens one request may carry, when the backend states a ceiling. */
+	/** The window's token allowance — a quota gauge, together with {@link remainingTokens}. */
 	readonly limitTokens?: number;
+	/**
+	 * Tokens one whole request (prompt and reserved reply) may carry, or undefined when the
+	 * stated limit does not bound that. Only the `x-ratelimit-*` family does: those backends
+	 * charge the whole request against the window and refuse one larger than it. Anthropic's
+	 * input limit counts only *uncached* input and output is limited separately, so treating it
+	 * as a ceiling cut a tier-1 key (30k/min) to ~30k per request on a 200k-window model — and
+	 * compacted away the very cache that makes a large request cheap there.
+	 */
+	readonly requestCeiling?: number;
 	/** Tokens left in the current window. */
 	readonly remainingTokens?: number;
 	/** How long until the token window refills, in ms from when the header was read. */
@@ -86,7 +95,8 @@ export function parseRateLimitHeaders(headers: Headers, now = Date.now()): RateL
 	if (limitTokens === undefined && remainingTokens === undefined) {
 		return undefined;
 	}
-	return { limitTokens, remainingTokens, resetMs, at: now };
+	const wholeRequest = tokens(header(headers, [HEADERS.limit[0]])) !== undefined;
+	return { limitTokens, remainingTokens, resetMs, at: now, ...(wholeRequest ? { requestCeiling: limitTokens } : {}) };
 }
 
 /**
@@ -100,6 +110,60 @@ const SNAPSHOT_TTL_MS = 60_000;
 
 /** Never sleep longer than this for a refill: past here, failing loudly beats hanging. */
 const MAX_PACE_MS = 30_000;
+
+/**
+ * How close a model's last-known token allowance is to exhausted, in the order a user should
+ * read them: `'unknown'` is not "healthy", it is "we have no idea" — there is no reading at
+ * all, or the one we have is stale (see {@link SNAPSHOT_TTL_MS}) or carries no `limitTokens`
+ * to divide by, so no ratio is computable. Never invented from nothing.
+ */
+export type RateLimitStatus = 'ok' | 'near' | 'critical' | 'unknown';
+
+/**
+ * Below this fraction of the allowance remaining, a run is one or two more steps from a hard
+ * 429 — worth a proactive, low-urgency notice so the user can switch models or add a backup
+ * key before that happens rather than after.
+ */
+const RATE_LIMIT_NEAR_RATIO = 0.2;
+
+/**
+ * Below this fraction remaining, the next request is likely to be refused outright. Roughly
+ * "one more request's worth" of headroom on a typical few-thousand-token chat turn against an
+ * 8k-token free-tier allowance — tight enough to warrant a sharper word than `'near'`, not so
+ * tight that it only ever fires after the 429 it was meant to warn about.
+ */
+const RATE_LIMIT_CRITICAL_RATIO = 0.05;
+
+/**
+ * The {@link RateLimitStatus} implied by `snapshot`, as of `now`.
+ *
+ * A pure function rather than a method, so the same ratio-threshold reasoning is usable both
+ * from {@link RateLimitTracker.status} (the plain streaming and agent-loop paths, which read a
+ * provider's shared tracker) and directly against whatever a `ChatProvider.rateLimit(model)`
+ * call returns (callers that only have the snapshot, not the tracker that produced it) —
+ * without the two ever computing the ratio differently.
+ */
+export function rateLimitStatus(snapshot: RateLimitSnapshot | undefined, now = Date.now()): RateLimitStatus {
+	if (!snapshot || snapshot.limitTokens === undefined || snapshot.remainingTokens === undefined) {
+		return 'unknown';
+	}
+	if (now - snapshot.at >= SNAPSHOT_TTL_MS) {
+		// Every limit here is per-minute; a two-minute-old reading describes a window that has
+		// since refilled, so treating it as current would raise a false alarm.
+		return 'unknown';
+	}
+	if (snapshot.limitTokens <= 0) {
+		return 'unknown';
+	}
+	const ratio = snapshot.remainingTokens / snapshot.limitTokens;
+	if (ratio < RATE_LIMIT_CRITICAL_RATIO) {
+		return 'critical';
+	}
+	if (ratio < RATE_LIMIT_NEAR_RATIO) {
+		return 'near';
+	}
+	return 'ok';
+}
 
 /**
  * Per-model record of what each backend has said about its limits.
@@ -122,6 +186,11 @@ export class RateLimitTracker {
 	/** The last thing this backend said about `model`. */
 	get(model: string): RateLimitSnapshot | undefined {
 		return this.byModel.get(model);
+	}
+
+	/** How close `model`'s last-known token allowance is to exhausted. See {@link rateLimitStatus}. */
+	status(model: string, now = Date.now()): RateLimitStatus {
+		return rateLimitStatus(this.byModel.get(model), now);
 	}
 
 	/**
@@ -171,11 +240,17 @@ export class RateLimitTracker {
 		if (!snapshot || snapshot.remainingTokens === undefined || snapshot.resetMs === undefined) {
 			return 0;
 		}
+		// A stated limit that is not a request ceiling (Anthropic's uncached-input bucket) is not
+		// comparable with an estimate of the whole request: waiting on it only slowed every step
+		// whose prompt was mostly cache (see {@link RateLimitSnapshot.requestCeiling}).
+		if (snapshot.limitTokens !== undefined && snapshot.requestCeiling === undefined) {
+			return 0;
+		}
 		const age = now - snapshot.at;
 		if (age >= SNAPSHOT_TTL_MS || estimatedTokens <= snapshot.remainingTokens) {
 			return 0;
 		}
-		if (snapshot.limitTokens !== undefined && estimatedTokens > snapshot.limitTokens) {
+		if (snapshot.requestCeiling !== undefined && estimatedTokens > snapshot.requestCeiling) {
 			return 0;
 		}
 		return Math.min(MAX_PACE_MS, Math.max(0, snapshot.resetMs - age));

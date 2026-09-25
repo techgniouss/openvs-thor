@@ -55,6 +55,8 @@ export const REMOTE_ALLOWED: readonly string[] = [
 	'setQueue',
 	'sync',
 	'fetchTranscript',
+	// The Undo button: the same effect as `/undo`, which is allowed remotely (see runSlash).
+	'undoRun',
 	// Host-side slash-command dispatch (Phase 6a): everything it can do (mode/provider
 	// switches, clear, skills, MCP) is already reachable individually through the allowed
 	// types above — `slash` is just one more way to reach the same, already-vetted effects.
@@ -107,10 +109,11 @@ export const REMOTE_ALLOWED: readonly string[] = [
  *    desktop-only, same reasoning as `requestPairing` immediately above.
  */
 export const REMOTE_DENIED: readonly string[] = [
-	'saveHistory',
+	'deleteHistory',
 	'requestOpenSettings',
 	'closeSettingsWindow',
 	'saveKey',
+	'saveExtraKeys',
 	'clearKey',
 	'signIn',
 	'setRole',
@@ -126,6 +129,9 @@ export const REMOTE_DENIED: readonly string[] = [
 	'setDecompose',
 	'setCompletionsEnabled',
 	'attachContext',
+	// Opens VS Code's file dialog on the desktop — which the remote user can't see — and reads
+	// local files. A phone attaches its own images through `attachImage` instead.
+	'pickImages',
 	'applyEdit',
 	'insertAtCursor',
 	'testKey',
@@ -137,6 +143,7 @@ export const REMOTE_DENIED: readonly string[] = [
 	'openExternal',
 	'adopt',
 	'requestPairing',
+	'setRemoteEnabled',
 	'listDevices',
 	'revokeDevice',
 ];

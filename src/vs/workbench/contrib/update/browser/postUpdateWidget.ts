@@ -20,6 +20,7 @@ import { IProductService } from '../../../../platform/product/common/productServ
 import { asTextOrError, IRequestService } from '../../../../platform/request/common/request.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { ITelemetryService } from '../../../../platform/telemetry/common/telemetry.js';
+import { parseGitHubReleasesRepo } from '../../../../platform/update/common/githubReleases.js';
 import { IWorkbenchContribution } from '../../../common/contributions.js';
 import { IHostService } from '../../../services/host/browser/host.js';
 import { ShowCurrentReleaseNotesActionId } from '../common/update.js';
@@ -112,7 +113,9 @@ export class PostUpdateWidgetContribution extends Disposable implements IWorkben
 	}
 
 	private async getUpdateInfo(input?: string | null): Promise<IParsedUpdateInfoInput | undefined> {
-		if (!input) {
+		// Microsoft's `_update.md` files describe VS Code, whose version numbers this fork
+		// shares; a product updating from GitHub Releases has none of its own to show here.
+		if (!input && !parseGitHubReleasesRepo(this.productService.updateUrl)) {
 			try {
 				const url = getUpdateInfoUrl(this.productService.version);
 				const context = await this.requestService.request({ url, callSite: 'postUpdateWidget' }, CancellationToken.None);

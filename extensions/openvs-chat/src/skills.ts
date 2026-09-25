@@ -120,30 +120,80 @@ export class SkillRegistry {
 		}
 		const skills: Skill[] = [];
 		for (const [name, type] of entries) {
-			if (type !== vscode.FileType.File || !name.endsWith('.md')) {
+			// `<id>.md`, or the layout skills are usually published in: `<id>/SKILL.md`.
+			let file: vscode.Uri;
+			let id: string;
+			if (type === vscode.FileType.File && name.endsWith('.md')) {
+				file = vscode.Uri.joinPath(dir, name);
+				id = name.replace(/\.md$/, '');
+			} else if (type === vscode.FileType.Directory) {
+				file = vscode.Uri.joinPath(dir, name, 'SKILL.md');
+				id = name;
+			} else {
 				continue;
 			}
 			try {
-				const bytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(dir, name));
-				skills.push(parseSkillMarkdown(name.replace(/\.md$/, ''), new TextDecoder().decode(bytes)));
+				const bytes = await vscode.workspace.fs.readFile(file);
+				skills.push(parseSkillMarkdown(id, new TextDecoder().decode(bytes)));
 			} catch {
-				// ignore unreadable files
+				// ignore unreadable files, and directories without a SKILL.md
 			}
 		}
 		return skills;
 	}
 }
 
-/** Parses a skill markdown file: first `# Heading` is the name, first `> quote` the description. */
+/**
+ * Parses a skill markdown file. The standard `SKILL.md` frontmatter (`name:` / `description:`)
+ * wins; otherwise the first `# Heading` is the name and the first `> quote` the description.
+ * Reading only the latter gave every skill published in the standard format an empty
+ * description (its body rarely opens with a quote) and whatever heading came first as a name.
+ */
 function parseSkillMarkdown(id: string, text: string): Skill {
-	const lines = text.split('\n');
-	const heading = lines.find(l => /^#\s+/.test(l));
-	const quote = lines.find(l => /^>\s+/.test(l));
+	const lines = text.split(/\r?\n/);
+	const meta = frontmatter(lines);
+	const body = meta ? lines.slice(meta.end + 1) : lines;
+	const heading = body.find(l => /^#\s+/.test(l));
+	const quote = body.find(l => /^>\s+/.test(l));
 	return {
 		id,
-		name: heading ? heading.replace(/^#\s+/, '').trim() : id,
-		description: quote ? quote.replace(/^>\s+/, '').trim() : '',
+		name: meta?.fields.get('name') || (heading ? heading.replace(/^#\s+/, '').trim() : id),
+		description: meta?.fields.get('description') || (quote ? quote.replace(/^>\s+/, '').trim() : ''),
 		instructions: text.trim(),
 		source: 'file',
 	};
+}
+
+/**
+ * Reads the top-level scalar fields of a leading `---` frontmatter block: plain, quoted, and
+ * folded/literal (`>` / `|`) values, which is every form skill files use for name/description.
+ * Not a YAML parser — nested structures are skipped, not interpreted.
+ */
+function frontmatter(lines: readonly string[]): { fields: Map<string, string>; end: number } | undefined {
+	if (lines[0]?.trim() !== '---') {
+		return undefined;
+	}
+	const end = lines.findIndex((line, i) => i > 0 && line.trim() === '---');
+	if (end < 0) {
+		return undefined;
+	}
+	const fields = new Map<string, string>();
+	for (let i = 1; i < end; i++) {
+		const match = /^([A-Za-z][\w-]*):\s*(.*)$/.exec(lines[i]);
+		if (!match) {
+			continue;
+		}
+		let value = match[2].trim();
+		if (/^[>|][+-]?$/.test(value)) {
+			const block: string[] = [];
+			while (i + 1 < end && (/^\s/.test(lines[i + 1]) || !lines[i + 1].trim())) {
+				block.push(lines[++i].trim());
+			}
+			value = block.filter(Boolean).join(' ');
+		} else if (/^(["']).*\1$/.test(value)) {
+			value = value.slice(1, -1);
+		}
+		fields.set(match[1], value);
+	}
+	return { fields, end };
 }

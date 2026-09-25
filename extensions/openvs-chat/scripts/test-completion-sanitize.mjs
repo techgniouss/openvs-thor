@@ -30,6 +30,15 @@ const cases = [
 	['restated prefix is removed',
 		'for (const n of xs) {\n\tsum += n;', w('for (const n of xs) {\n\t'), 'sum += n;'],
 
+	['an opening bracket the completion itself starts with is not mistaken for a restatement',
+		'(x) => x * 2)', w('const r = arr.map('), '(x) => x * 2)'],
+
+	['a restated opener is still removed when keeping it would unbalance the completion',
+		'{ a: 1 })', w('f({'), ' a: 1 })'],
+
+	['a restated partial identifier is removed',
+		'bar();', w('foo.ba'), 'r();'],
+
 	['restated suffix is removed so brackets are not doubled',
 		'sum += n;\n}', w('for (const n of xs) {\n\t', '\n}'), 'sum += n;'],
 

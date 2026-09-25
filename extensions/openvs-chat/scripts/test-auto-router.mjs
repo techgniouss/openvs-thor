@@ -46,10 +46,12 @@ let credentialReads = [];
 
 /**
  * A registry stand-in. `keys` names the providers holding a credential; `selected` pins a
- * provider's currently-chosen chat model (what the user picked in the model dropdown).
+ * provider's currently-chosen chat model (what the user picked in the model dropdown);
+ * `cooling` names `providerId:model` pairs the router should treat as quota-cooling-down.
  */
-function registryOf(providers, { keys = [], selected = {} } = {}) {
+function registryOf(providers, { keys = [], selected = {}, cooling = [] } = {}) {
 	const byId = new Map(providers.map(p => [p.info.id, p]));
+	const coolingSet = new Set(cooling);
 	return {
 		get ids() { return [...byId.keys()]; },
 		getProvider: id => byId.get(id),
@@ -57,6 +59,9 @@ function registryOf(providers, { keys = [], selected = {} } = {}) {
 		async hasCredentials(id) {
 			credentialReads.push(id);
 			return keys.includes(id);
+		},
+		cooldowns: {
+			isCoolingDown: (providerId, model) => coolingSet.has(`${providerId}:${model}`),
 		},
 	};
 }
@@ -176,6 +181,39 @@ function beforeEach() {
 			'groq:llama-3.3-70b-versatile (inferred)',
 		],
 		'the selected model is preferred but never the provider\'s only representative',
+	);
+}
+
+// 6. A cooling-down candidate is skipped in favor of the next-ranked one that isn't. Uses
+// the same groq-only pool as test 4, where 'plan' ranks llama-3.3-70b-versatile first and
+// llama-3.1-8b-instant second (llama-4-scout is dropped by MAX_PER_PROVIDER regardless).
+{
+	beforeEach();
+	const router = new RoleRouter(registryOf([groq], {
+		keys: ['groq'],
+		cooling: ['groq:llama-3.3-70b-versatile'],
+	}));
+	assert.deepStrictEqual(
+		(await router.resolveRoleCandidates('plan')).map(summarize),
+		['groq:llama-3.1-8b-instant (inferred)'],
+		'a cooling-down candidate is skipped in favor of a working one',
+	);
+}
+
+// 7. When EVERY ready candidate happens to be cooling down at once, Auto still answers with
+// the best-ranked one rather than reporting not-ready — a stale cooldown costing one
+// avoidable 429 beats refusing to run at all.
+{
+	beforeEach();
+	const router = new RoleRouter(registryOf([groq], {
+		keys: ['groq'],
+		cooling: ['groq:llama-3.3-70b-versatile', 'groq:llama-3.1-8b-instant'],
+	}));
+	const candidates = await router.resolveRoleCandidates('plan');
+	assert.deepStrictEqual(
+		candidates.map(summarize),
+		['groq:llama-3.3-70b-versatile (inferred)', 'groq:llama-3.1-8b-instant (inferred)'],
+		'falls back to the cooling candidates, best-ranked first, rather than reporting not-ready',
 	);
 }
 

@@ -96,6 +96,12 @@ function fakeSql() {
 			pairing.push({ codeHash, expiresAt, usedAt: null });
 			return result([]);
 		}
+		if (/^UPDATE pairing SET usedAt = \? WHERE usedAt IS NULL/.test(s)) {
+			// Withdraws every live code at once (the wrong-guess limit in handlePairClaim).
+			const [usedAt] = params;
+			for (const row of pairing) { if (row.usedAt === null) { row.usedAt = usedAt; } }
+			return result([]);
+		}
 		if (/^UPDATE pairing SET usedAt/.test(s)) {
 			const [usedAt, codeHash] = params;
 			const row = pairing.find(r => r.codeHash === codeHash);
@@ -500,8 +506,8 @@ const FAKE_ENV = { RELAY_PEPPER: 'x', VAPID_PUBLIC: '', VAPID_PRIVATE: '', VAPID
 	const hello = JSON.stringify({ v: 1, t: 'c', seq: 1, p: { c: 'hello', role: 'client' } });
 	await room.webSocketMessage(client, hello);
 
-	assert.deepEqual(client.sent.map(m => JSON.parse(m)), [{ v: 1, t: 'c', seq: 0, p: { c: 'welcome', lastSeq: 0 } }],
-		"a client's hello is answered with exactly one welcome frame");
+	assert.deepEqual(client.sent.map(m => JSON.parse(m)), [{ v: 1, t: 'c', seq: 0, p: { c: 'welcome', lastSeq: 0, hostOnline: false } }],
+		"a client's hello is answered with exactly one welcome frame, saying no host is connected");
 	assert.equal(client.closed, undefined, "answering a client's hello does not close its own socket");
 }
 
@@ -521,6 +527,88 @@ const FAKE_ENV = { RELAY_PEPPER: 'x', VAPID_PUBLIC: '', VAPID_PRIVATE: '', VAPID
 		"a host's hello is also answered with welcome, alongside the takeover of the old host");
 	assert.deepEqual(oldHost.closed, { code: HOST_TAKEOVER_CLOSE_CODE, reason: 'replaced by a new host connection' },
 		'the takeover itself is unaffected by also sending welcome');
+}
+
+// ---- 11. Host presence: clients learn whether VS Code is there -----------------------------------
+//
+// A phone connected to the relay while VS Code was closed used to show "Connected" over an app
+// that could never answer, and the `ready` it sent into the empty room was lost for good.
+
+{
+	// `welcome` reports a connected host.
+	const state = new FakeDurableObjectState();
+	const room = new WorkspaceRoom(state, FAKE_ENV);
+	const host = new FakeWebSocket('host');
+	const client = new FakeWebSocket('client');
+	state.acceptWebSocket(host, [HOST_TAG]);
+	state.acceptWebSocket(client, [clientTag('device-a')]);
+	await room.webSocketMessage(client, JSON.stringify({ v: 1, t: 'c', seq: 1, p: { c: 'hello', role: 'client' } }));
+	assert.deepEqual(JSON.parse(client.sent.at(-1)).p, { c: 'welcome', lastSeq: 0, hostOnline: true });
+}
+
+{
+	// The last host leaving tells every client, and only clients.
+	const state = new FakeDurableObjectState();
+	const room = new WorkspaceRoom(state, FAKE_ENV);
+	const host = new FakeWebSocket('host');
+	const clientA = new FakeWebSocket('client-a');
+	const clientB = new FakeWebSocket('client-b');
+	state.acceptWebSocket(host, [HOST_TAG]);
+	state.acceptWebSocket(clientA, [clientTag('device-a')]);
+	state.acceptWebSocket(clientB, [clientTag('device-b')]);
+	room.webSocketClose(host, 1006, '', false);
+	const offline = { v: 1, t: 'c', seq: 0, p: { c: 'hostStatus', online: false } };
+	assert.deepEqual(clientA.sent.map(m => JSON.parse(m)), [offline]);
+	assert.deepEqual(clientB.sent.map(m => JSON.parse(m)), [offline]);
+	assert.deepEqual(host.sent, [], 'the closing host is not told about itself');
+}
+
+{
+	// A displaced host closing while its replacement is connected is not an outage.
+	const state = new FakeDurableObjectState();
+	const room = new WorkspaceRoom(state, FAKE_ENV);
+	const oldHost = new FakeWebSocket('old-host');
+	const newHost = new FakeWebSocket('new-host');
+	const client = new FakeWebSocket('client');
+	state.acceptWebSocket(oldHost, [HOST_TAG]);
+	state.acceptWebSocket(newHost, [HOST_TAG]);
+	state.acceptWebSocket(client, [clientTag('device-a')]);
+	room.webSocketClose(oldHost, 4003, 'replaced by a new host connection', true);
+	assert.deepEqual(client.sent, [], 'no hostStatus while another host is connected');
+}
+
+// ---- 12. A ping is answered whatever seq it carries ------------------------------------------------
+//
+// The runtime's auto-responder matches only the exact seq-0 ping string. Clients stamped a
+// running seq, so no ping was ever answered and both the host and the phone dropped their
+// connection about once a minute.
+{
+	const state = new FakeDurableObjectState();
+	const room = new WorkspaceRoom(state, FAKE_ENV);
+	const client = new FakeWebSocket('client');
+	state.acceptWebSocket(client, [clientTag('device-a')]);
+	await room.webSocketMessage(client, JSON.stringify({ v: 1, t: 'c', seq: 42, p: { c: 'ping' } }));
+	assert.deepEqual(client.sent.map(m => JSON.parse(m).p), [{ c: 'pong' }]);
+}
+
+// Wrong pairing codes are limited per room. The per-code attempt counter only ever saw claims
+// of a code that exists, so a wrong guess counted nowhere and guessing a live code through the
+// public relay was unlimited; past the limit every live code is withdrawn.
+{
+	const { hashCode, PAIRING_TTL_MS } = await import('../src/pairing.ts');
+	const state = new FakeDurableObjectState();
+	const room = new WorkspaceRoom(state, FAKE_ENV);
+	const live = 'ABCDEFGH';
+	state.storage.sql.exec('INSERT OR REPLACE INTO pairing (codeHash, expiresAt, usedAt) VALUES (?, ?, NULL)', await hashCode(live, FAKE_ENV.RELAY_PEPPER), Date.now() + PAIRING_TTL_MS);
+	const claim = code => room.fetch(new Request('https://relay.example/pair/claim?room=R', { method: 'POST', body: JSON.stringify({ code }) }));
+	const statuses = [];
+	for (let i = 0; i < 10; i++) {
+		statuses.push((await claim(`WRONG00${i}`)).status);
+	}
+	assert.deepEqual(statuses, [403, 403, 403, 403, 403, 403, 403, 403, 403, 429]);
+	assert.equal((await claim(live)).status, 429, 'refused: the room stays locked until a new code is minted');
+	const [row] = state.storage.sql.exec('SELECT codeHash, expiresAt, usedAt FROM pairing WHERE codeHash = ?', await hashCode(live, FAKE_ENV.RELAY_PEPPER)).toArray();
+	assert.notEqual(row.usedAt, null, 'and the live code itself was withdrawn');
 }
 
 console.log('test-room-relay: all assertions passed');

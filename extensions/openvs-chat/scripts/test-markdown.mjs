@@ -27,7 +27,16 @@ assert.equal(render('*emphasis* and **strong** and ~~gone~~'),
 	'<em>emphasis</em> and <strong>strong</strong> and <del>gone</del><br />');
 assert.equal(render('# H1\n###### H6'), '<h1>H1</h1><h6>H6</h6>');
 assert.equal(render('> quoted\n> lines'), '<blockquote>quoted<br />lines<br /></blockquote>');
-assert.equal(render('a\n\n---\n\nb'), 'a<br /><br /><hr /><br />b<br />');
+assert.equal(render('a\n\n---\n\nb'), 'a<br /><hr />b<br />');
+
+// 1b. A blank line is a paragraph break only between two lines of prose. Beside a block it is
+// the gap the block's own margin already makes, and emitting it too stacked a line of dead
+// space above and below every table, list, heading and code block a model wrote.
+assert.equal(render('a\n\nb'), 'a<br /><br />b<br />');
+assert.equal(render('x\n\n| a |\n|---|\n| 1 |\n\n```\nc\n```\n\ny'),
+	'x<br /><table><thead><tr><th>a</th></tr></thead><tbody><tr><td>1</td></tr></tbody></table>'
+	+ '<pre><code>c</code></pre>y<br />');
+assert.equal(render('intro:\n\n## Plan\n\n- one\n\ndone'), 'intro:<br /><h2>Plan</h2><ul><li>one</li></ul>done<br />');
 
 // 2. Tables, including alignment and a ragged row — a model routinely writes one cell short.
 assert.equal(

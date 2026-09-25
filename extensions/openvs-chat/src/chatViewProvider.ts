@@ -4,31 +4,41 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as vscode from 'vscode';
-import { AgentRunner, RunResult } from './agent/agentRunner';
+import { AgentA2A, AgentMessageDelivery, AgentOptions, AgentRunner, AgentSessionInfo, RunResult } from './agent/agentRunner';
 import { streamBudgeted } from './agent/budgetedStream';
+import { describeRestore, FileWrite, RunCheckpoint } from './agent/checkpoint';
 import { CACHED_COMPACT_TRIGGER, COMPACT_MARKER, COMPACT_TRIGGER, SUMMARY_MAX_TOKENS, compactMessages, shouldCompact } from './agent/compaction';
+import { contextTurn, estimateTokens, needsCompactPrompt, unfittableRequest, withSystemPrompt } from './agent/context';
 import { contextWindowFor, requestBudgets } from './agent/contextWindow';
 import { APPROVAL_POLICIES, ApprovalPolicy, applyApprovalFloor, Guardrails, loadGuardrails, parseApprovalPolicy, RunOrigin } from './agent/guardrails';
 import { ApprovalRequest, ApprovalResult, ToolApprover, UserQuestion } from './agent/tools';
-import { AutoOrchestrator, describePinnedModelError, isModelError } from './auto/orchestrator';
+import { AutoOrchestrator, describePinnedModelError, fallbackNote, isModelError, nextCandidate } from './auto/orchestrator';
 import { AUTO_ROLES, AutoRole, RoleAssignment, RoleRouter } from './auto/router';
 import { WebAuthManager } from './auth';
+import { importKiroCredential, signInWithDeviceFlow } from './deviceSignIn';
 import { McpManager } from './mcp/manager';
 import { supportsNativeSignIn } from './oauth';
 import { buildEnvContext } from './persona/envContext';
 import { modeDoctrine, personaBase } from './persona/prompts';
 import { smallTalkKind } from './persona/smallTalk';
 import { ThinkingStreamParser, formatThinking, stripHistoryThinking, stripThinking } from './persona/thinking';
+import { CopilotProvider } from './providers/copilot';
+import { GrokProvider } from './providers/grok';
+import { rateLimitStatus } from './providers/rateLimits';
 import { ProviderRegistry } from './providers/registry';
-import { ChatImage, ChatMessage, ChatProvider, ModelEntry, entrySupportsTools, isAbortError, modelSupportsVision } from './providers/types';
-import { AttachImageChunk, UploadAssembler } from './remote/attachments';
-import { RulesProvider } from './rules';
+import { withProviderResilience } from './providers/resilience';
+import { ModelCatalog } from './providers/modelCatalog';
+import { ChatImage, ChatMessage, ChatProvider, entrySupportsTools, isAbortError, modelSupportsVision } from './providers/types';
+import { defaultChromeProfilePath } from './providers/webCookie/chromeCookies';
+import { AttachImageChunk, UploadAssembler, readPickedImages } from './remote/attachments';
+import { QueueDrainGate } from './session/queueDrain';
+import { appendRules, COMPACT_RULES_CHARS, RulesProvider } from './rules';
 import { MessageSink, SessionBus } from './session/bus';
-import { adoptLegacyState, buildPersistedState, LegacyPersistedState, saveState } from './session/persistence';
+import { adoptLegacyState, buildPersistedState, LegacyPersistedState, loadState, restoredSessions, saveState } from './session/persistence';
 import { PromptRegistry } from './session/prompts';
 import { runSlash, SLASH_COMMANDS, SlashEffects } from './session/slash';
 import { SessionStore } from './session/store';
-import { HistoryEntry as SessionHistoryEntry, SessionDeps, SessionMemento, SessionState, SessionSummary, TranscriptEntry } from './session/types';
+import { HistoryEntry as SessionHistoryEntry, SessionDeps, SessionMemento, SessionState, SessionSummary, TranscriptImage } from './session/types';
 import { SkillRegistry } from './skills';
 import { CHAT_APP_HTML } from './webviewHtml';
 
@@ -73,6 +83,17 @@ const MIN_SKILL_CHARS = 2_000;
  */
 const MAX_READ_ONLY_STEPS = 30;
 
+/**
+ * Minimum time between proactive rate-limit notices for the same (provider, model) pair. A
+ * long agent run can succeed dozens of times while sitting at `'near'`/`'critical'` — this is
+ * what keeps that from repeating the same notice on every step. See
+ * {@link ChatViewProvider.rateLimitNoticeAt}.
+ */
+const RATE_LIMIT_NOTICE_COOLDOWN_MS = 5 * 60_000;
+
+/** Runs per tab whose file changes `/undo` can still take back, newest last. */
+const MAX_CHECKPOINTS_PER_SESSION = 10;
+
 /** A unique id for one send, used to fence out messages from a superseded run. */
 function newRunId(): string {
 	return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -102,7 +123,7 @@ const CHAT_ONLY_MESSAGE_TYPES: ReadonlySet<string> = new Set([
 	'token', 'agentStepStart', 'agentStepEnd', 'toolStart', 'toolEnd',
 	'done', 'newChat', 'inline', 'autoPhase', 'autoSummary', 'editProposal', 'compacted', 'steerable', 'steerRejected',
 	'approvalRequest', 'askRequest', 'promptCancel',
-	'sessions', 'transcript', 'runStart', 'commands', 'remote',
+	'sessions', 'transcript', 'runStart', 'userTurn', 'commands', 'remote',
 ]);
 
 /**
@@ -122,6 +143,20 @@ const DEFAULT_PROMPT_ESCALATION_SECONDS = 30;
 const ATTACH_ACTIVE_MAX_CHARS = 24 * 1024;
 const ENHANCE_SYSTEM = 'You are a prompt engineer. Rewrite the user\'s message into a clear, specific, self-contained prompt for an AI coding assistant. Preserve intent and concrete details; add structure and obvious missing specifics, but do not invent requirements. Return ONLY the improved prompt — no preamble, code fences, or commentary.';
 
+/** Stored Edit-mode proposals kept for the Apply button; see `ChatViewProvider.editProposals`. */
+const MAX_EDIT_PROPOSALS = 20;
+
+/** What an Edit-mode request rewrites, snapshotted when the request is sent. */
+interface EditTarget {
+	readonly uri: vscode.Uri;
+	/** The selection an inline action rewrites; absent for a whole-file edit. */
+	readonly range?: vscode.Range;
+	/** The document version at send time. */
+	readonly version: number;
+	/** The text of `range` (or of the whole file) at send time. */
+	readonly original: string;
+}
+
 interface AttachedContext {
 	readonly label: string;
 	readonly content: string;
@@ -135,11 +170,19 @@ interface WebviewToHost {
 	messages?: ChatMessage[];
 	context?: AttachedContext;
 	key?: string;
+	/** Backup API keys for `saveExtraKeys` — one entry per non-blank textarea line. */
+	keys?: string[];
 	url?: string;
 	content?: string;
 	role?: string;
 	reviewEnabled?: boolean;
 	inline?: boolean;
+	/** `applyEdit` only: which stored proposal to apply (see `ChatViewProvider.editProposals`). */
+	proposalId?: string;
+	/** `send` only: the turn was written by an editor action and embeds selected code — see `TranscriptEntry.fromEditor`. */
+	fromEditor?: boolean;
+	/** `send` only: a client draining its tab's queue after `done` — see `session/queueDrain.ts`. */
+	fromQueue?: boolean;
 	/** The new checked state for a boolean settings-panel toggle, e.g. `setCompletionsEnabled`. */
 	value?: boolean;
 	/**
@@ -171,6 +214,12 @@ interface WebviewToHost {
 	historyId?: string;
 	/** The replacement queue for `setQueue` — a wholesale set, not an incremental push. */
 	queue?: string[];
+	/** `createSession` only: `false` opens the chat without making it the host's active one (a phone opening its own chat). */
+	activate?: boolean;
+	/** `setRemoteEnabled` only: the Settings switch's new position. */
+	enabled?: boolean;
+	/** `listModels` only: bypass the cached catalog and fetch again (the ⟳ button). */
+	refresh?: boolean;
 	/** Pagination for `fetchTranscript`: `before` is the transcript index to page strictly before; `count` how many entries to return (defaults to `DEFAULT_PAGE_COUNT` when absent/invalid). */
 	before?: number;
 	count?: number;
@@ -207,6 +256,7 @@ interface PairingHandlerResult {
 	readonly code: string;
 	readonly expiresAt: number;
 	readonly url: string;
+	readonly hint?: string;
 }
 
 /**
@@ -230,8 +280,8 @@ interface DeviceInfo {
  */
 interface DevicesHandler {
 	list(): Promise<DeviceInfo[]>;
-	/** Resolves once the relay has confirmed the revoke (or {@link revokeDevice}'s own timeout elapses) — see that function's doc for why this is no longer fire-and-forget. */
-	revoke(deviceId: string): Promise<void>;
+	/** Resolves once the relay has confirmed the revoke (true) or {@link revokeDevice}'s own timeout elapses (false); rejects when not connected. See that function's doc. */
+	revoke(deviceId: string): Promise<boolean>;
 }
 
 /** A function that posts to the webview with a session id pre-bound. */
@@ -267,6 +317,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	private settingsPanel?: vscode.WebviewPanel;
 	/** One in-flight request per chat tab, so parallel conversations don't cancel each other. */
 	private readonly activeRequests = new Map<string, AbortController>();
+	/** Admits one queue drain per finished run — see {@link QueueDrainGate}. */
+	private readonly queueDrains = new QueueDrainGate();
 	/**
 	 * Steering messages typed while an agent run is in flight, per chat tab.
 	 *
@@ -293,6 +345,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	 * the loop that is about to start and is drained when it does.
 	 */
 	private readonly steerableRuns = new Map<string, string>();
+
+	/**
+	 * Last time a proactive rate-limit notice (see {@link maybeNoticeRateLimit}) was shown for
+	 * a `${providerId}:${model}` pair, epoch ms. Session-scoped and in-memory, same convention
+	 * as {@link RateLimitTracker}/`CooldownTracker`/`KeyRotator` — a stale entry costs at most
+	 * one skipped or one extra notice, since the next successful request re-derives the truth.
+	 * Throttled purely by elapsed time ({@link RATE_LIMIT_NOTICE_COOLDOWN_MS}) rather than by
+	 * "notify again only after dropping back to `'ok'`": a run that sits at `'critical'` for
+	 * an hour genuinely deserves more than one reminder, and a pure time cooldown needs no
+	 * extra state to track the last-seen status per pair.
+	 */
+	private readonly rateLimitNoticeAt = new Map<string, number>();
+
+	/**
+	 * `${providerId}:${model}` pairs already told they run on the compact prompt (see
+	 * {@link noticeCompactPrompt}). Once per pair for the life of the view: the switch is a
+	 * property of the model's budget, so it recurs on every send and is only news once.
+	 */
+	private readonly compactNoticed = new Set<string>();
+
+	/**
+	 * Per tab, the file changes of its recent runs, so `/undo` can take the latest back (see
+	 * {@link RunCheckpoint}). In memory only: after a reload the text needed to restore is gone,
+	 * and `/undo` says so rather than guessing.
+	 */
+	private readonly checkpoints = new Map<string, { runId: string; checkpoint: RunCheckpoint }[]>();
 
 	/**
 	 * Remote-control connection status, as last reported by `RemoteService` via
@@ -332,6 +410,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	 * see {@link UploadAssembler}'s own doc.
 	 */
 	private readonly uploadAssembler = new UploadAssembler();
+
+	/** Whether the "Attach image" dialog is open (see {@link handlePickImages}). */
+	private pickingImages = false;
 
 	/**
 	 * Records whether this run can be steered and tells the tab, which until now assumed it
@@ -404,9 +485,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		this.steerQueues.delete(sessionId);
 		return queued.filter(entry => !entry.runId || entry.runId === runId).map(entry => entry.text);
 	}
-	private editTarget?: vscode.Uri;
-	private editRange?: vscode.Range;
-	private inlineEditActive = false;
+	/**
+	 * The target an inline editor action (Fix/Doc/Optimize/Edit) captured, handed to the one
+	 * `send` it triggers — and only to a send marked `inline`, so another tab's send arriving
+	 * first cannot take it. See {@link takeEditTarget}.
+	 */
+	private pendingInlineTarget?: EditTarget;
+	/**
+	 * Edits Edit mode proposed, by id, each with the target snapshotted when its request was
+	 * sent. The Apply button names an id; the host applies its own stored copy to that file.
+	 */
+	private readonly editProposals = new Map<string, { target: EditTarget; content: string }>();
 	private readonly router: RoleRouter;
 	private readonly rules = new RulesProvider();
 	private readonly skills: SkillRegistry;
@@ -466,6 +555,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			update: (key, value) => Promise.resolve(context.workspaceState.update(key, value)),
 		};
 		this.bus.setChatOnlyTypes(CHAT_ONLY_MESSAGE_TYPES);
+		this.restoreSessionState();
 		// A hidden sink that exercises the N-sink paths (origin routing, rebind, escalation)
 		// with no network transport — see the "remote control" plan's Phase 3 staging note.
 		// Read once at construction, like `traceSessions`: no live toggling.
@@ -511,9 +601,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		};
 	}
 
-	private async baseSystem(): Promise<string> {
+	/**
+	 * The two base system prompts one send may use: the full one, and the compact one sent
+	 * instead when a model's per-request budget cannot carry the full one (see
+	 * `needsCompactPrompt`). Built together from one environment probe and one rules read.
+	 *
+	 * The compact prompt condenses the identity, caps the project rules at
+	 * {@link COMPACT_RULES_CHARS} and leaves the active skills out: on a budget that small a
+	 * skill (up to 16k characters) cannot fit whole, and half a skill is worse than none.
+	 */
+	private async basePrompts(): Promise<{ full: string; compact: string }> {
 		const env = this.environmentEnabled() ? (await buildEnvContext()).stable : '';
-		let base = await this.rules.composeSystem(personaBase(env, this.registry.getSystemPrompt()));
+		const userBase = this.registry.getSystemPrompt();
+		const rules = await this.rules.getRules();
+		return {
+			full: await this.withSkills(appendRules(personaBase(env, userBase), rules)),
+			compact: appendRules(personaBase(env, userBase, true), rules, COMPACT_RULES_CHARS),
+		};
+	}
+
+	/** `base` followed by every active skill, within the combined skills budget. */
+	private async withSkills(prompt: string): Promise<string> {
+		let base = prompt;
 		// Skills go in the system prompt, which every request and every agent step carries,
 		// so their combined size is a per-step cost paid for the whole run. The per-skill cap
 		// bounded one skill; nothing bounded the set, and the bundled skills are large enough
@@ -629,7 +738,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		const history: HistoryEntry[] = this.sessionStore.getHistory().map(h => ({
 			id: h.id,
 			title: h.title,
-			messages: h.messages.map(m => ({ role: m.role, content: m.content, images: m.images, toolCalls: m.toolCalls, toolCallId: m.toolCallId })),
+			// Every field kept: this used to be a hand-picked list that dropped `kind` — so after a
+			// reload a restored chat's notices became real turns sent to the model — and
+			// `fromEditor`, which keeps selected editor code off paired phones.
+			messages: h.messages.map(m => ({ ...m })),
 			savedAt: h.savedAt,
 		}));
 		await this.context.workspaceState.update(ChatViewProvider.HISTORY_KEY, history);
@@ -816,9 +928,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		const isEdit = kind === 'fix' || kind === 'doc' || kind === 'optimize' || kind === 'edit';
 		const mode: ChatMode = isEdit ? 'edit' : 'ask';
 		if (isEdit) {
-			this.editTarget = editor.document.uri;
-			this.editRange = range;
-			this.inlineEditActive = true;
+			this.pendingInlineTarget = { uri: editor.document.uri, range, version: editor.document.version, original: code };
 		}
 
 		const prompts: Record<InlineKind, string> = {
@@ -1014,6 +1124,72 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		}
 	}
 
+	/** Records a file write a run made, for `/undo`. Called by the run's {@link SessionApprover}. */
+	recordRunWrite(sessionId: string, runId: string, write: FileWrite): void {
+		const list = this.checkpoints.get(sessionId) ?? [];
+		let entry = list.find(c => c.runId === runId);
+		if (!entry) {
+			entry = { runId, checkpoint: new RunCheckpoint() };
+			list.push(entry);
+			list.splice(0, Math.max(0, list.length - MAX_CHECKPOINTS_PER_SESSION));
+			this.checkpoints.set(sessionId, list);
+		}
+		entry.checkpoint.record(write);
+	}
+
+	/**
+	 * Moves a tab's undo history to the id `/clear` gave it. Clearing starts a new conversation,
+	 * but the files the earlier runs changed are still changed, and `/undo` must still reach them.
+	 */
+	private carryCheckpoints(oldId: string, newId: string): void {
+		const list = this.checkpoints.get(oldId);
+		if (list) {
+			this.checkpoints.delete(oldId);
+			this.checkpoints.set(newId, list);
+		}
+	}
+
+	/** Names the files a finished run changed and how to take them back. Silent when it changed none. */
+	private announceCheckpoint(sessionId: string, runId: string, post: SessionPost): void {
+		const entry = this.checkpoints.get(sessionId)?.find(c => c.runId === runId);
+		if (!entry || entry.checkpoint.isEmpty) {
+			return;
+		}
+		const files = entry.checkpoint.describe();
+		post({
+			type: 'info',
+			message: `This run changed ${files.length} file(s): ${files.join(', ')}. Press Undo or send /undo to restore them (changes made by commands it ran are not tracked).`,
+		});
+		// Draws the Undo button. `checkpointRunId`, not `runId`: clients drop a message whose
+		// `runId` belongs to a superseded run, and the "undone" reply below can arrive after
+		// a newer run in the tab has started.
+		post({ type: 'checkpoint', checkpointRunId: runId, files });
+	}
+
+	/**
+	 * Restores the files a run changed: the one named by `runId` (the Undo button), or the
+	 * tab's latest not-yet-undone run (`/undo`). Refused while a run is in flight, since that
+	 * run may be about to write the same files again. An earlier run can be undone after a
+	 * later one: any file the later run changed again is left alone, and the report says so.
+	 */
+	private async undoLastRun(sessionId: string, origin: string, runId?: string): Promise<void> {
+		const reply = (message: string) => this.bus.postTo(origin, { type: 'info', sessionId, message });
+		if (this.activeRequests.has(sessionId)) {
+			reply('Undo: stop the running request first — it may still be changing files.');
+			return;
+		}
+		const list = this.checkpoints.get(sessionId) ?? [];
+		const index = runId ? list.findIndex(c => c.runId === runId) : list.length - 1;
+		const entry = index >= 0 ? list.splice(index, 1)[0] : undefined;
+		if (!entry) {
+			reply('Undo: no file changes from this tab\'s runs are left to undo (they are kept in memory only, so a reload clears them).');
+			return;
+		}
+		reply(describeRestore(await entry.checkpoint.restore()));
+		// Every connected client's Undo button for that run goes away.
+		this.post({ type: 'checkpoint', sessionId, checkpointRunId: entry.runId, files: [] });
+	}
+
 	/** Builds the per-run channel the agent uses to reach the user. */
 	private approverFor(sessionId: string, runId: string, signal: AbortSignal): ToolApprover {
 		return new SessionApprover(this, sessionId, runId, signal);
@@ -1103,10 +1279,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				this.postCommands();
 				this.postRemote();
 				break;
-			case 'saveHistory':
-				if (Array.isArray(message.history)) {
-					await this.context.workspaceState.update(ChatViewProvider.HISTORY_KEY, message.history);
-					this.sessionStore.mergeHistory(this.toSessionHistory(message.history));
+			case 'deleteHistory':
+				// By id, applied to the store — the one copy every later save is made from. The old
+				// `saveHistory` wrote the panel's list to disk but could only merge it into the store,
+				// so a deleted conversation came back with the next archive save.
+				if (message.historyId && this.sessionStore.deleteHistory(message.historyId)) {
+					await this.persistAndPostHistory();
 				}
 				break;
 			case 'send':
@@ -1140,7 +1318,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				}
 				break;
 			case 'createSession': {
-				const created = this.sessionStore.createSession(true, message.mode ?? 'ask');
+				// `activate: false` is how a phone opens a chat without switching the desktop
+				// away from the one it's in — each device keeps its own tab (see pwa/app.js).
+				const created = this.sessionStore.createSession(message.activate !== false, message.mode ?? 'ask');
 				this.persistSessionState();
 				this.postSessions();
 				this.postTranscript(created.id);
@@ -1163,6 +1343,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 					break;
 				}
 				const result = this.sessionStore.closeSession(message.sessionId);
+				this.checkpoints.delete(message.sessionId);
 				if (result.abortSessionId) {
 					this.activeRequests.get(result.abortSessionId)?.abort();
 				}
@@ -1182,6 +1363,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				if (!result) {
 					break;
 				}
+				this.carryCheckpoints(message.sessionId, result.newId);
 				if (result.abortSessionId) {
 					this.activeRequests.get(result.abortSessionId)?.abort();
 				}
@@ -1247,15 +1429,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				// method's doc for why sending the local sink a tail-only view was a bug, not a
 				// feature). Sending the *remote* sink a full multi-hundred-turn transcript here
 				// would reintroduce exactly that bug through a different door.
-				const sessionId = message.sessionId || this.sessionStore.getActiveId();
-				const isLocal = origin === WEBVIEW_SINK_ID;
-				this.bus.postTo(origin, {
-					type: 'sessions',
-					sessions: this.sessionStore.getSessions().map(s => this.toSessionSummary(s)),
-					activeSessionId: this.sessionStore.getActiveId(),
-				});
-				const window = this.sessionStore.windowedMessages(sessionId, isLocal ? { tailTurns: Infinity, tailBytes: Infinity } : undefined);
-				this.bus.postTo(origin, { type: 'transcript', sessionId, ...window });
+				this.postSyncTo(origin, message.sessionId || this.sessionStore.getActiveId());
 				break;
 			}
 			case 'fetchTranscript': {
@@ -1294,6 +1468,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 						await this.clearKeyWithEnvNotice(message.provider);
 					}
 					this.invalidateModelCache(message.provider);
+					await this.postConfig();
+				}
+				break;
+			case 'saveExtraKeys':
+				// Backup keys for round-robin on 401/403/429 — see ProviderRegistry.setExtraApiKeys
+				// and providers/resilience.ts. Empty strings/whitespace-only lines are dropped
+				// there, so a textarea with trailing blank lines round-trips cleanly.
+				if (message.provider && Array.isArray(message.keys)) {
+					await this.registry.setExtraApiKeys(message.provider, message.keys.filter((k): k is string => typeof k === 'string'));
 					await this.postConfig();
 				}
 				break;
@@ -1417,6 +1600,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 					this.postRemote(origin, undefined, undefined, err instanceof Error ? err.message : String(err));
 				}
 				break;
+			case 'setRemoteEnabled':
+				// The Settings panel's on/off switch. Desktop-only (REMOTE_DENIED in
+				// src/remote/policy.ts): a paired phone must not be able to switch remote off, or on.
+				if (message.enabled) {
+					await vscode.commands.executeCommand('openvsChat.remoteEnable', { quiet: true });
+				} else {
+					await vscode.workspace.getConfiguration('openvsChat').update('remote.enabled', false, vscode.ConfigurationTarget.Global);
+				}
+				// Answers with the real state, so a switch that couldn't turn on (no relay URL in
+				// hosted mode) flips back instead of showing "on".
+				this.postRemote(origin);
+				break;
 			case 'listDevices':
 				// Desktop-only, like `requestPairing` above — denied to remote clients in
 				// src/remote/policy.ts's REMOTE_DENIED: a paired phone must never enumerate the
@@ -1457,7 +1652,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				}
 				break;
 			case 'listModels':
-				await this.handleListModels(message.provider);
+				await this.handleListModels(message.provider, message.refresh === true);
 				break;
 			case 'attachContext':
 				await this.handleAttachContext();
@@ -1465,11 +1660,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			case 'attachActive':
 				await this.handleAttachActive(origin);
 				break;
+			case 'pickImages':
+				await this.handlePickImages();
+				break;
 			case 'attachImage':
 				this.handleAttachImage(message, origin);
 				break;
 			case 'applyEdit':
-				await this.handleApplyEdit(message.content ?? '');
+				await this.applyProposal(message.proposalId ?? '');
+				break;
+			case 'undoRun':
+				if (message.sessionId && message.runId) {
+					await this.undoLastRun(message.sessionId, origin, message.runId);
+				}
 				break;
 			case 'insertAtCursor':
 				await this.handleInsertAtCursor(message.content ?? '');
@@ -1515,6 +1718,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 					const queue = this.steerQueues.get(message.sessionId) ?? [];
 					queue.push({ runId: message.runId ?? '', text: message.text.trim() });
 					this.steerQueues.set(message.sessionId, queue);
+					// The steering client echoed it already; every other one should see the
+					// correction too, not an agent changing course for no visible reason.
+					this.bus.postExcept(origin, { type: 'userTurn', sessionId: message.sessionId, runId: message.runId ?? '', content: message.text.trim(), images: [] });
 				}
 				break;
 			case 'listMcp':
@@ -1540,13 +1746,79 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		}
 	}
 
-	private async handleSignIn(providerId?: string): Promise<void> {
+	/**
+	 * Runs the sign-in flow for `providerId`: device-flow OAuth for Copilot/Grok, a local
+	 * credential import for Kiro, the redirect-URI/native web flow for everything that has
+	 * one configured, and a paste-a-key prompt otherwise. Public (not just reached via the
+	 * webview's generic `signIn` message) so `extension.ts`'s `openvsChat.signIn` command —
+	 * the Command Palette entry point — shares this one implementation instead of
+	 * duplicating a second, older dispatch that never learned about the three OAuth-proxy
+	 * providers.
+	 */
+	async handleSignIn(providerId?: string): Promise<void> {
 		if (!providerId) {
 			return;
 		}
 		try {
 			const provider = this.registry.getProvider(providerId);
-			if (this.registry.getAuthUrl(providerId) || supportsNativeSignIn(providerId)) {
+			const label = provider?.info.label ?? providerId;
+			if (providerId === 'copilot') {
+				// Device-flow sign-in against GitHub's own OAuth grant — see CopilotProvider's
+				// class doc for what this actually authenticates as and why.
+				const result = await signInWithDeviceFlow(label, {
+					deviceCodeUrl: CopilotProvider.DEVICE_CODE_URL,
+					tokenUrl: CopilotProvider.TOKEN_URL,
+					clientId: CopilotProvider.CLIENT_ID,
+					scope: CopilotProvider.SCOPE,
+				});
+				if (result) {
+					// Copilot has no separate refresh token to persist — the GitHub device-flow
+					// token itself is the long-lived credential; CopilotProvider mints the
+					// short-lived wire token from it per request.
+					await this.registry.setApiKey(providerId, result.accessToken);
+					this.invalidateModelCache(providerId);
+					vscode.window.showInformationMessage(`${label} connected.`);
+				}
+			} else if (providerId === 'grok') {
+				// A thunk, not a pre-resolved config: OIDC discovery runs INSIDE the progress
+				// notification signInWithDeviceFlow opens, so a slow/hanging discovery call
+				// still shows a cancel button instead of leaving the click on "Sign in" looking
+				// like it did nothing.
+				const result = await signInWithDeviceFlow(label, signal => GrokProvider.discoverDeviceFlowConfig(signal));
+				if (result) {
+					await this.registry.setApiKey(providerId, JSON.stringify({
+						accessToken: result.accessToken, refreshToken: result.refreshToken, expiresAt: result.expiresAt,
+					}));
+					this.invalidateModelCache(providerId);
+					vscode.window.showInformationMessage(`${label} connected.`);
+				}
+			} else if (providerId === 'kiro') {
+				// Not a sign-in flow at all — imports the token Kiro's own IDE/CLI already
+				// wrote after a normal sign-in there. See importKiroCredential's doc.
+				const credential = await importKiroCredential();
+				await this.registry.setApiKey(providerId, credential);
+				this.invalidateModelCache(providerId);
+				vscode.window.showInformationMessage(`${label} credential imported.`);
+			} else if (providerId === 'web_gemini') {
+				// Also not a sign-in flow — there is no credential to obtain, only a Chrome
+				// profile directory to point at. Auto-filling the DEFAULT profile's path as
+				// the primary key (rather than leaving it blank, which also works — see
+				// GeminiWebProvider.profilePath) is what makes "Additional API keys" usable
+				// for a second/third Google account: ProviderRegistry.getApiKeys only
+				// considers the backup pool once a primary key is actually stored.
+				const defaultProfile = defaultChromeProfilePath();
+				if (!defaultProfile) {
+					vscode.window.showErrorMessage('Gemini (Chrome session) has no default Chrome profile location on this platform (Windows only, for now).');
+				} else {
+					await this.registry.setApiKey(providerId, defaultProfile);
+					this.invalidateModelCache(providerId);
+					vscode.window.showInformationMessage(
+						`${label} will use the default Chrome profile (${defaultProfile}). Add more Google accounts ` +
+						'under "Additional API keys" on this card, and enable "openvsChat.webGemini.enabled" in ' +
+						'Settings before using it — read the risk in the provider\'s description first.',
+					);
+				}
+			} else if (this.registry.getAuthUrl(providerId) || supportsNativeSignIn(providerId)) {
 				// A web auth backend is configured (or the provider has a built-in
 				// account login): run the browser round-trip flow.
 				const ok = await this.auth.signIn(providerId);
@@ -1625,17 +1897,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		const controller = new AbortController();
 		let out = '';
 		try {
-			await provider.streamChat({
-				messages: [
-					{ role: 'system', content: ENHANCE_SYSTEM },
-					{ role: 'user', content: text },
-				],
-				model: model || this.registry.getModel(providerId),
-				apiKey: apiKey ?? '',
-				baseUrl: this.registry.getBaseUrl(providerId),
-				maxTokens: this.registry.getMaxTokens(),
-				signal: controller.signal,
-				onToken: delta => { out += delta; },
+			const resolvedModel = model || this.registry.getModel(providerId);
+			// Sized like every other request. With the raw configured reservation (8192 by
+			// default) this was refused outright on an 8k allowance or an 8k-window model,
+			// before the draft itself was even read.
+			const budgets = this.budgetsFor(resolvedModel, this.registry.getMaxTokens(), providerId);
+			await withProviderResilience(this.registry, providerId, resolvedModel, key => {
+				// A retry on a rotated key starts over; text from the failed attempt must not prefix it.
+				out = '';
+				return streamBudgeted(provider, {
+					messages: [
+						{ role: 'system', content: ENHANCE_SYSTEM },
+						{ role: 'user', content: text },
+					],
+					model: resolvedModel,
+					apiKey: key,
+					baseUrl: this.registry.getBaseUrl(providerId),
+					maxTokens: budgets.maxTokens,
+					contextBudget: budgets.contextBudget,
+					signal: controller.signal,
+					onToken: delta => { out += delta; },
+					onNotice: () => { /* the composer shows only the result */ },
+				});
 			});
 			this.bus.postTo(origin, { type: 'enhancedPrompt', text: out.trim() || text });
 		} catch (err) {
@@ -1653,10 +1936,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			this.post({ type: 'info', message: `Unknown provider: ${providerId}` });
 			return;
 		}
-		const controller = new AbortController();
 		try {
-			const models = await this.registry.listModels(providerId, controller.signal);
-			this.modelCache.set(providerId, models);
+			const models = await this.modelCache.load(providerId, true);
 			this.post({ type: 'info', message: `${provider.info.label}: connection OK — ${models.length} models available.` });
 			this.post({ type: 'models', provider: providerId, models });
 		} catch (err) {
@@ -1678,18 +1959,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		await vscode.window.showTextDocument(editor.document);
 	}
 
-	private async handleListModels(providerId?: string): Promise<void> {
-		if (!providerId) {
+	private async handleListModels(providerId: string | undefined, refresh: boolean): Promise<void> {
+		if (!providerId || !this.registry.getProvider(providerId)) {
 			return;
 		}
-		const controller = new AbortController();
-		try {
-			const models = await this.registry.listModels(providerId, controller.signal);
-			this.modelCache.set(providerId, models);
-			this.post({ type: 'models', provider: providerId, models });
-		} catch (err) {
-			this.post({ type: 'info', message: err instanceof Error ? err.message : String(err) });
-		}
+		await this.publishModels(providerId, refresh);
 	}
 
 	private async handleAttachContext(): Promise<void> {
@@ -1715,6 +1989,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			type: 'context',
 			context: { label, content: `File: ${name} (${editor.document.languageId})\n\n${text}` },
 		});
+	}
+
+	/**
+	 * The composer's "Attach image" button. VS Code's own open dialog rather than a browser
+	 * file input inside the webview: it is the dialog the rest of the editor uses, and reading
+	 * through `workspace.fs` works the same in a remote workspace, where the files are not on
+	 * this machine's disk at all. Reading and typing the files is `readPickedImages`'s job; the
+	 * reply goes to the desktop webview alone — `pickImages` is `REMOTE_DENIED`, and these are
+	 * local files. The webview does the resizing and the per-message cap, exactly as it does
+	 * for a pasted screenshot.
+	 */
+	private async handlePickImages(): Promise<void> {
+		// A second click while the dialog is up is not a second request: without this it queued
+		// behind the first and opened another dialog the moment the first one closed.
+		if (this.pickingImages) {
+			return;
+		}
+		this.pickingImages = true;
+		try {
+			const uris = await vscode.window.showOpenDialog({
+				canSelectMany: true,
+				openLabel: 'Attach',
+				title: 'Attach Images',
+				filters: { Images: ['png', 'jpg', 'jpeg', 'gif', 'webp'] },
+			});
+			if (!uris?.length) {
+				return;
+			}
+			const { images, skipped } = await readPickedImages(uris, vscode.workspace.fs);
+			this.bus.postTo(WEBVIEW_SINK_ID, { type: 'pickedImages', images, skipped });
+		} finally {
+			this.pickingImages = false;
+		}
 	}
 
 	/**
@@ -1797,35 +2104,93 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		}
 	}
 
-	private async handleApplyEdit(content: string): Promise<void> {
-		if (!this.editTarget || !content) {
-			vscode.window.showWarningMessage('No edit to apply.');
+	/**
+	 * Applies a stored Edit-mode proposal to the file it was made for.
+	 *
+	 * The target is the one snapshotted when the request was sent, never whatever the view
+	 * happens to hold now: that used to be a single field every send reset, so with tabs
+	 * streaming in parallel an edit proposed for one file could be written over another, or
+	 * silently dropped. And the file must still be what the model saw. If it changed since,
+	 * an automatic apply stands down (the user reviews and presses Apply), a range edit is
+	 * refused outright unless its text is untouched (the range may now cover other code), and
+	 * a whole-file replacement asks first, since it would overwrite those changes.
+	 *
+	 * `auto` is Edit mode's own apply at the end of the reply; `post` reports into its tab.
+	 */
+	private async applyProposal(proposalId: string, auto = false, post?: SessionPost): Promise<void> {
+		const proposal = this.editProposals.get(proposalId);
+		if (!proposal) {
+			vscode.window.showWarningMessage('This proposed edit is no longer available (it was already applied, or the window reloaded).');
 			return;
 		}
+		const { target, content } = proposal;
+		const name = vscode.workspace.asRelativePath(target.uri);
 		try {
-			const doc = await vscode.workspace.openTextDocument(this.editTarget);
-			const isWholeFileReplace = !this.editRange;
+			const doc = await vscode.workspace.openTextDocument(target.uri);
+			const wholeRange = new vscode.Range(doc.positionAt(0), doc.positionAt(doc.getText().length));
+			const range = target.range ?? wholeRange;
+			const unchanged = doc.version === target.version || doc.getText(range) === target.original;
+			if (!unchanged) {
+				if (auto) {
+					post?.({ type: 'info', message: `${name} changed while the model was working, so the edit was not applied automatically. Review it and press Apply to use it.` });
+					return;
+				}
+				if (target.range) {
+					vscode.window.showWarningMessage(`The selected code in ${name} changed after the action started, so this edit can't be placed safely. Run the action again.`);
+					return;
+				}
+				const choice = await vscode.window.showWarningMessage(
+					`${name} changed after this edit was proposed. Applying it replaces the whole file, including those changes. Apply anyway?`,
+					{ modal: true }, 'Apply Anyway');
+				if (choice !== 'Apply Anyway') {
+					return;
+				}
+			}
 			const originalLength = doc.getText().length;
 			// A whole-file replacement that's drastically shorter than the original is the
 			// signature of a truncated model response slipping past the fence-balance check
 			// (e.g. the model closed the block early with a "// ... rest unchanged" comment).
-			if (isWholeFileReplace && originalLength > 200 && content.length < originalLength * 0.4) {
+			if (!target.range && originalLength > 200 && content.length < originalLength * 0.4) {
 				const choice = await vscode.window.showWarningMessage(
-					`The proposed content for ${vscode.workspace.asRelativePath(this.editTarget)} is only ${Math.round(content.length / originalLength * 100)}% of the file's current size. This can mean the model's response was truncated. Apply anyway?`,
+					`The proposed content for ${name} is only ${Math.round(content.length / originalLength * 100)}% of the file's current size. This can mean the model's response was truncated. Apply anyway?`,
 					{ modal: true }, 'Apply Anyway');
 				if (choice !== 'Apply Anyway') {
 					return;
 				}
 			}
 			const edit = new vscode.WorkspaceEdit();
-			const range = this.editRange ?? new vscode.Range(doc.positionAt(0), doc.positionAt(originalLength));
-			edit.replace(this.editTarget, range, content);
-			await vscode.workspace.applyEdit(edit);
+			edit.replace(target.uri, range, content);
+			// `applyEdit` reports failure by resolving false (a read-only file, a document the
+			// editor refused to change), not by throwing — ignoring it announced "Applied".
+			if (!await vscode.workspace.applyEdit(edit)) {
+				vscode.window.showErrorMessage(`Could not apply the edit to ${name}: the editor refused the change.`);
+				return;
+			}
+			this.editProposals.delete(proposalId);
 			await vscode.window.showTextDocument(doc);
-			vscode.window.showInformationMessage(`Applied changes to ${vscode.workspace.asRelativePath(this.editTarget)}.`);
+			vscode.window.showInformationMessage(`Applied changes to ${name} (Undo in the editor reverts them).`);
 		} catch (err) {
 			vscode.window.showErrorMessage(`Could not apply edit: ${err instanceof Error ? err.message : String(err)}`);
 		}
+	}
+
+	/**
+	 * The file (and, for an inline action, the range) an Edit-mode request is about, snapshotted
+	 * as the request is sent. Undefined outside Edit mode, or with no editor to edit.
+	 */
+	private takeEditTarget(mode: ChatMode, inline: boolean): EditTarget | undefined {
+		const pending = inline ? this.pendingInlineTarget : undefined;
+		if (inline) {
+			this.pendingInlineTarget = undefined;
+		}
+		if (mode !== 'edit') {
+			return undefined;
+		}
+		if (inline) {
+			return pending;
+		}
+		const doc = vscode.window.activeTextEditor?.document;
+		return doc ? { uri: doc.uri, version: doc.version, original: doc.getText() } : undefined;
 	}
 
 	/**
@@ -1834,13 +2199,40 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	 * cancelled run's trailing `done` would end the run that replaced it, blanking the
 	 * bubble and re-enabling Send while the new answer was still streaming.
 	 */
+	/**
+	 * Catches one sink up: every tab's metadata, then `sessionId`'s transcript — whole for the
+	 * local webview, the default tail for a remote one (see `case 'sync':` for why).
+	 */
+	private postSyncTo(origin: string, sessionId: string): void {
+		const isLocal = origin === WEBVIEW_SINK_ID;
+		this.bus.postTo(origin, {
+			type: 'sessions',
+			sessions: this.sessionStore.getSessions().map(s => this.toSessionSummary(s)),
+			activeSessionId: this.sessionStore.getActiveId(),
+		});
+		const window = this.sessionStore.windowedMessages(sessionId, isLocal ? { tailTurns: Infinity, tailBytes: Infinity } : undefined);
+		this.bus.postTo(origin, { type: 'transcript', sessionId, ...window });
+	}
+
 	private sessionPost(sessionId: string, runId = ''): SessionPost {
-		return m => this.post({ ...m, sessionId, runId });
+		return m => {
+			if (m.type === 'done') {
+				this.queueDrains.runFinished(sessionId);
+			}
+			this.post({ ...m, sessionId, runId });
+		};
 	}
 
 	private async handleSend(message: WebviewToHost, origin: string): Promise<void> {
 		const requestedMode: ChatMode = message.mode ?? 'ask';
 		const sessionId = message.sessionId || 'default';
+		// A second client's drain of the same queue after the same `done` (see QueueDrainGate):
+		// refused before anything is posted or appended, and that client — which has already
+		// echoed the turn locally — is resynced to the run the first drain started.
+		if (!this.queueDrains.admit(sessionId, message.fromQueue === true)) {
+			this.postSyncTo(origin, sessionId);
+			return;
+		}
 		// Resolved once, here, for this run — never re-derived per tool call (see
 		// `applyApprovalFloor`'s doc for why that matters). Both the plain Agent path below
 		// and the read-only tool loop share it; the Auto path gets its own call inside
@@ -1867,7 +2259,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
 		// Edit mode auto-applies the model's reply directly to whatever file
 		// `resolveContext`/`runStreaming` resolve as `editTarget` (the *desktop's* current
-		// active editor) — with no approval prompt at all (see `handleApplyEdit`'s own doc;
+		// active editor) — with no approval prompt at all (see `applyProposal`'s own doc;
 		// this bypasses the whole guardrails/approval-floor system entirely, which only gates
 		// the Agent tool loop). It was only ever meant to be reachable from `runInline`'s own
 		// local-only trigger — a right-click command, or one of the five `SLASH_INLINE`
@@ -1904,7 +2296,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		const pendingImages = this.sessionStore.takePendingImages(sessionId);
 		const images = [...(message.images ?? []), ...(pendingImages ?? [])];
 		if (message.text || images.length) {
-			this.sessionStore.appendMessage(sessionId, { role: 'user', content: message.text ?? '', images: images.length ? images : undefined });
+			this.appendUserTurn(sessionId, runId, message.text ?? '', images.length ? images : undefined, origin, message.fromEditor === true && origin === WEBVIEW_SINK_ID);
 		}
 
 		if (message.provider === AUTO_PROVIDER) {
@@ -2001,11 +2393,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			// such turn ~1.9k tokens of tool schemas for the privilege.
 			const smallTalk = !!talkKind;
 			const readTools = (mode === 'ask' || mode === 'plan') && !smallTalk && !!provider.runAgentStep && this.modelToolCapable(providerId, provider, model);
-			const systemPrompt = this.buildSystemPrompt(mode, await this.baseSystem(), !!message.inline, readTools);
-			const assembled: ChatMessage[] = [{ role: 'system', content: systemPrompt }];
-			const context = await this.resolveContext(mode, message.context);
+			const prompts = await this.systemPrompts(mode, !!message.inline, readTools);
+			const assembled: ChatMessage[] = [{ role: 'system', content: prompts.full }];
+			const contextBudget = this.configuredContextTokens(model, params.maxTokens, providerId);
+			const editTarget = this.takeEditTarget(mode, !!message.inline);
+			const context = await this.resolveContext(mode, message.context, contextBudget, editTarget);
+			// Throws, with a message that says what to do, when no amount of trimming can make
+			// this request fit — far better than a provider refusal after a wasted request.
+			const unfittable = unfittableRequest({
+				model,
+				budget: contextBudget,
+				instructions: prompts.compact ?? prompts.full,
+				message: request?.content ?? '',
+				wholeFile: mode === 'edit' && !message.inline ? context?.content : undefined,
+			});
+			if (unfittable) {
+				throw new Error(unfittable);
+			}
 			if (context) {
-				assembled.push({ role: 'user', content: `Context for the request:\n\n${context.content}` });
+				// Edit mode's file is not reference material but the thing being rewritten whole:
+				// it must never be cut to fit (the reply would drop the file's tail), so it is not
+				// built as a `contextTurn`, which trimming may cut as a last resort.
+				assembled.push(mode === 'edit'
+					? { role: 'user', content: `The file to edit:
+
+${context.content}` }
+					: contextTurn(context.content));
 			}
 			const head = assembled.length;
 			assembled.push(...history);
@@ -2030,17 +2443,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				{ model, apiKey: apiKey ?? '', baseUrl: params.baseUrl, maxTokens: params.maxTokens, signal: controller.signal },
 				post,
 				sessionId,
+				prompts.compact,
 			);
 
 			if (mode === 'agent') {
-				this.reportStop(post, await this.runAgent(provider, messages, { ...params, signal: controller.signal }, post, sessionId, runId, keepHead, guardrails));
+				this.reportStop(post, await this.runAgent(provider, messages, { ...params, signal: controller.signal }, post, sessionId, runId, keepHead, prompts.compact, guardrails));
 			} else if (readTools) {
 				// Ask/Plan get the read-only tool loop when the model can call tools: the
 				// model reads/lists/searches whatever files it needs to answer or plan,
 				// but has no write or command tools, so it cannot change anything.
-				this.reportStop(post, await this.runReadOnlyAgent(provider, messages, { ...params, signal: controller.signal }, post, sessionId, runId, keepHead, guardrails));
+				this.reportStop(post, await this.runReadOnlyAgent(provider, messages, { ...params, signal: controller.signal }, post, sessionId, runId, keepHead, prompts.compact, guardrails));
 			} else {
-				await this.runStreaming(provider, messages, { ...params, signal: controller.signal }, mode, post, sessionId);
+				await this.runStreaming(provider, messages, { ...params, signal: controller.signal }, mode, post, sessionId, prompts.compact, editTarget);
 			}
 		} catch (err) {
 			// Only a genuine abort is silent. Previously any error was dropped whenever the
@@ -2064,6 +2478,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			}
 			this.clearSteerable(sessionId, runId);
 			this.endSessionRun(sessionId);
+			this.announceCheckpoint(sessionId, runId, post);
 			post({ type: 'done' });
 		}
 	}
@@ -2148,6 +2563,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				if (!result) {
 					return;
 				}
+				this.carryCheckpoints(sessionId, result.newId);
 				if (result.abortSessionId) {
 					this.activeRequests.get(result.abortSessionId)?.abort();
 				}
@@ -2170,6 +2586,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			},
 			openMcpSettings: () => { this.openSettingsWindow(); },
 			reply: text => { this.bus.postTo(origin, { type: 'info', sessionId, message: text }); },
+			undoRun: () => { void this.undoLastRun(sessionId, origin); },
 			listSkills: () => skillsSnapshot,
 		};
 	}
@@ -2184,7 +2601,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	 */
 	private async sendFollowUp(sessionId: string, runId: string | undefined, text: string, origin: string): Promise<void> {
 		const session = this.sessionStore.getSession(sessionId);
-		this.sessionStore.appendMessage(sessionId, { role: 'user', content: text });
+		// No client echoed this turn itself — the typed text was a slash command, which every
+		// client forwards without rendering — so every client, the origin included, is told.
+		this.appendUserTurn(sessionId, runId ?? '', text, undefined, undefined);
 		await this.handleSend({
 			type: 'send',
 			sessionId,
@@ -2260,7 +2679,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		};
 
 		try {
-			const context = await this.resolveContext(mode, message.context);
+			const editTarget = this.takeEditTarget(mode, !!message.inline);
+			const context = await this.resolveContext(mode, message.context, 0, editTarget);
 			const contextText = context?.content;
 
 			if (mode === 'agent') {
@@ -2278,9 +2698,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				// same mid-run steering box. Stragglers from a previous run in this tab go;
 				// what was typed into this one is kept for the implementer to drain.
 				this.dropForeignSteering(sessionId, runId);
+				const base = await this.basePrompts();
+				// `openvsChat.persona.compactPrompt`, as `systemPrompts` applies it everywhere else.
+				const compactSetting = this.compactPromptSetting();
 				await orchestrator.run(
 					{
-						history, contextText, baseSystemPrompt: await this.baseSystem(), signal: controller.signal,
+						history, contextText, signal: controller.signal,
+						baseSystemPrompt: compactSetting === 'always' ? base.compact : base.full,
+						compactBaseSystemPrompt: compactSetting === 'never' ? undefined : base.compact,
+						forceCompactPrompt: compactSetting === 'always',
+						thinking: vscode.workspace.getConfiguration('openvsChat').get<boolean>('persona.thinking') !== false,
 						steering: () => this.drainSteering(sessionId, runId),
 					},
 					{
@@ -2303,8 +2730,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 							// Records the authoritative text for this step.
 							this.recordAssistantTurn(sessionId, formatted);
 						},
-						onToolStart: call => post({ type: 'toolStart', id: call.id, name: call.name, args: call.args }),
-						onToolEnd: (call, result, isError) => post({ type: 'toolEnd', id: call.id, name: call.name, result, isError }),
+						onToolStart: (call, parentCallId) => post({ type: 'toolStart', id: call.id, name: call.name, args: call.args, parentCallId }),
+						onToolEnd: (call, result, isError, parentCallId) => post({ type: 'toolEnd', id: call.id, name: call.name, result, isError, parentCallId }),
 						note: text => post({ type: 'info', message: text }),
 						onTodos: items => post({ type: 'todos', items }),
 					},
@@ -2316,9 +2743,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				// Vision is a routing constraint, not a late failure: an attached image steers
 				// Auto to a model that can read it instead of erroring out on the one it picked.
 				const needs = { vision: !!history.at(-1)?.images?.length };
-				const messages: ChatMessage[] = [{ role: 'system', content: this.buildSystemPrompt(mode, await this.baseSystem(), !!message.inline) }];
+				const prompts = await this.systemPrompts(mode, !!message.inline);
+				const messages: ChatMessage[] = [{ role: 'system', content: prompts.full }];
 				if (contextText) {
-					messages.push({ role: 'user', content: `Context for the request:\n\n${contextText}` });
+					messages.push(contextTurn(contextText));
 				}
 				messages.push(...history);
 				// Candidates, not a single pick: an inferred model that this account can't
@@ -2344,14 +2772,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 							baseUrl: this.registry.getBaseUrl(a.providerId),
 							maxTokens: this.effectiveMaxTokens(mode, !!message.inline, a.providerId, a.model),
 							signal: controller.signal,
-						}, mode, post, sessionId);
+						}, mode, post, sessionId, prompts.compact, editTarget);
 						break;
 					} catch (err) {
-						const next = candidates[i + 1];
-						if (controller.signal.aborted || !isModelError(err) || a.source !== 'inferred' || !next?.ready) {
+						// The same rule the Auto pipeline's own phases fall back by — see `nextCandidate`.
+						const next = !controller.signal.aborted && a.source === 'inferred' ? nextCandidate(candidates, i, err) : -1;
+						if (next < 0) {
 							throw isModelError(err) && a.source === 'configured' ? describePinnedModelError(a, err) : err;
 						}
-						post({ type: 'info', message: `${a.model} unavailable — trying ${next.model}.` });
+						post({ type: 'info', message: fallbackNote(a, candidates[next], err) });
+						i = next - 1;
 					}
 				}
 			}
@@ -2372,6 +2802,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			}
 			this.clearSteerable(sessionId, runId);
 			this.endSessionRun(sessionId);
+			this.announceCheckpoint(sessionId, runId, post);
 			// Auto picks the models, so the run has to say which ones it picked — the per-phase
 			// headers scroll away, and after a fallback they no longer agree with each other.
 			const phases = AUTO_ROLES.flatMap(role => {
@@ -2392,27 +2823,41 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		mode: ChatMode,
 		post: SessionPost,
 		sessionId: string,
+		compactSystem?: string,
+		editTarget?: EditTarget,
 	): Promise<void> {
 		// Streams with transparent auto-continuation: a max-token cutoff is resumed
 		// in place (Claude-style) instead of the reply stopping midway.
 		const thinking = new ThinkingStreamParser(text => post({ type: 'token', delta: text }));
 		let full = '';
 		let truncated = false;
+		let compactPrompt = false;
+		const contextBudget = this.configuredContextTokens(params.model, params.maxTokens, provider.info.id);
 		try {
 			// Trims to the budget and, if the backend still refuses the request as too big,
 			// retries once inside the ceiling it named. Shared with the Auto pipeline's text
 			// phases so the two cannot drift.
-			({ text: full, truncated } = await streamBudgeted(provider, {
+			({ text: full, truncated, compactPrompt } = await withProviderResilience(this.registry, provider.info.id, params.model, apiKey => streamBudgeted(provider, {
 				messages,
 				...params,
-				contextBudget: this.configuredContextTokens(params.model, params.maxTokens, provider.info.id),
+				apiKey,
+				contextBudget,
+				compactSystem,
 				onToken: delta => thinking.push(delta),
 				onNotice: text => post({ type: 'info', message: text }),
-			}));
+			})));
 		} finally {
 			// Flushed even on failure, or text buffered inside an unclosed <thinking> tag
 			// is lost along with the error.
 			thinking.flush();
+		}
+		// A throw above propagates out of this function, so reaching here means the request
+		// succeeded — the same "after a successful request" hook point `keyResilienceOptions`
+		// uses for the agent-loop path.
+		this.maybeNoticeRateLimit(provider, params.model, post);
+		if (compactPrompt) {
+			this.noticeCompactPrompt(provider.info.id, params.model,
+				`${params.model}'s request budget (~${Math.round(contextBudget / 1000)}k tokens) is too small for the full instructions, so it is sent the compact prompt: condensed instructions, project rules shortened, active skills left out.`, post);
 		}
 		// Records the authoritative final text for this non-agent turn — there is no
 		// agentStepEnd on this path, so this is its equivalent. `stripThinking` mirrors what
@@ -2447,19 +2892,92 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				});
 			} else {
 				const code = extractLastCodeBlock(full);
-				if (code && this.editTarget) {
+				if (code && editTarget) {
+					const proposalId = newRunId();
+					this.editProposals.set(proposalId, { target: editTarget, content: code });
+					// Bounded: each entry holds a copy of a file. The oldest are the ones least
+					// likely to still apply cleanly anyway.
+					for (const id of [...this.editProposals.keys()].slice(0, Math.max(0, this.editProposals.size - MAX_EDIT_PROPOSALS))) {
+						this.editProposals.delete(id);
+					}
 					post({
 						type: 'editProposal',
 						content: code,
-						path: vscode.workspace.asRelativePath(this.editTarget),
+						proposalId,
+						path: vscode.workspace.asRelativePath(editTarget.uri),
 					});
 					// Apply the edit directly instead of waiting for the user to press Apply -
 					// Edit mode's job is to change the file, not to hand back text. The
-					// truncation safety check in handleApplyEdit still guards bad replaces.
-					await this.handleApplyEdit(code);
+					// safety checks in applyProposal still guard stale and truncated replaces.
+					await this.applyProposal(proposalId, true, post);
 				}
 			}
 		}
+	}
+
+	/**
+	 * Surfaces a one-line, low-urgency notice through the same `{ type: 'info' }` channel as
+	 * every other transport status (see `runStreaming`'s `onNotice` and {@link retryNotice})
+	 * when `provider.rateLimit(model)`'s last reading says the allowance is running low —
+	 * *before* a request actually gets refused with a 429, not only after (that reactive side
+	 * stays entirely in `keyRotation.ts`/`cooldown.ts` and is untouched by this).
+	 *
+	 * Purely additive visibility: a provider with no `rateLimit()`, or one that has said
+	 * nothing yet, yields `'unknown'` from {@link rateLimitStatus} and nothing is posted —
+	 * never invents a warning from the absence of data. `'ok'` is likewise silent. Throttled
+	 * per (provider, model) via {@link rateLimitNoticeAt} so a long-running agent loop that
+	 * keeps succeeding at `'near'`/`'critical'` gets this once per
+	 * {@link RATE_LIMIT_NOTICE_COOLDOWN_MS} window, not once per step.
+	 */
+	private maybeNoticeRateLimit(provider: ChatProvider, model: string, post: SessionPost, now = Date.now()): void {
+		const status = rateLimitStatus(provider.rateLimit?.(model), now);
+		if (status !== 'near' && status !== 'critical') {
+			return;
+		}
+		const key = `${provider.info.id}:${model}`;
+		const last = this.rateLimitNoticeAt.get(key);
+		if (last !== undefined && now - last < RATE_LIMIT_NOTICE_COOLDOWN_MS) {
+			return;
+		}
+		this.rateLimitNoticeAt.set(key, now);
+		const urgency = status === 'critical' ? 'is critically close to' : 'is close to';
+		post({
+			type: 'info',
+			message: `${provider.info.label} ${urgency} its rate limit for ${model} — consider switching models or providers, or adding a backup API key in Settings.`,
+		});
+	}
+
+	/** `AgentOptions.compactSystemPrompt`/`onCompactPrompt`/`forceCompactPrompt`, shared by both agent loops. */
+	private compactPromptOptions(provider: ChatProvider, model: string, post: SessionPost, compactSystem?: string): Pick<AgentOptions, 'compactSystemPrompt' | 'onCompactPrompt' | 'forceCompactPrompt'> {
+		return {
+			compactSystemPrompt: compactSystem,
+			onCompactPrompt: notice => this.noticeCompactPrompt(provider.info.id, model, notice, post),
+			forceCompactPrompt: this.compactPromptSetting() === 'always',
+		};
+	}
+
+	/**
+	 * `AgentOptions.onKeyFailure`/`onStepSuccess` wired to this registry's key rotation and
+	 * quota cooldown, shared by `runAgent` and `runReadOnlyAgent` so the two loops rotate and
+	 * clear cooldowns identically. Kept as a hook rather than handing `AgentRunner` the
+	 * registry directly — see `AgentOptions.onKeyFailure`'s doc for why. Also carries the
+	 * proactive rate-limit notice (see {@link maybeNoticeRateLimit}) on every successful step,
+	 * since `provider` and `post` are only in scope at these two call sites.
+	 */
+	private keyResilienceOptions(provider: ChatProvider, model: string, post: SessionPost): Pick<AgentOptions, 'onKeyFailure' | 'onStepSuccess'> {
+		const providerId = provider.info.id;
+		return {
+			onKeyFailure: async message => {
+				this.registry.cooldowns.markCooldown(providerId, model, message);
+				const rotated = await this.registry.rotateApiKey(providerId);
+				return rotated ? (await this.registry.getApiKey(providerId)) ?? '' : undefined;
+			},
+			onStepSuccess: () => {
+				this.registry.noteApiKeySuccess(providerId);
+				this.registry.cooldowns.clear(providerId, model);
+				this.maybeNoticeRateLimit(provider, model, post);
+			},
+		};
 	}
 
 	/**
@@ -2469,6 +2987,90 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	 */
 	private modelToolCapable(providerId: string, provider: ChatProvider, model: string): boolean {
 		return entrySupportsTools(provider.info, this.modelCache.get(providerId), model);
+	}
+
+	/**
+	 * Builds the `AgentA2A` capability for one top-level session's own Agent-mode run — the
+	 * `AgentOptions.onKeyFailure`-style inversion `AgentRunner` needs for `list_agent_sessions`/
+	 * `send_agent_message`, since it has no knowledge of sibling sessions itself. Only
+	 * `runAgent` below passes this to its `AgentRunner`; `runReadOnlyAgent` (Ask/Plan) does
+	 * not, and neither does `AgentRunner.runSubagent` forward it to a delegate's options — so
+	 * a `spawn_subagent` child never sees either tool, whatever its nesting depth.
+	 */
+	private buildA2A(sessionId: string): AgentA2A {
+		return {
+			selfId: sessionId,
+			listSessions: () => this.listAgentSessions(sessionId),
+			sendMessage: (targetSessionId, message, expectsReply) =>
+				this.deliverAgentMessage(sessionId, targetSessionId, message, expectsReply),
+		};
+	}
+
+	/**
+	 * The other open top-level chat sessions for `list_agent_sessions` — excludes `sessionId`
+	 * itself. The "New chat" fallback for an untitled session matches the live tab strip's own
+	 * (`media/main.js`'s `renderTabs`, `s.title || 'New chat'`) rather than history's
+	 * "Untitled chat" — this lists LIVE tabs, not archived ones.
+	 */
+	private listAgentSessions(sessionId: string): AgentSessionInfo[] {
+		return this.sessionStore.getSessions()
+			.filter(s => s.id !== sessionId)
+			.map(s => ({ id: s.id, title: s.title || 'New chat', running: s.streaming }));
+	}
+
+	/**
+	 * Delivers one agent-to-agent message from `fromSessionId` to `targetSessionId`.
+	 *
+	 * Two cases, mirroring exactly what `steerQueues`/`steerableRuns` already distinguish for
+	 * user-typed steering (see `dispatchMessage`'s `'steer'` case, ~line 1537): a target with
+	 * a live steerable run gets the message injected the same way — pushed onto
+	 * `steerQueues`, picked up on that run's next loop step. An idle target has no loop to
+	 * inject into.
+	 *
+	 * `SessionState.queue` is deliberately NOT used for the idle case: per `media/main.js`'s
+	 * `send()`, that field only ever fills while a tab is mid-run but not steerable (Ask/Plan)
+	 * and is drained once THAT run ends (main.js:2672-2676) — nothing drains it for a tab
+	 * that is already idle, so pushing there would strand the message with no run ever
+	 * picking it up. Appending it to the transcript as an ordinary turn instead is durable
+	 * (survives a reload), lands in `sendableMessages` the next time that session sends
+	 * (unlike an 'info'/'error' notice — this carries no `kind`), and is pushed to any open
+	 * webview immediately via `postTranscript`, so a person watching that tab sees the
+	 * message arrive rather than only inferring it from the model's next reply. The same
+	 * append+`postTranscript` also runs for the live case, for the same durability/visibility
+	 * reasons — it does not interfere with the live injection, which acts on the run's own
+	 * in-memory `messages` and is independent of what is persisted here.
+	 */
+	private async deliverAgentMessage(
+		fromSessionId: string,
+		targetSessionId: string,
+		message: string,
+		expectsReply: boolean,
+	): Promise<AgentMessageDelivery> {
+		const target = this.sessionStore.getSession(targetSessionId);
+		if (!target) {
+			// Raced with `list_agent_sessions`: the tab closed between the two calls.
+			return { ok: false, error: `No open chat tab with session id "${targetSessionId}" — it may have just been closed.` };
+		}
+		const senderTitle = this.sessionStore.getSession(fromSessionId)?.title || 'New chat';
+		const replyHint = expectsReply
+			? ` Reply with send_agent_message, using targetSessionId: "${fromSessionId}".`
+			: '';
+		const content = `[Message from agent session "${senderTitle}" (id ${fromSessionId})]:\n${message}${replyHint}`;
+		this.sessionStore.appendMessage(targetSessionId, {
+			role: 'user',
+			content,
+			fromAgentSession: { id: fromSessionId, title: senderTitle },
+		});
+		this.persistSessionState();
+		this.postTranscript(targetSessionId);
+		const liveRunId = this.steerableRuns.get(targetSessionId);
+		if (liveRunId !== undefined) {
+			const queue = this.steerQueues.get(targetSessionId) ?? [];
+			queue.push({ runId: liveRunId, text: content });
+			this.steerQueues.set(targetSessionId, queue);
+			return { ok: true, delivered: 'live' };
+		}
+		return { ok: true, delivered: 'queued' };
 	}
 
 	/**
@@ -2483,6 +3085,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		sessionId: string,
 		runId: string,
 		keepHead: number | undefined,
+		compactSystem: string | undefined,
 		guardrails: Guardrails,
 	): Promise<RunResult> {
 		const configured = this.configuredMaxSteps();
@@ -2495,6 +3098,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			keepHead,
 			maxRunMs: this.configuredMaxRunMs(),
 			traceTiming: vscode.workspace.getConfiguration('openvsChat').get<boolean>('agent.traceTiming') ?? false,
+			...this.keyResilienceOptions(provider, params.model, post),
+			...this.compactPromptOptions(provider, params.model, post, compactSystem),
 		});
 		let stepThinking: ThinkingStreamParser | undefined;
 		return runner.run(messages, params, {
@@ -2508,9 +3113,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				// Records the authoritative text for this step.
 				this.recordAssistantTurn(sessionId, formatted);
 			},
-			onToolStart: call => post({ type: 'toolStart', id: call.id, name: call.name, args: call.args }),
-			onToolEnd: (call, result, isError) =>
-				post({ type: 'toolEnd', id: call.id, name: call.name, result, isError }),
+			onToolStart: (call, parentCallId) => post({ type: 'toolStart', id: call.id, name: call.name, args: call.args, parentCallId }),
+			onToolEnd: (call, result, isError, parentCallId) =>
+				post({ type: 'toolEnd', id: call.id, name: call.name, result, isError, parentCallId }),
 			onNote: text => post({ type: 'info', message: text }),
 		});
 	}
@@ -2523,22 +3128,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		sessionId: string,
 		runId: string,
 		keepHead: number | undefined,
+		compactSystem: string | undefined,
 		guardrails: Guardrails,
 	): Promise<RunResult> {
 		const maxSteps = this.configuredMaxSteps();
+		// The runner names the connected MCP tools in each request itself, and only while their
+		// schemas are offered — see `AgentRunner.outgoing`.
 		await this.mcp.ensureStarted();
-		// Tell the model about connected MCP tools so it actually reaches for them.
-		const mcpTools = this.mcp.tools();
-		if (mcpTools.length && messages[0]?.role === 'system') {
-			const names = mcpTools.slice(0, 20).map(t => t.name).join(', ');
-			messages = [
-				{
-					...messages[0],
-					content: `${messages[0].content}\n\nYou also have ${mcpTools.length} MCP tools (names start with "mcp__"): ${names}${mcpTools.length > 20 ? ', …' : ''}. Prefer them when they fit better than the generic file/command tools.`,
-				},
-				...messages.slice(1),
-			];
-		}
 		// Stragglers from an earlier run in this tab only — a correction typed while this
 		// run was assembling its prompt was meant for this run, and is drained below.
 		this.dropForeignSteering(sessionId, runId);
@@ -2551,6 +3147,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			steering: () => this.drainSteering(sessionId, runId),
 			maxRunMs: this.configuredMaxRunMs(),
 			traceTiming: vscode.workspace.getConfiguration('openvsChat').get<boolean>('agent.traceTiming') ?? false,
+			// Top-level Agent-mode run only — see `buildA2A`'s own doc for why neither
+			// `runReadOnlyAgent` (Ask/Plan) nor a `spawn_subagent` delegate ever gets this.
+			a2a: this.buildA2A(sessionId),
+			...this.keyResilienceOptions(provider, params.model, post),
+			...this.compactPromptOptions(provider, params.model, post, compactSystem),
 		});
 		let stepThinking: ThinkingStreamParser | undefined;
 		post({ type: 'todos', items: [] });
@@ -2571,9 +3172,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 					// Records the authoritative text for this step.
 					this.recordAssistantTurn(sessionId, formatted);
 				},
-				onToolStart: call => post({ type: 'toolStart', id: call.id, name: call.name, args: call.args }),
-				onToolEnd: (call, result, isError) =>
-					post({ type: 'toolEnd', id: call.id, name: call.name, result, isError }),
+				onToolStart: (call, parentCallId) => post({ type: 'toolStart', id: call.id, name: call.name, args: call.args, parentCallId }),
+				onToolEnd: (call, result, isError, parentCallId) =>
+					post({ type: 'toolEnd', id: call.id, name: call.name, result, isError, parentCallId }),
 				onNote: text => post({ type: 'info', message: text }),
 				onTodos: items => post({ type: 'todos', items }),
 			});
@@ -2633,7 +3234,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			maxOutputTokens,
 			override: typeof configured === 'number' ? configured : 0,
 			entries: providerId ? this.modelCache.get(providerId) : undefined,
-			stated: providerId ? this.registry.getProvider(providerId)?.rateLimit?.(model)?.limitTokens : undefined,
+			stated: providerId ? this.registry.getProvider(providerId)?.rateLimit?.(model)?.requestCeiling : undefined,
 		});
 	}
 
@@ -2675,27 +3276,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			`[${sessionId}] send arrived for a session the store has never seen, with no messages to seed it from`);
 	}
 
-	/**
-	 * Converts a webview message-history payload into the store's own transcript shape.
-	 * Only 'user'/'assistant'/'tool' roles are kept — the webview's own session transcript
-	 * never carries a 'system' turn (that only ever appears in the assembled request this
-	 * host builds), so this is a defensive filter, not one expected to drop anything in
-	 * practice.
-	 */
-	private toTranscriptEntries(messages: readonly ChatMessage[]): TranscriptEntry[] {
-		const out: TranscriptEntry[] = [];
-		for (const m of messages) {
-			if (m.role !== 'user' && m.role !== 'assistant' && m.role !== 'tool') {
-				continue;
-			}
-			out.push({ role: m.role, content: m.content, images: m.images, toolCalls: m.toolCalls, toolCallId: m.toolCallId });
-		}
-		return out;
-	}
 
-	/** {@link toTranscriptEntries}, applied to a whole archived-history payload. */
-	private toSessionHistory(entries: readonly HistoryEntry[]): SessionHistoryEntry[] {
-		return entries.map(h => ({ id: h.id, title: h.title, messages: this.toTranscriptEntries(h.messages), savedAt: h.savedAt }));
+	/**
+	 * Seeds the store from what the extension saved last time: the open tabs and their
+	 * transcripts, and the History archive. Nothing did. Both are written on every change, but
+	 * the store started empty on every activation, so after a restart the open tabs were gone
+	 * without even being archived, History entries could not be reopened (`restoreSession`
+	 * looks in the store), and the first tab closed or cleared overwrote the saved archive with
+	 * just itself, deleting every earlier conversation.
+	 *
+	 * A run cannot survive a restart, so every restored tab comes back idle. The archive is
+	 * merged from both places it is kept — the session payload and `HISTORY_KEY`, which builds
+	 * before the session payload existed also wrote — by id, newest copy winning.
+	 */
+	private restoreSessionState(): void {
+		const saved = loadState(this.sessionMemento);
+		const sessions = restoredSessions(saved);
+		if (saved && sessions.length) {
+			this.sessionStore.hydrate({ sessions, activeSessionId: saved.activeSessionId });
+		}
+		this.sessionStore.mergeHistory([
+			...(saved?.history ?? []),
+			...(this.context.workspaceState.get<SessionHistoryEntry[]>(ChatViewProvider.HISTORY_KEY) ?? []),
+		]);
 	}
 
 	/**
@@ -2736,6 +3339,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	/**
+	 * Appends a user turn to the session store and tells every chat client about it. A turn
+	 * used to reach only the store: the client that typed it echoed its own copy, and every
+	 * other client — the desktop panel for a phone's message, the phone for the desktop's —
+	 * streamed a reply to a question it never saw asked, until a tab switch or reconnect forced
+	 * a full transcript refresh. `echoedBy` names the sink that already rendered the turn
+	 * optimistically (an ordinary send); `undefined` means nobody did (a slash command's
+	 * piggybacked message), so the origin is told too.
+	 */
+	private appendUserTurn(sessionId: string, runId: string, content: string, images: TranscriptImage[] | undefined, echoedBy: string | undefined, fromEditor = false): void {
+		this.sessionStore.appendMessage(sessionId, fromEditor ? { role: 'user', content, images, fromEditor } : { role: 'user', content, images });
+		const editor = fromEditor ? { fromEditor } : {};
+		if (echoedBy) {
+			this.bus.postExcept(echoedBy, { type: 'userTurn', sessionId, runId, content, images: images ?? [], ...editor });
+		} else {
+			this.post({ type: 'userTurn', sessionId, runId, content, images: images ?? [], ...editor });
+		}
+	}
+
+	/**
 	 * Appends the host's own record of an authoritative assistant turn to the session store.
 	 * Fed only from `agentStepEnd`'s content and the plain-streaming path's final text — never
 	 * from individual `token` deltas, which posting `agentStepEnd` exists precisely to avoid
@@ -2773,25 +3395,40 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		params: { model: string; apiKey: string; baseUrl: string; maxTokens: number; signal: AbortSignal },
 		post: SessionPost,
 		sessionId: string,
+		compactSystem?: string,
 	): Promise<ChatMessage[]> {
 		// The trim budget is passed too, so compaction always precedes the lossy trim.
 		const trimBudget = this.configuredContextTokens(params.model, params.maxTokens, provider.info.id);
+		// Judged, and summarized, on the prompt that will actually be sent: a full system
+		// prompt the dispatch will swap for the compact one would otherwise make the request
+		// look over the threshold, and ride along to the summarizer, where trimming cannot
+		// shrink it. The result goes back out with the full prompt, for the dispatch to decide.
+		const original = messages;
+		const system = messages[0]?.role === 'system' ? messages[0].content : '';
+		if (compactSystem !== undefined && needsCompactPrompt(estimateTokens(system), 0, trimBudget)) {
+			messages = withSystemPrompt(messages, compactSystem);
+		}
 		// Same provider-derived trigger the agent loop uses: compacting early pays only where
 		// a long prompt is expensive, and on a caching backend it throws the cache away.
 		const trigger = provider.info.cachesPrompts ? CACHED_COMPACT_TRIGGER : COMPACT_TRIGGER;
 		if (!shouldCompact(messages, this.windowFor(provider.info.id, params.model), trimBudget, trigger)) {
-			return messages;
+			return original;
 		}
 		const res = await compactMessages(messages, async (toSummarize, maxTokens) => {
 			let text = '';
-			await provider.streamChat({
-				messages: toSummarize,
-				model: params.model,
-				apiKey: params.apiKey,
-				baseUrl: params.baseUrl,
-				maxTokens,
-				signal: params.signal,
-				onToken: delta => { text += delta; },
+			// Best-effort: compactMessages swallows a thrown summarizer failure and degrades
+			// to the lossy trim, so a rotated key here is a pure win with no new failure mode
+			// to guard — the surrounding try/catch already existed.
+			await withProviderResilience(this.registry, provider.info.id, params.model, async apiKey => {
+				await provider.streamChat({
+					messages: toSummarize,
+					model: params.model,
+					apiKey,
+					baseUrl: params.baseUrl,
+					maxTokens,
+					signal: params.signal,
+					onToken: delta => { text += delta; },
+				});
 			});
 			return stripThinking(text);
 			// Bounded by the same budget the conversation itself is trimmed to, less the
@@ -2799,7 +3436,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			// one most likely to be refused, on the providers that most need compacting.
 		}, keepHead, Math.max(1_000, trimBudget - SUMMARY_MAX_TOKENS));
 		if (!res) {
-			return messages;
+			return original;
 		}
 		const summaryMsg = res.messages.find(m => m.content.startsWith(COMPACT_MARKER));
 		const summary = summaryMsg?.content ?? '';
@@ -2809,7 +3446,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		// actually applies them on this send's next turn — see SessionStore.applyCompaction's
 		// doc for why this exact arithmetic is the subtlest thing the port had to get right.
 		this.sessionStore.applyCompaction(sessionId, summary, res.replaced);
-		return res.messages;
+		return withSystemPrompt(res.messages, system);
 	}
 
 	/**
@@ -2829,31 +3466,69 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		return model ? this.budgetsFor(model, wanted, providerId).maxTokens : wanted;
 	}
 
-	private buildSystemPrompt(mode: ChatMode, base: string, inline = false, readTools = false): string {
+	private buildSystemPrompt(mode: ChatMode, base: string, inline = false, readTools = false, compact = false): string {
+		if (compact) {
+			// The compact identity already carries the brevity rule.
+			return `${base}\n\n${modeDoctrine(mode, { inline, readTools, compact })}`;
+		}
 		const thinking = vscode.workspace.getConfiguration('openvsChat').get<boolean>('persona.thinking') !== false;
 		return `${base}\n\n${modeDoctrine(mode, { inline, readTools, thinking })}\n\n${ChatViewProvider.CONCISE}`;
 	}
 
-	private async resolveContext(mode: ChatMode, attached?: AttachedContext): Promise<AttachedContext | undefined> {
-		// Inline edits pre-set editTarget/editRange and embed the code in the prompt, so we
-		// keep them and add no extra context. Otherwise reset and fall back to whole-file.
-		const inline = this.inlineEditActive;
-		this.inlineEditActive = false;
-		if (!inline) {
-			this.editTarget = undefined;
-			this.editRange = undefined;
+	/**
+	 * The full and compact system prompts for one send. See {@link basePrompts}.
+	 *
+	 * `openvsChat.persona.compactPrompt` is applied here, once, so no dispatch path has to
+	 * know about it: `always` makes both the compact one (and sets `force`, which also
+	 * condenses the tool schemas), `never` offers no compact one to fall back to.
+	 */
+	private async systemPrompts(mode: ChatMode, inline = false, readTools = false): Promise<{ full: string; compact: string | undefined; force: boolean }> {
+		const base = await this.basePrompts();
+		const compact = this.buildSystemPrompt(mode, base.compact, inline, readTools, true);
+		const setting = this.compactPromptSetting();
+		if (setting === 'always') {
+			return { full: compact, compact, force: true };
 		}
+		return {
+			full: this.buildSystemPrompt(mode, base.full, inline, readTools),
+			compact: setting === 'never' ? undefined : compact,
+			force: false,
+		};
+	}
+
+	/** `openvsChat.persona.compactPrompt`, with anything unrecognized read as the default. */
+	private compactPromptSetting(): 'auto' | 'always' | 'never' {
+		const value = vscode.workspace.getConfiguration('openvsChat').get<string>('persona.compactPrompt');
+		return value === 'always' || value === 'never' ? value : 'auto';
+	}
+
+	/**
+	 * Tells the user, once per model, that its request budget put it on the compact prompt —
+	 * otherwise their skills and most of their rules vanish from its behavior unexplained.
+	 */
+	private noticeCompactPrompt(providerId: string, model: string, notice: string, post: SessionPost): void {
+		const key = `${providerId}:${model}`;
+		if (this.compactNoticed.has(key)) {
+			return;
+		}
+		this.compactNoticed.add(key);
+		post({ type: 'info', message: notice });
+	}
+
+	private async resolveContext(mode: ChatMode, attached?: AttachedContext, budgetTokens = 0, editTarget?: EditTarget): Promise<AttachedContext | undefined> {
 		if (mode === 'edit') {
-			if (inline && this.editTarget) {
+			// An inline action embeds its code in the prompt; whole-file Edit sends the file
+			// exactly as snapshotted in `editTarget`, so the text the model rewrites is the text
+			// the apply step later checks the file against.
+			if (!editTarget) {
+				return attached;
+			}
+			if (editTarget.range) {
 				return undefined;
 			}
-			const editor = vscode.window.activeTextEditor;
-			if (editor) {
-				this.editTarget = editor.document.uri;
-				this.editRange = undefined;
-				const name = vscode.workspace.asRelativePath(editor.document.uri);
-				return { label: name, content: `File: ${name} (${editor.document.languageId})\n\n${editor.document.getText()}` };
-			}
+			const doc = vscode.workspace.textDocuments.find(d => d.uri.toString() === editTarget.uri.toString());
+			const name = vscode.workspace.asRelativePath(editTarget.uri);
+			return { label: name, content: `File: ${name} (${doc?.languageId ?? 'plaintext'})\n\n${editTarget.original}` };
 		}
 		// Ask answers over what the user is looking at: fall back to the files open in
 		// editor tabs when nothing was attached explicitly. Plan intentionally gets only
@@ -2863,7 +3538,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			if (auto === 'off') {
 				return undefined;
 			}
-			return this.openEditorsContext(auto === 'active');
+			return this.openEditorsContext(auto === 'active', budgetTokens);
 		}
 		return attached;
 	}
@@ -2873,7 +3548,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	 * renders them via {@link filesContext} so Ask mode can answer questions about what's
 	 * loaded. When `activeOnly` is set, only the active editor is included.
 	 */
-	private async openEditorsContext(activeOnly = false): Promise<AttachedContext | undefined> {
+	private async openEditorsContext(activeOnly = false, budgetTokens = 0): Promise<AttachedContext | undefined> {
 		const active = vscode.window.activeTextEditor?.document.uri;
 		const seen = new Set<string>();
 		const uris: vscode.Uri[] = [];
@@ -2885,7 +3560,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		// attach. Falling through to the tab sweep here would quietly attach every open
 		// file — the expensive behavior this setting exists to avoid.
 		if (activeOnly) {
-			return this.filesContext(uris);
+			return this.filesContext(uris, budgetTokens);
 		}
 		for (const group of vscode.window.tabGroups.all) {
 			for (const tab of group.tabs) {
@@ -2895,13 +3570,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				}
 			}
 		}
-		return this.filesContext(uris);
+		return this.filesContext(uris, budgetTokens);
 	}
 
-	/** Renders the given files (per-file and total capped) as one attached-context block. */
-	private async filesContext(uris: vscode.Uri[]): Promise<AttachedContext | undefined> {
-		const PER_FILE_CHARS = 8_000;
-		const TOTAL_CHARS = 32_000;
+	/**
+	 * Renders the given files (per-file and total capped) as one attached-context block.
+	 *
+	 * Auto-attached, not chosen, so it is never allowed more than a quarter of the request
+	 * budget: at the fixed 32k characters it was ~8k tokens, more than the whole budget of an
+	 * 8k-allowance model — and, being protected, the one part of the request trimming would
+	 * not touch until nothing else was left.
+	 */
+	private async filesContext(uris: vscode.Uri[], budgetTokens = 0): Promise<AttachedContext | undefined> {
+		const TOTAL_CHARS = budgetTokens > 0 ? Math.min(32_000, Math.max(2_000, budgetTokens)) : 32_000;
+		const PER_FILE_CHARS = Math.min(8_000, TOTAL_CHARS);
 		const active = vscode.window.activeTextEditor?.document.uri;
 		const parts: string[] = [];
 		let total = 0;
@@ -2968,7 +3650,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	 * per provider so repeated config refreshes don't hammer the APIs; the cache is
 	 * invalidated when a key changes (see `invalidateModelCache`).
 	 */
-	private readonly modelCache = new Map<string, ModelEntry[]>();
+	private readonly modelCache = new ModelCatalog((id, signal) => this.registry.listModels(id, signal));
 
 	private pushAvailableModels(providers: { id: string; requiresApiKey: boolean; hasApiKey: boolean; hasEnvKey: boolean }[]): void {
 		for (const p of providers) {
@@ -2978,23 +3660,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				this.post({ type: 'models', provider: p.id, models: [] });
 				continue;
 			}
-			const cached = this.modelCache.get(p.id);
-			if (cached) {
-				this.post({ type: 'models', provider: p.id, models: cached });
-				continue;
+			void this.publishModels(p.id, false);
+		}
+	}
+
+	/**
+	 * Loads a provider's catalog and posts it — or, when the fetch fails, posts whatever is
+	 * still cached along with the reason, so a client can say "couldn't load models" instead
+	 * of silently presenting the hardcoded suggestions as if they were the account's catalog.
+	 * A result superseded by a credential change is dropped: the change's own refresh posts.
+	 */
+	private async publishModels(providerId: string, refresh: boolean): Promise<void> {
+		const generation = this.modelCache.generation(providerId);
+		const current = () => this.modelCache.generation(providerId) === generation;
+		try {
+			const models = await this.modelCache.load(providerId, refresh);
+			if (current()) {
+				this.post({ type: 'models', provider: providerId, models });
 			}
-			const controller = new AbortController();
-			void this.registry.listModels(p.id, controller.signal).then(models => {
-				if (models.length) {
-					this.modelCache.set(p.id, models);
-					this.post({ type: 'models', provider: p.id, models });
-				}
-			}, () => { /* model listing is best-effort; the suggested models remain usable */ });
+		} catch (err) {
+			if (current() && !isAbortError(err)) {
+				this.post({
+					type: 'models', provider: providerId, models: this.modelCache.get(providerId) ?? [],
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
 		}
 	}
 
 	private invalidateModelCache(providerId: string): void {
-		this.modelCache.delete(providerId);
+		this.modelCache.invalidate(providerId);
 	}
 
 	private post(message: Record<string, unknown> & { type: string }): void {
@@ -3223,6 +3918,10 @@ class SessionApprover implements ToolApprover {
 		}
 		const feedback = typeof reply.feedback === 'string' ? reply.feedback : undefined;
 		return { approved, feedback };
+	}
+
+	recordWrite(write: FileWrite): void {
+		this.view.recordRunWrite(this.sessionId, this.runId, write);
 	}
 
 	async ask(question: UserQuestion): Promise<string> {

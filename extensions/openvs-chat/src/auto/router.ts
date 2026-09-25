@@ -65,7 +65,14 @@ export interface RoleAssignment {
  * credential is restricted by Google's terms to Google's own client — neither is something
  * to select on a user's behalf. Both remain available when pinned explicitly.
  */
-const NOT_AUTO_INFERRED = new Set(['custom', 'antigravity']);
+// copilot/grok/kiro are OAuth-proxy backends that impersonate another vendor's own client
+// identity (see their doc comments) — never something to select on a user's behalf, same
+// reasoning as antigravity. web_gemini goes further still (a real browser session replayed
+// against a consumer chat UI, off by default behind its own setting) — all barred from
+// automatic selection; a user who wants one pins it explicitly per role. claude-code-cli
+// joins `custom` for the same reason `custom` is here: it's a local binary that may not be
+// installed, so Auto must not gamble on it being reachable on the user's behalf.
+const NOT_AUTO_INFERRED = new Set(['custom', 'antigravity', 'copilot', 'grok', 'kiro', 'web_gemini', 'claude-code-cli']);
 
 /**
  * Models never selected *on the user's behalf*, however well they would serve the role.
@@ -253,17 +260,32 @@ export class RoleRouter {
 			return [await this.evaluate(role, configured.providerId, configured.model, 'configured', needs, memo)];
 		}
 		const ready: RoleAssignment[] = [];
+		// Collected separately rather than dropped outright: a stale quota cooldown producing
+		// one avoidable 429 is still better than Auto mode refusing to answer at all when
+		// every other inferred candidate happens to be cooling down at the same moment.
+		const coolingDown: RoleAssignment[] = [];
 		for (const candidate of await this.inferredPool(role, needs, memo, localReachable)) {
 			const assignment = await this.evaluate(role, candidate.providerId, candidate.model, 'inferred', needs, memo);
-			if (assignment.ready) {
-				ready.push(assignment);
+			if (!assignment.ready) {
+				continue;
 			}
+			if (this.registry.cooldowns.isCoolingDown(candidate.providerId, candidate.model)) {
+				coolingDown.push(assignment);
+				continue;
+			}
+			ready.push(assignment);
 			if (ready.length >= MAX_INFERRED_CANDIDATES) {
 				break;
 			}
 		}
+		if (ready.length) {
+			return ready;
+		}
+		if (coolingDown.length) {
+			return coolingDown.slice(0, MAX_INFERRED_CANDIDATES);
+		}
 		// Fall back to the not-ready placeholder so callers get a clear problem to report.
-		return ready.length ? ready : [this.noCandidate(role, needs)];
+		return [this.noCandidate(role, needs)];
 	}
 
 	/** One credential read per provider per resolution pass, however many roles ask. */

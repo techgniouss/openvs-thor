@@ -15,7 +15,6 @@ export const dirs = [
 	'build/vite',
 	'extensions',
 	'extensions/configuration-editing',
-	'extensions/copilot',
 	'extensions/css-language-features',
 	'extensions/css-language-features/server',
 	'extensions/debug-auto-launch',
@@ -24,35 +23,20 @@ export const dirs = [
 	'extensions/extension-editing',
 	'extensions/git',
 	'extensions/git-base',
-	'extensions/github',
-	'extensions/github-authentication',
-	'extensions/grunt',
-	'extensions/gulp',
 	'extensions/html-language-features',
 	'extensions/html-language-features/server',
-	'extensions/ipynb',
-	'extensions/jake',
 	'extensions/json-language-features',
 	'extensions/json-language-features/server',
 	'extensions/markdown-language-features',
 	'extensions/markdown-math',
 	'extensions/media-preview',
 	'extensions/merge-conflict',
-	'extensions/mermaid-markdown-features',
-	'extensions/microsoft-authentication',
-	'extensions/notebook-renderers',
 	'extensions/npm',
-	'extensions/php-language-features',
+	'extensions/openvs-chat',
 	'extensions/references-view',
 	'extensions/search-result',
-	'extensions/simple-browser',
-	'extensions/tunnel-forwarding',
 	'extensions/terminal-suggest',
 	'extensions/typescript-language-features',
-	'extensions/vscode-api-tests',
-	'extensions/vscode-colorize-tests',
-	'extensions/vscode-colorize-perf-tests',
-	'extensions/vscode-test-resolver',
 	'remote',
 	'remote/web',
 	'test/automation',
@@ -60,24 +44,7 @@ export const dirs = [
 	'test/monaco',
 	'test/smoke',
 	'test/mcp',
-	'.vscode/extensions/vscode-selfhost-import-aid',
-	'.vscode/extensions/vscode-selfhost-test-provider',
-	'.vscode/extensions/vscode-extras',
-	'.vscode/extensions/vscode-pr-pinger',
 ];
-
-// `extensions/copilot` vendors the GitHub Copilot Chat extension. It is excluded from
-// packaging (`excludedExtensions` in build/lib/extensions.ts) and the packaging tasks no
-// longer compile it, so a release build never needs its ~1.3GB of dependencies - only the
-// local dev flow (`npm run compile` / `npm run watch`) does. On a CI runner that install
-// costs several minutes and is by far the largest source of freshly-written unsigned
-// native prebuilds for Windows Defender to quarantine mid-install.
-if (process.env['VSCODE_SKIP_COPILOT_EXTENSION_INSTALL'] === '1') {
-	const copilotIndex = dirs.indexOf('extensions/copilot');
-	if (copilotIndex !== -1) {
-		dirs.splice(copilotIndex, 1);
-	}
-}
 
 if (existsSync(`${import.meta.dirname}/../../.build/distro/npm`)) {
 	dirs.push('.build/distro/npm');

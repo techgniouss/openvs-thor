@@ -46,9 +46,12 @@ const WINDOWS: Array<[RegExp, number]> = [
 	[/minimax/i, 192_000],
 	[/command-a|command-r/i, 128_000],
 	[/nemotron/i, 128_000],
-	// Gemma 4 broke the family's small-window pattern outright: 256k, against 8k for 2 and 3.
+	// Gemma 4: 256k. Gemma 3 is 128k except the 1B and the 3n (on-device) checkpoints at 32k;
+	// only Gemma 2 is the 8k the family used to be known for.
 	[/gemma-?4/i, 256_000],
-	[/gemma-?3|gemma-?2/i, 8_000],
+	[/gemma-?3n|gemma-?3-1b/i, 32_000],
+	[/gemma-?3/i, 128_000],
+	[/gemma-?2/i, 8_000],
 	[/phi-?[34]/i, 128_000],
 	[/mistral-large|mistral-medium|mistral-small|mixtral-8x22b|ministral|magistral|devstral|codestral/i, 128_000],
 	[/mistral|mixtral/i, 32_000],
@@ -151,11 +154,22 @@ export interface RequestBudgetInput {
  */
 export function requestBudgets(input: RequestBudgetInput): { maxTokens: number; contextBudget: number } {
 	const windowBudget = contextBudgetFor(input.model, input.maxOutputTokens, input.override, input.entries);
-	if (!input.stated || input.stated <= 0) {
+	const window = contextWindowFor(input.model, input.entries);
+	// A window too small for the configured reply plus a usable conversation is split the way
+	// a stated allowance is. Left to `contextBudgetFor`, an 8k-window model got the 8k budget
+	// floor *and* the default 8192-token reservation — a request twice its window, refused
+	// before a word of the conversation mattered, and never repaired, since the context-length
+	// retry shrinks only the conversation. A pinned budget is the user's call and is left alone.
+	const tooSmall = !(input.override && input.override > 0) && Math.floor(window * WINDOW_SHARE) - input.maxOutputTokens < MIN_BUDGET;
+	const ceiling = input.stated && input.stated > 0
+		? (tooSmall ? Math.min(input.stated, window) : input.stated)
+		: (tooSmall ? window : 0);
+	if (!ceiling) {
 		return { maxTokens: input.maxOutputTokens, contextBudget: windowBudget };
 	}
-	const { reply, conversation } = budgetsForCeiling(input.stated, input.maxOutputTokens);
+	const { reply, conversation } = budgetsForCeiling(ceiling, input.maxOutputTokens);
 	// The window still binds when it is the smaller of the two: an allowance is per request,
-	// not a window, so a roomy allowance must never widen a small model's budget.
-	return { maxTokens: reply, contextBudget: Math.min(conversation, windowBudget) };
+	// not a window, so a roomy allowance must never widen a small model's budget. (When the
+	// window itself was split, its floored budget is the looser figure and must not win.)
+	return { maxTokens: reply, contextBudget: tooSmall ? conversation : Math.min(conversation, windowBudget) };
 }

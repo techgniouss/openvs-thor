@@ -51,7 +51,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Known suite names (used for help text and validation)
-KNOWN_SUITES="api-folder api-workspace colorize terminal-suggest typescript markdown emmet git git-base ipynb notebook-renderers configuration-editing github-authentication copilot css html"
+KNOWN_SUITES="terminal-suggest typescript markdown emmet git git-base configuration-editing css html"
 
 if $HELP; then
 	echo "Usage: $0 [options]"
@@ -88,9 +88,8 @@ if $HELP; then
 	echo "  $0 --grep 'some test name'"
 	echo "  $0 --runGlob '**/editor/**/*.integrationTest.js'"
 	echo "  $0 --suite git                             # run only Git tests"
-	echo "  $0 --suite 'api*'                          # run API folder + workspace tests"
 	echo "  $0 --suite 'git,emmet,typescript'          # run multiple suites"
-	echo "  $0 --suite api-folder --grep 'some test'     # grep within a suite"
+	echo "  $0 --suite git --grep 'some test'          # grep within a suite"
 	exit 0
 fi
 
@@ -203,30 +202,6 @@ else
 	kill_app() { killall $INTEGRATION_TEST_APP_NAME || true; }
 fi
 
-if should_run_suite api-folder; then
-echo
-echo "### API tests (folder)"
-echo
-"$INTEGRATION_TEST_ELECTRON_PATH" $ROOT/extensions/vscode-api-tests/testWorkspace --enable-proposed-api=vscode.vscode-api-tests --extensionDevelopmentPath=$ROOT/extensions/vscode-api-tests --extensionTestsPath=$ROOT/extensions/vscode-api-tests/out/singlefolder-tests $API_TESTS_EXTRA_ARGS
-kill_app
-fi
-
-if should_run_suite api-workspace; then
-echo
-echo "### API tests (workspace)"
-echo
-"$INTEGRATION_TEST_ELECTRON_PATH" $ROOT/extensions/vscode-api-tests/testworkspace.code-workspace --enable-proposed-api=vscode.vscode-api-tests --extensionDevelopmentPath=$ROOT/extensions/vscode-api-tests --extensionTestsPath=$ROOT/extensions/vscode-api-tests/out/workspace-tests $API_TESTS_EXTRA_ARGS
-kill_app
-fi
-
-if should_run_suite colorize; then
-echo
-echo "### Colorize tests"
-echo
-npm run test-extension -- -l vscode-colorize-tests "${GREP_ARGS[@]}"
-kill_app
-fi
-
 if should_run_suite terminal-suggest; then
 echo
 echo "### Terminal Suggest tests"
@@ -275,43 +250,11 @@ npm run test-extension -- -l git-base "${GREP_ARGS[@]}"
 kill_app
 fi
 
-if should_run_suite ipynb; then
-echo
-echo "### Ipynb tests"
-echo
-npm run test-extension -- -l ipynb "${GREP_ARGS[@]}"
-kill_app
-fi
-
-if should_run_suite notebook-renderers; then
-echo
-echo "### Notebook Output tests"
-echo
-npm run test-extension -- -l notebook-renderers "${GREP_ARGS[@]}"
-kill_app
-fi
-
 if should_run_suite configuration-editing; then
 echo
 echo "### Configuration editing tests"
 echo
 npm run test-extension -- -l configuration-editing "${GREP_ARGS[@]}"
-kill_app
-fi
-
-if should_run_suite github-authentication; then
-echo
-echo "### GitHub Authentication tests"
-echo
-npm run test-extension -- -l github-authentication "${GREP_ARGS[@]}"
-kill_app
-fi
-
-if should_run_suite copilot; then
-echo
-echo "### Copilot tests"
-echo
-npm run test-extension -- -l copilot "${GREP_ARGS[@]}"
 kill_app
 fi
 

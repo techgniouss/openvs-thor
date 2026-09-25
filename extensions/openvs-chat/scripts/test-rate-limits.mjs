@@ -52,7 +52,7 @@ const headers = obj => new Headers(obj);
 	assert.deepStrictEqual(
 		[groq, anthropic, m.parseRateLimitHeaders(headers({ 'content-type': 'application/json' }))],
 		[
-			{ limitTokens: 8_000, remainingTokens: 1_200, resetMs: 7_500, at: 1_000 },
+			{ limitTokens: 8_000, remainingTokens: 1_200, resetMs: 7_500, at: 1_000, requestCeiling: 8_000 },
 			{ limitTokens: 40_000, remainingTokens: 39_000, resetMs: undefined, at: 1_000 },
 			undefined,
 		],
@@ -252,6 +252,52 @@ const headers = obj => new Headers(obj);
 	// Pacing is not a retry and must not claim to be one — nothing has failed.
 	const paced = retryNotice('Groq (free tier)', { attempt: 0, delayMs: 7_500, reason: 'pacing' });
 	assert.ok(/refills in 8s/.test(paced) && !/retrying/.test(paced), `pacing reads as a wait, not a failure: ${paced}`);
+}
+
+// status(): the proactive-warning classification, read straight off remaining/limit ratios.
+{
+	const tracker = new m.RateLimitTracker();
+	const note = (obj, at) => tracker.note('q', { headers: headers(obj) }, at);
+
+	// Boundaries: exactly at a threshold reads as the healthier side (strict `<`, not `<=`).
+	note({ 'x-ratelimit-limit-tokens': '8000', 'x-ratelimit-remaining-tokens': '400' }, 0); // 5% exactly
+	assert.strictEqual(tracker.status('q', 0), 'near', 'exactly the critical ratio is not yet critical');
+	note({ 'x-ratelimit-limit-tokens': '8000', 'x-ratelimit-remaining-tokens': '399' }, 0); // just under 5%
+	assert.strictEqual(tracker.status('q', 0), 'critical', 'just under the critical ratio is critical');
+	note({ 'x-ratelimit-limit-tokens': '8000', 'x-ratelimit-remaining-tokens': '1600' }, 0); // 20% exactly
+	assert.strictEqual(tracker.status('q', 0), 'ok', 'exactly the near ratio is not yet near');
+	note({ 'x-ratelimit-limit-tokens': '8000', 'x-ratelimit-remaining-tokens': '1599' }, 0); // just under 20%
+	assert.strictEqual(tracker.status('q', 0), 'near', 'just under the near ratio is near');
+	note({ 'x-ratelimit-limit-tokens': '8000', 'x-ratelimit-remaining-tokens': '8000' }, 0); // 100%
+	assert.strictEqual(tracker.status('q', 0), 'ok', 'a full allowance is ok');
+
+	// unknown: no reading at all, or a reading with no limitTokens to divide by.
+	assert.strictEqual(tracker.status('nothing-known', 0), 'unknown', 'no reading at all is unknown, not ok');
+	tracker.note('no-limit', { headers: headers({ 'x-ratelimit-remaining-tokens': '10' }) }, 0);
+	assert.strictEqual(tracker.status('no-limit', 0), 'unknown', 'no limitTokens means no ratio, so unknown');
+
+	// Staleness: a reading past SNAPSHOT_TTL_MS (60s) is worthless, same rule delayFor uses.
+	note({ 'x-ratelimit-limit-tokens': '8000', 'x-ratelimit-remaining-tokens': '100' }, 0); // would be critical fresh
+	assert.strictEqual(tracker.status('q', 59_999), 'critical', 'just under the TTL is still fresh');
+	assert.strictEqual(tracker.status('q', 60_000), 'unknown', 'at/past the TTL the reading is stale, not critical');
+}
+
+// Anthropic's input limit is a per-minute bucket of *uncached* input, with output limited
+// separately: it neither caps a request's size nor compares with an estimate of the whole
+// prompt. Read as a ceiling it cut a tier-1 key to ~30k tokens per request on a 200k model,
+// and paced every mostly-cached step against a refill it did not need. It still feeds the
+// quota notice.
+{
+	const tracker = new m.RateLimitTracker();
+	tracker.note('claude', { headers: headers({
+		'anthropic-ratelimit-input-tokens-limit': '30000',
+		'anthropic-ratelimit-input-tokens-remaining': '1000',
+		'anthropic-ratelimit-input-tokens-reset': new Date(20_000).toISOString(),
+	}) }, 0);
+	assert.deepStrictEqual(
+		[tracker.get('claude').requestCeiling, tracker.delayFor('claude', 5_000, 0), tracker.status('claude', 0)],
+		[undefined, 0, 'critical'],
+	);
 }
 
 console.log('test-rate-limits: all assertions passed');

@@ -24,7 +24,7 @@
 	'use strict';
 
 	/**
-	 * @typedef {{ code: string, expiresAt: number, url: string }} PairingResult
+	 * @typedef {{ code: string, expiresAt: number, url: string, hint?: string }} PairingResult
 	 * @typedef {{ id: string, name: string, createdAt: number, lastSeenAt: number|null, revokedAt: number|null }} DeviceInfo
 	 * @typedef {{ enabled: boolean, connected: boolean, idleDisabled?: boolean, pairing?: PairingResult, devices?: DeviceInfo[], error?: string }} RemoteStatusPayload
 	 */
@@ -109,6 +109,20 @@
 		const statusLabel = el('span', 'remote-status-label', 'Remote: off');
 		statusRow.appendChild(statusDot);
 		statusRow.appendChild(statusLabel);
+		// The on/off switch for `openvsChat.remote.enabled` — so turning remote on doesn't mean
+		// finding a Command Palette entry. The host answers with the real state (see
+		// `setRemoteEnabled` in chatViewProvider.ts), which is what finally sets `checked`: a
+		// switch that couldn't turn on flips back rather than claiming to be on.
+		const toggle = el('label', 'remote-toggle');
+		const toggleInput = /** @type {HTMLInputElement} */ (el('input', 'remote-toggle-input'));
+		toggleInput.setAttribute('type', 'checkbox');
+		toggleInput.setAttribute('aria-label', 'Remote control');
+		toggleInput.addEventListener('change', () => {
+			deps.post({ type: 'setRemoteEnabled', enabled: !!toggleInput.checked });
+		});
+		toggle.appendChild(toggleInput);
+		toggle.appendChild(el('span', 'remote-toggle-text', 'On'));
+		statusRow.appendChild(toggle);
 		deps.container.appendChild(statusRow);
 
 		function renderStatus() {
@@ -120,6 +134,7 @@
 				// touching the `enabled` setting — say so, rather than looking like an ordinary drop.
 				: status.idleDisabled ? 'Remote: paused (idle)'
 				: 'Remote: connecting…';
+			toggleInput.checked = status.enabled;
 		}
 		renderStatus();
 
@@ -213,6 +228,9 @@
 
 			const codeRow = el('div', 'remote-pairing-code', pairing.code);
 			card.appendChild(codeRow);
+			if (pairing.hint) {
+				card.appendChild(el('div', 'hint remote-pairing-hint', pairing.hint));
+			}
 
 			const expiry = el('div', 'remote-pairing-expiry');
 			card.appendChild(expiry);

@@ -46,6 +46,12 @@
 	const TABLE_DELIM = /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)*\|?\s*$/;
 	/** A horizontal rule: three or more of the same marker, nothing else on the line. */
 	const HR = /^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/;
+	const QUOTE = /^\s*>\s?(.*)$/;
+	const HEADING = /^(#{1,6})\s+(.*)$/;
+	const BULLET = /^(\s*)[-*+]\s+(.*)$/;
+	const NUMBERED = /^(\s*)(\d+)[.)]\s+(.*)$/;
+	/** Output that ends on a closed block construct, i.e. not on a line of prose. */
+	const BLOCK_END = /(?:<\/(?:table|blockquote|ul|ol|h[1-6])>|<hr \/>)$/;
 
 	/** @param {string} text */
 	function escapeHtml(text) {
@@ -170,6 +176,18 @@
 	}
 
 	/**
+	 * Whether line `i` opens a block construct — the constructs renderBlocks gives margins of
+	 * their own rather than a trailing `<br />`.
+	 * @param {string[]} lines
+	 * @param {number} i
+	 */
+	function startsBlock(lines, i) {
+		const line = lines[i];
+		return (line.includes('|') && i + 1 < lines.length && TABLE_DELIM.test(lines[i + 1]))
+			|| QUOTE.test(line) || HR.test(line) || HEADING.test(line) || BULLET.test(line) || NUMBERED.test(line);
+	}
+
+	/**
 	 * Renders a non-code segment: headings, lists (nested), tables, blockquotes, rules and
 	 * paragraphs.
 	 *
@@ -177,11 +195,24 @@
 	 * which is what the transcript has always done — a chat answer reads the way the model
 	 * laid it out. Block constructs deliberately emit no `<br />` of their own: their own
 	 * margins do that spacing, and a stray break either side of a table left a visible gap.
+	 * The blank line a model writes around a block is the same gap by another route, so a
+	 * blank line only becomes a break between two lines of prose (see `blockAdjacent`).
 	 * @param {string} text
 	 */
 	function renderBlocks(text) {
 		const lines = String(text).split('\n');
 		let html = '';
+		/**
+		 * Whether the blank line at `i` touches a block: the segment's edge (a fence or the
+		 * message's own start/end lies beyond it) or a block construct on either side.
+		 * @param {number} i
+		 */
+		const blockAdjacent = i => {
+			if (html === '' || BLOCK_END.test(html)) { return true; }
+			let next = i + 1;
+			while (next < lines.length && lines[next].trim() === '') { next++; }
+			return next >= lines.length || startsBlock(lines, next);
+		};
 		/**
 		 * Open list elements, outermost first: the indent that opened each, its tag, and
 		 * whether its current `<li>` is still open. A nested list belongs *inside* the item
@@ -211,7 +242,7 @@
 				continue;
 			}
 
-			const quote = /^\s*>\s?(.*)$/.exec(line);
+			const quote = QUOTE.exec(line);
 			if (quote) {
 				closeLists();
 				if (!quoted) { html += '<blockquote>'; quoted = true; }
@@ -226,15 +257,15 @@
 				continue;
 			}
 
-			const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+			const heading = HEADING.exec(line);
 			if (heading) {
 				closeLists();
 				html += `<h${heading[1].length}>${renderInline(heading[2])}</h${heading[1].length}>`;
 				continue;
 			}
 
-			const bullet = /^(\s*)[-*+]\s+(.*)$/.exec(line);
-			const numbered = /^(\s*)(\d+)[.)]\s+(.*)$/.exec(line);
+			const bullet = BULLET.exec(line);
+			const numbered = NUMBERED.exec(line);
 			if (bullet || numbered) {
 				const m = /** @type {RegExpExecArray} */ (bullet ?? numbered);
 				const indent = m[1].replace(/\t/g, '    ').length;
@@ -280,7 +311,7 @@
 			}
 			closeLists();
 			if (line.trim() === '') {
-				html += '<br />';
+				if (!blockAdjacent(i)) { html += '<br />'; }
 			} else {
 				html += renderInline(line) + '<br />';
 			}

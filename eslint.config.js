@@ -11,7 +11,10 @@ import tseslint from 'typescript-eslint';
 
 import stylisticTs from '@stylistic/eslint-plugin-ts';
 import * as pluginLocal from './.eslint-plugin-local/index.ts';
-import * as pluginCopilotLocal from './extensions/copilot/.eslintplugin/index.ts';
+// extensions/copilot was removed from this fork (openvs-chat replaces it); the copilot-scoped
+// config blocks below never match a file anymore, but still need a valid plugin object to
+// register without crashing eslint.config.js at load.
+const pluginCopilotLocal = { rules: {} };
 import pluginImport from 'eslint-plugin-import';
 import pluginJsdoc from 'eslint-plugin-jsdoc';
 

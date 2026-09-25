@@ -1161,7 +1161,7 @@ async function runAuto(agentSteps, { maxSteps = 20, history = [{ role: 'user', c
 		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
 		async listModels() { return []; },
 		// A backend that has stated a per-request token allowance in its response headers.
-		rateLimit: () => (limitTokens ? { limitTokens } : undefined),
+		rateLimit: () => (limitTokens ? { requestCeiling: limitTokens } : undefined),
 		async streamChat(request) {
 			if (streamPhase === 0) { lastPlanRequest = request; }
 			if (streamPhase === 1) { reviewPrompt = request.messages.at(-1).content; }
@@ -1176,6 +1176,9 @@ async function runAuto(agentSteps, { maxSteps = 20, history = [{ role: 'user', c
 		getProvider: () => provider,
 		async getApiKey() { return 'k'; },
 		getBaseUrl: () => 'u',
+		async rotateApiKey() { return false; },
+		noteApiKeySuccess() { },
+		cooldowns: { markCooldown() { }, isCoolingDown: () => false, clear() { } },
 	};
 	const noop = () => { };
 	await new AutoOrchestrator(registry, autoRouter, approver, maxSteps).run(
@@ -1626,7 +1629,7 @@ async function runAuto(agentSteps, { maxSteps = 20, history = [{ role: 'user', c
 		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
 		async listModels() { return []; },
 		// Reported from the first response onward, exactly as `x-ratelimit-limit-tokens` is.
-		rateLimit: () => ({ limitTokens: 8_000, at: 0 }),
+		rateLimit: () => ({ limitTokens: 8_000, requestCeiling: 8_000, at: 0 }),
 		async runAgentStep(request) {
 			seen.push({ maxTokens: request.maxTokens, tokens: m.estimateMessagesTokens(request.messages) });
 			// Refuse anything over the allowance, as the real backend would. If the ceiling
@@ -1652,6 +1655,35 @@ async function runAuto(agentSteps, { maxSteps = 20, history = [{ role: 'user', c
 		'the ceiling is reported once, not re-announced on every step');
 }
 
+// 34b. A stated limit that is not a request ceiling — Anthropic's per-minute bucket of
+// uncached input — must not size the run. Read as one, a tier-1 key's 30k/min cut every
+// request to ~30k on a 200k-window model and compacted away the cache that makes it cheap.
+{
+	const sizes = [];
+	const provider = {
+		async listModels() { return []; },
+		rateLimit: () => ({ limitTokens: 30_000, remainingTokens: 29_000, at: 0 }),
+		// As Anthropic does — which is also what keeps the economy pass from eliding old reads.
+		get info() { return { id: 'fake', label: 'Fake', supportsTools: true, cachesPrompts: true, toolModelPatterns: [], visionModelPatterns: [] }; },
+		async runAgentStep(request) {
+			sizes.push(m.estimateMessagesTokens(request.messages));
+			return { content: 'done', toolCalls: [] };
+		},
+	};
+	const seed = [{ role: 'system', content: 'SYS' }, { role: 'user', content: 'go' }];
+	for (let i = 0; i < 20; i++) {
+		seed.push({ role: 'assistant', content: '', toolCalls: [{ id: `s${i}`, name: 'read_file', args: { path: `f${i}.ts` } }] });
+		seed.push({ role: 'tool', content: 'y'.repeat(8_000), toolCallId: `s${i}` });
+	}
+	const cb = noopCallbacks();
+	await new AgentRunner(provider, approver, 8, { maxContextTokens: 200_000 }).run(seed, { ...params, maxTokens: 8192 }, cb);
+	assert.deepStrictEqual(
+		[sizes[0] > 30_000, cb.notes.filter(n => /per request/.test(n))],
+		[true, []],
+		`the conversation is not cut to the per-minute bucket (${sizes[0]} tokens sent)`,
+	);
+}
+
 // 35. A *generous* stated allowance must change nothing. This is a tokens-per-request
 // limit, not a context window: a backend reporting 300k against a 128k-window model would,
 // if allowed to raise the budget, trade a rate-limit rejection for a context-length one —
@@ -1661,7 +1693,7 @@ async function runAuto(agentSteps, { maxSteps = 20, history = [{ role: 'user', c
 	const provider = {
 		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
 		async listModels() { return []; },
-		rateLimit: () => ({ limitTokens: 300_000, at: 0 }),
+		rateLimit: () => ({ limitTokens: 300_000, requestCeiling: 300_000, at: 0 }),
 		async runAgentStep(request) { seen.push(request); return { content: 'done', toolCalls: [] }; },
 	};
 	const cb = noopCallbacks();
@@ -1686,7 +1718,7 @@ async function runAuto(agentSteps, { maxSteps = 20, history = [{ role: 'user', c
 	const provider = {
 		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
 		async listModels() { return []; },
-		rateLimit: () => ({ limitTokens: 8_000, at: 0 }),
+		rateLimit: () => ({ limitTokens: 8_000, requestCeiling: 8_000, at: 0 }),
 		async runAgentStep(request) { seen.push(request.tools.map(t => t.name)); return { content: 'done', toolCalls: [] }; },
 	};
 	const cb = noopCallbacks();
@@ -1727,7 +1759,7 @@ async function runAuto(agentSteps, { maxSteps = 20, history = [{ role: 'user', c
 		const provider = {
 			info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
 			async listModels() { return []; },
-			rateLimit: () => (ceiling ? { limitTokens: ceiling, at: 0 } : undefined),
+			rateLimit: () => (ceiling ? { limitTokens: ceiling, requestCeiling: ceiling, at: 0 } : undefined),
 			async runAgentStep() {
 				return ++asked === 1
 					? { content: '', toolCalls: [{ id: 'c1', name: 'read_file', args: { path: 'big.ts' } }] }
@@ -1749,6 +1781,634 @@ async function runAuto(agentSteps, { maxSteps = 20, history = [{ role: 'user', c
 	assert.ok(m.estimateTokens(tight) < 2_600,
 		`a tight allowance gets a page sized to it (${m.estimateTokens(tight)} tokens)`);
 	assert.ok(/offset=\d+ to continue/.test(tight), 'and is told how to read the rest, so nothing is lost');
+}
+
+// 38. A sub-agent's own tool activity is forwarded live to the OUTER callbacks, tagged with
+// the spawn_subagent call's own id as `parentCallId` — the UI nests it under that call's
+// already-rendered card instead of it appearing as an unrelated top-level event, and the
+// spawn_subagent call itself stays untagged (it IS the top-level event).
+{
+	const provider = {
+		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+		async listModels() { return []; },
+		async runAgentStep(request) {
+			const isChild = request.messages.some(m => m.content.includes('DELEGATE THIS'));
+			if (isChild) {
+				return request.messages.some(m => m.role === 'tool')
+					? { content: 'child done', toolCalls: [] }
+					: { content: '', toolCalls: [{ id: 'k1', name: 'list_dir', args: { path: 'dir' } }] };
+			}
+			return request.messages.some(m => m.role === 'tool')
+				? { content: 'parent done', toolCalls: [] }
+				: { content: '', toolCalls: [{ id: 's1', name: 'spawn_subagent', args: { goal: 'DELEGATE THIS', readOnly: true } }] };
+		},
+	};
+	const events = [];
+	const cb = {
+		...noopCallbacks(),
+		onToolStart: (call, parentCallId) => events.push(['start', call.id, parentCallId]),
+		onToolEnd: (call, _result, _isError, parentCallId) => events.push(['end', call.id, parentCallId]),
+	};
+	const runner = new AgentRunner(provider, approver, 10);
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, cb);
+	assert.strictEqual(result.reason, 'done');
+	assert.deepStrictEqual(
+		events.filter(e => e[1] === 'k1'),
+		[['start', 'k1', 's1'], ['end', 'k1', 's1']],
+		"the delegate's own tool call is tagged with the spawn_subagent call's id",
+	);
+	assert.deepStrictEqual(
+		events.filter(e => e[1] === 's1'),
+		[['start', 's1', undefined], ['end', 's1', undefined]],
+		'the spawn_subagent call itself carries no parentCallId — it is the top-level event',
+	);
+}
+
+// 39. list_agent_sessions lists the other open tabs (title + running state), excluding the
+// caller's own session — never available at all without an injected `a2a` capability.
+{
+	const a2a = {
+		selfId: 'me',
+		listSessions: () => [{ id: 'other', title: 'Other Tab', running: true }],
+		sendMessage: async () => { throw new Error('not used by this test'); },
+	};
+	const provider = fakeProvider([
+		{ content: '', toolCalls: [{ id: 'c1', name: 'list_agent_sessions', args: {} }] },
+		{ content: 'done', toolCalls: [] },
+	]);
+	const runner = new AgentRunner(provider, approver, 10, { a2a });
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.strictEqual(result.reason, 'done');
+	const toolTurn = provider.seen[1].find(m => m.startsWith('tool:'));
+	assert.match(toolTurn, /other/, 'the other tab is listed');
+	assert.match(toolTurn, /Other Tab/, 'with its title');
+	assert.doesNotMatch(toolTurn, /"me"/, 'the caller never lists itself');
+}
+
+// 39b. Without an injected `a2a` (e.g. Ask/Plan, or any run the host didn't wire it into),
+// list_agent_sessions is never even offered as a tool.
+{
+	let offered;
+	const provider = {
+		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+		async listModels() { return []; },
+		async runAgentStep(request) { offered = request.tools.map(t => t.name); return { content: 'done', toolCalls: [] }; },
+	};
+	const runner = new AgentRunner(provider, approver, 10);
+	await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.ok(!offered.includes('list_agent_sessions'), 'no a2a capability, no A2A tools');
+	assert.ok(!offered.includes('send_agent_message'));
+}
+
+// 40. send_agent_message refuses a missing/empty targetSessionId with a clean tool error.
+{
+	const a2a = {
+		selfId: 'me',
+		listSessions: () => [{ id: 'other', title: 'Other', running: false }],
+		sendMessage: async () => { throw new Error('must not be called'); },
+	};
+	const provider = fakeProvider([
+		{ content: '', toolCalls: [{ id: 'c1', name: 'send_agent_message', args: { message: 'hi' } }] },
+		{ content: 'done', toolCalls: [] },
+	]);
+	const runner = new AgentRunner(provider, approver, 10, { a2a });
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.strictEqual(result.reason, 'done', 'the run recovers rather than throwing');
+	assert.match(provider.seen[1].find(m => m.startsWith('tool:')), /non-empty "targetSessionId"/);
+}
+
+// 41. send_agent_message refuses a session targeting itself.
+{
+	const a2a = {
+		selfId: 'me',
+		listSessions: () => [{ id: 'other', title: 'Other', running: false }],
+		sendMessage: async () => { throw new Error('must not be called'); },
+	};
+	const provider = fakeProvider([
+		{ content: '', toolCalls: [{ id: 'c1', name: 'send_agent_message', args: { targetSessionId: 'me', message: 'hi' } }] },
+		{ content: 'done', toolCalls: [] },
+	]);
+	const runner = new AgentRunner(provider, approver, 10, { a2a });
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.strictEqual(result.reason, 'done');
+	assert.match(provider.seen[1].find(m => m.startsWith('tool:')), /cannot send a message to itself/i);
+}
+
+// 41b. send_agent_message refuses a target session id that does not exist.
+{
+	const a2a = {
+		selfId: 'me',
+		listSessions: () => [{ id: 'other', title: 'Other', running: false }],
+		sendMessage: async () => { throw new Error('must not be called'); },
+	};
+	const provider = fakeProvider([
+		{ content: '', toolCalls: [{ id: 'c1', name: 'send_agent_message', args: { targetSessionId: 'ghost', message: 'hi' } }] },
+		{ content: 'done', toolCalls: [] },
+	]);
+	const runner = new AgentRunner(provider, approver, 10, { a2a });
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.strictEqual(result.reason, 'done');
+	assert.match(provider.seen[1].find(m => m.startsWith('tool:')), /No open chat tab with session id "ghost"/);
+}
+
+// 42. The per-run cap (Guardrails.maxAgentMessages) refuses further sends once reached, with
+// a message telling the model to stop rather than keep trying — and a2a.sendMessage is
+// never even called for the refused attempt.
+{
+	let sent = 0;
+	const a2a = {
+		selfId: 'me',
+		listSessions: () => [{ id: 'other', title: 'Other', running: false }],
+		sendMessage: async () => { sent++; return { ok: true, delivered: 'queued' }; },
+	};
+	const provider = fakeProvider([
+		{ content: '', toolCalls: [{ id: 'c1', name: 'send_agent_message', args: { targetSessionId: 'other', message: 'one' } }] },
+		{ content: '', toolCalls: [{ id: 'c2', name: 'send_agent_message', args: { targetSessionId: 'other', message: 'two' } }] },
+		{ content: 'done', toolCalls: [] },
+	]);
+	const runner = new AgentRunner(provider, approver, 10, { a2a, guardrails: { ...guardrails, maxAgentMessages: 1 } });
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.strictEqual(result.reason, 'done');
+	assert.strictEqual(sent, 1, 'only the first message actually reached delivery');
+	assert.match(provider.seen[1].find(m => m.startsWith('tool:')), /queued/, 'the first send succeeded');
+	// `seen[2]` carries BOTH tool results by now (this call's history includes the first
+	// send's too), so the last one — not `.find`'s first — is the one this step answers.
+	assert.match(provider.seen[2].filter(m => m.startsWith('tool:')).at(-1), /limit 1/, 'the second is refused by the cap');
+}
+
+// 43. send_agent_message goes through the SAME approval gate every other side-effecting
+// tool uses (`autoApproves`/`approver.confirm`) — under a strict policy the approver is
+// actually consulted, and a denial comes back as a clean tool-error result rather than
+// throwing or bypassing delivery.
+{
+	const a2a = {
+		selfId: 'me',
+		listSessions: () => [{ id: 'other', title: 'Other', running: false }],
+		sendMessage: async () => { throw new Error('must not be called after a denial'); },
+	};
+	let confirmCalls = 0;
+	const denying = {
+		confirm: async request => { confirmCalls++; assert.strictEqual(request.kind, 'agent_message'); return { approved: false, feedback: 'not now' }; },
+		ask: async () => '',
+	};
+	const provider = fakeProvider([
+		{ content: '', toolCalls: [{ id: 'c1', name: 'send_agent_message', args: { targetSessionId: 'other', message: 'hi' } }] },
+		{ content: 'done', toolCalls: [] },
+	]);
+	const strict = { ...guardrails, approval: 'always' };
+	const runner = new AgentRunner(provider, denying, 10, { a2a, guardrails: strict });
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.strictEqual(result.reason, 'done', 'a denial ends the run cleanly, not with a thrown error');
+	assert.strictEqual(confirmCalls, 1, 'the approval gate was actually consulted');
+	const toolTurn = provider.seen[1].find(m => m.startsWith('tool:'));
+	assert.match(toolTurn, /denied sending this agent-to-agent message/i);
+	assert.match(toolTurn, /not now/, "the user's feedback is fed back to the model");
+}
+
+// 44. Delivery into a live steerable run actually reaches that run's next step — the same
+// `steering` callback real user-typed steering drains. `a2a.sendMessage` here stands in for
+// `ChatViewProvider.deliverAgentMessage`, pushing into a queue a second AgentRunner drains
+// via its own `steering` option, proving the text that reached delivery is what the target
+// sees on its next request.
+{
+	// `a2a.sendMessage` stands in for `ChatViewProvider.deliverAgentMessage`, which is what
+	// actually builds the "[Message from agent session…]:" header and reply-hint text — that
+	// wrapping is exercised where it lives (chatViewProvider.ts), not here. This test's job
+	// is purely the AgentRunner-side contract: the raw message and `expectsReply` reach
+	// `sendMessage` intact, and whatever `sendMessage` pushes for delivery is what a target
+	// run's `steering` drain actually sees on its next step.
+	const bridge = [];
+	let seenExpectsReply;
+	const a2a = {
+		selfId: 'sender',
+		listSessions: () => [{ id: 'target', title: 'Target Tab', running: true }],
+		sendMessage: async (targetSessionId, message, expectsReply) => {
+			assert.strictEqual(targetSessionId, 'target');
+			seenExpectsReply = expectsReply;
+			bridge.push(message);
+			return { ok: true, delivered: 'live' };
+		},
+	};
+	const senderProvider = fakeProvider([
+		{ content: '', toolCalls: [{ id: 'c1', name: 'send_agent_message', args: { targetSessionId: 'target', message: 'peer review this diff', expectsReply: true } }] },
+		{ content: 'sent', toolCalls: [] },
+	]);
+	const senderRunner = new AgentRunner(senderProvider, approver, 10, { a2a });
+	const senderResult = await senderRunner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.strictEqual(senderResult.reason, 'done');
+	assert.match(senderProvider.seen[1].find(m => m.startsWith('tool:')), /Delivered live/, 'the sender is told it was delivered live, not queued');
+	assert.strictEqual(bridge.length, 1);
+	assert.match(bridge[0], /peer review this diff/, 'the raw message reaches sendMessage intact');
+	assert.strictEqual(seenExpectsReply, true, 'expectsReply is passed through');
+
+	const targetProvider = fakeProvider([{ content: 'reviewed', toolCalls: [] }]);
+	const targetRunner = new AgentRunner(targetProvider, approver, 10, { steering: () => bridge.splice(0) });
+	await targetRunner.run([{ role: 'user', content: 'original task' }], params, noopCallbacks());
+	assert.ok(
+		targetProvider.seen[0].some(m => m.startsWith('user:') && m.includes('peer review this diff')),
+		"the message reaches the target run's next step as a user turn",
+	);
+}
+
+// 45. `spawn_subagent` delegates never get either A2A tool — not offered in their schema at
+// all, whatever the parent's own capability — and the runtime handler refuses them too, as
+// a second, independent guard (`AgentOptions.a2a`'s doc: `runSubagent` never forwards `a2a`
+// to a child's options in the first place).
+{
+	let offeredToChild;
+	const parentA2a = {
+		selfId: 'parent',
+		listSessions: () => [{ id: 'other', title: 'Other', running: false }],
+		sendMessage: async () => { throw new Error('must not be reachable from a sub-agent'); },
+	};
+	const provider = {
+		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+		async listModels() { return []; },
+		async runAgentStep(request) {
+			const isChild = request.messages.some(m => m.content.includes('TRY A2A'));
+			if (isChild) {
+				offeredToChild = request.tools.map(t => t.name);
+				return { content: 'child done', toolCalls: [] };
+			}
+			return request.messages.some(m => m.role === 'tool')
+				? { content: 'parent done', toolCalls: [] }
+				: { content: '', toolCalls: [{ id: 's1', name: 'spawn_subagent', args: { goal: 'TRY A2A', readOnly: false } }] };
+		},
+	};
+	const runner = new AgentRunner(provider, approver, 20, { a2a: parentA2a });
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.strictEqual(result.reason, 'done');
+	assert.ok(offeredToChild, 'the sub-agent ran');
+	assert.ok(!offeredToChild.includes('list_agent_sessions'), 'not offered to a delegate');
+	assert.ok(!offeredToChild.includes('send_agent_message'), 'not offered to a delegate');
+}
+
+// 45b. Even a depth>0 runner constructed WITH an `a2a` capability (never how `runSubagent`
+// actually builds a child today, but the explicit belt-and-suspenders check both tool
+// handlers make) refuses both tools at runtime rather than reaching it.
+{
+	const a2a = {
+		selfId: 'child',
+		listSessions: () => [{ id: 'other', title: 'Other', running: false }],
+		sendMessage: async () => { throw new Error('must not be reachable below depth 0'); },
+	};
+	const provider = fakeProvider([
+		{ content: '', toolCalls: [{ id: 'c1', name: 'list_agent_sessions', args: {} }] },
+		{ content: '', toolCalls: [{ id: 'c2', name: 'send_agent_message', args: { targetSessionId: 'other', message: 'hi' } }] },
+		{ content: 'done', toolCalls: [] },
+	]);
+	const runner = new AgentRunner(provider, approver, 10, { a2a, depth: 1 });
+	const result = await runner.run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.strictEqual(result.reason, 'done');
+	assert.match(provider.seen[1].find(m => m.startsWith('tool:')), /not available in this run/);
+	assert.match(provider.seen[2].filter(m => m.startsWith('tool:')).at(-1), /not available in this run/);
+}
+
+// 46. The system prompt and tool schemas are the one part of a request trimming can never
+// shrink. Once they no longer leave the conversation room inside the budget, the run sends
+// the compact prompt and condensed schemas instead — every request from then on, and it
+// says so exactly once. Where the full pair fits, nothing changes.
+{
+	const bigSystem = 'FULL '.repeat(3_000); // ~3.75k tokens: rules and skills on a small model
+	const record = () => {
+		const seen = [];
+		const provider = {
+			info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+			async listModels() { return []; },
+			async runAgentStep(request) {
+				seen.push({ system: request.messages[0].content, toolTokens: m.estimateToolsTokens(request.tools), tools: request.tools });
+				return seen.length === 1
+					? { content: '', toolCalls: [{ id: 'r1', name: 'read_file', args: { path: 'a.ts' } }] }
+					: { content: 'done', toolCalls: [] };
+			},
+		};
+		return { seen, provider };
+	};
+	const seed = () => [{ role: 'system', content: bigSystem }, { role: 'user', content: 'go' }];
+	let fullToolTokens = 0;
+
+	// Roomy budget: the full prompt and full schemas go out untouched.
+	{
+		const { seen, provider } = record();
+		const callbacks = noopCallbacks();
+		await new AgentRunner(provider, approver, 5, { maxContextTokens: 120_000, compactSystemPrompt: 'COMPACT' })
+			.run(seed(), params, callbacks);
+		assert.ok(seen.every(r => r.system === bigSystem), 'a budget that carries the full prompt keeps it');
+		assert.ok(!callbacks.notes.some(n => /compact prompt/.test(n)), 'and says nothing about it');
+		fullToolTokens = seen[0].toolTokens;
+	}
+
+	// Tight budget (Groq's 8k free tier leaves ~5.4k for the conversation).
+	{
+		const { seen, provider } = record();
+		const callbacks = noopCallbacks();
+		await new AgentRunner(provider, approver, 5, { maxContextTokens: 5_400, compactSystemPrompt: 'COMPACT' })
+			.run(seed(), params, callbacks);
+		assert.ok(seen.length >= 2, 'the run takes more than one step');
+		assert.ok(seen.every(r => r.system === 'COMPACT'), 'every request carries the compact prompt');
+		assert.ok(seen[0].toolTokens < fullToolTokens * 0.8, `schemas are condensed: ${seen[0].toolTokens} vs ${fullToolTokens}`);
+		const names = seen[0].tools.map(t => t.name);
+		assert.ok(names.includes('read_file') && names.includes('edit_file'), 'no tool is dropped, only described more briefly');
+		const edit = seen[0].tools.find(t => t.name === 'edit_file');
+		assert.deepStrictEqual(edit.parameters.required, ['path'], 'the schema itself is unchanged');
+		assert.strictEqual(callbacks.notes.filter(n => /compact prompt/.test(n)).length, 1, 'the switch is announced once');
+	}
+
+	// A host that throttles the notice gets it instead of the transcript.
+	{
+		const { provider } = record();
+		const callbacks = noopCallbacks();
+		const relayed = [];
+		await new AgentRunner(provider, approver, 5, { maxContextTokens: 5_400, compactSystemPrompt: 'COMPACT', onCompactPrompt: n => relayed.push(n) })
+			.run(seed(), params, callbacks);
+		assert.strictEqual(relayed.length, 1);
+		assert.ok(!callbacks.notes.some(n => /compact prompt/.test(n)), 'not also written to the transcript');
+	}
+
+	// Without a compact prompt to switch to, behavior is exactly as before.
+	{
+		const { seen, provider } = record();
+		await new AgentRunner(provider, approver, 5, { maxContextTokens: 5_400 }).run(seed(), params, noopCallbacks());
+		assert.ok(seen.every(r => r.system === bigSystem));
+	}
+}
+
+// 47. A budget learned from a refusal mid-run (the 413 retry) is also checked against the
+// full prompt: re-sending the same fixed part inside a smaller budget fails identically.
+{
+	const bigSystem = 'FULL '.repeat(3_000);
+	const systems = [];
+	const provider = {
+		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+		async listModels() { return []; },
+		async runAgentStep(request) {
+			systems.push(request.messages[0].content);
+			if (systems.length === 1) {
+				throw new Error('Fake: request too large (HTTP 413). Request too large for model `q` on tokens per minute (TPM): Limit 8000, Requested 13155, please reduce your message size and try again.');
+			}
+			return { content: 'done', toolCalls: [] };
+		},
+	};
+	await new AgentRunner(provider, approver, 3, { maxContextTokens: 120_000, compactSystemPrompt: 'COMPACT' })
+		.run([{ role: 'system', content: bigSystem }, { role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.deepStrictEqual(systems, [bigSystem, 'COMPACT'], 'the first try is full, the retry inside the stated limit is compact');
+}
+
+// 48. A budget handed in below the normal 8k floor came from a real limit (a small window or
+// a stated allowance). A refusal that names no number halves the budget — it must never be
+// raised back to the floor, over the limit it was derived from.
+{
+	const sent = [];
+	const provider = {
+		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+		async listModels() { return []; },
+		async runAgentStep(request) {
+			sent.push(m.estimateMessagesTokens(request.messages) + m.estimateToolsTokens(request.tools));
+			if (sent.length === 1) {
+				throw new Error('This model\'s maximum context length was exceeded. Please reduce the length of the messages.');
+			}
+			return { content: 'done', toolCalls: [] };
+		},
+	};
+	const seed = [{ role: 'system', content: 'SYS' }, { role: 'user', content: 'go' }];
+	for (let i = 0; i < 20; i++) {
+		seed.push({ role: 'assistant', content: '', toolCalls: [{ id: `c${i}`, name: 'read_file', args: { path: `f${i}.ts` } }] });
+		seed.push({ role: 'tool', content: 'y'.repeat(4_000), toolCallId: `c${i}` });
+	}
+	await new AgentRunner(provider, approver, 3, { maxContextTokens: 5_400 }).run(seed, params, noopCallbacks());
+	assert.strictEqual(sent.length, 2, 'the refused step was retried once');
+	assert.ok(sent[1] < sent[0], `the retry is smaller than the refused request: ${sent}`);
+	assert.ok(sent[1] <= 5_400, `and stays inside the budget it was given, not the 8k floor: ${sent}`);
+}
+
+// 49. The MCP hint rides on each request only while the MCP schemas are actually offered:
+// once they are dropped for budget, telling the model to prefer them made it call tools that
+// were no longer there.
+{
+	const mcpTool = { name: 'mcp__big__query', description: 'd'.repeat(20_000), parameters: { type: 'object', properties: {} } };
+	const mcp = { tools: () => [mcpTool], async call() { return { result: 'ok', isError: false }; } };
+	const record = async budget => {
+		const seen = [];
+		const provider = {
+			info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+			async listModels() { return []; },
+			async runAgentStep(request) {
+				seen.push({ system: request.messages[0].content, names: request.tools.map(t => t.name) });
+				return { content: 'done', toolCalls: [] };
+			},
+		};
+		await new AgentRunner(provider, approver, 3, { mcp, maxContextTokens: budget })
+			.run([{ role: 'system', content: 'SYS' }, { role: 'user', content: 'go' }], params, noopCallbacks());
+		return seen[0];
+	};
+	const roomy = await record(120_000);
+	assert.ok(roomy.names.includes('mcp__big__query') && /mcp__big__query/.test(roomy.system), 'offered and named');
+	const tight = await record(8_000);
+	assert.ok(!tight.names.includes('mcp__big__query'), 'schemas dropped on a budget they would swamp');
+	assert.ok(!/MCP tools/.test(tight.system), 'and the hint goes with them');
+}
+
+// 50. `persona.compactPrompt: always` starts on the compact prompt and condensed schemas,
+// whatever the budget, and says nothing (the user chose it).
+{
+	const seen = [];
+	const provider = {
+		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+		async listModels() { return []; },
+		async runAgentStep(request) {
+			seen.push({ system: request.messages[0].content, edit: request.tools.find(t => t.name === 'edit_file').description });
+			return { content: 'done', toolCalls: [] };
+		},
+	};
+	const callbacks = noopCallbacks();
+	await new AgentRunner(provider, approver, 3, { maxContextTokens: 120_000, compactSystemPrompt: 'COMPACT', forceCompactPrompt: true })
+		.run([{ role: 'system', content: 'FULL' }, { role: 'user', content: 'go' }], params, callbacks);
+	assert.strictEqual(seen[0].system, 'COMPACT');
+	assert.ok(!/Requires user approval/.test(seen[0].edit), 'descriptions are condensed');
+	assert.ok(!callbacks.notes.some(n => /compact prompt/.test(n)));
+}
+
+// 51. Auto's implementer gets the same Agent-mode doctrine as a plain Agent run, and is no
+// longer told that writes need approval (false under the default policy).
+{
+	let implementerSystem = '';
+	const provider = {
+		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+		async listModels() { return []; },
+		async streamChat(request) { request.onToken('1. do the thing'); return { finishReason: 'stop' }; },
+		async runAgentStep(request) { implementerSystem ||= request.messages[0].content; return { content: 'implemented', toolCalls: [] }; },
+	};
+	const registry = {
+		getMaxTokens: () => 1000, getProvider: () => provider, async getApiKey() { return 'k'; }, getBaseUrl: () => 'u',
+		async rotateApiKey() { return false; }, noteApiKeySuccess() { },
+		cooldowns: { markCooldown() { }, isCoolingDown: () => false, clear() { } },
+	};
+	const noop = () => { };
+	await new AutoOrchestrator(registry, autoRouter, approver, 5).run(
+		{ history: [{ role: 'user', content: 'do it' }], baseSystemPrompt: 'base', signal: new AbortController().signal },
+		{ phase: noop, token: noop, agentStepStart: noop, agentStepEnd: noop, onToolStart: noop, onToolEnd: noop, note: noop },
+	);
+	assert.match(implementerSystem, /AGENT mode/);
+	assert.match(implementerSystem, /Never guess a file path/);
+	assert.match(implementerSystem, /IMPLEMENTER/);
+	assert.ok(!/require user approval/.test(implementerSystem));
+}
+
+// 52. Every tool's output is sized to the run's budget, not just read_file's: a result larger
+// than a small model's whole budget used to be cut to 200 characters by trimming before the
+// model saw any of it. Here an MCP tool returns ~40k characters against a 5.4k budget.
+{
+	const huge = 'FIRST ' + 'r'.repeat(40_000) + ' LAST';
+	const mcpTool = { name: 'mcp__s__dump', description: 'dump', parameters: { type: 'object', properties: {} } };
+	const mcp = { tools: () => [mcpTool], async call() { return { result: huge, isError: false }; } };
+	const sent = [];
+	const provider = {
+		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+		async listModels() { return []; },
+		async runAgentStep(request) {
+			sent.push(request.messages.filter(x => x.role === 'tool').map(x => x.content));
+			return sent.length === 1
+				? { content: '', toolCalls: [{ id: 'd1', name: 'mcp__s__dump', args: {} }] }
+				: { content: 'done', toolCalls: [] };
+		},
+	};
+	await new AgentRunner(provider, approver, 3, { mcp, maxContextTokens: 5_400 })
+		.run([{ role: 'system', content: 'SYS' }, { role: 'user', content: 'go' }], params, noopCallbacks());
+	const result = sent[1][0];
+	assert.ok(result.startsWith('FIRST') && result.endsWith('LAST'), 'head and tail reach the model');
+	assert.match(result, /omitted to fit/);
+	assert.ok(result.length < 12_000, `sized to the budget: ${result.length}`);
+}
+
+// 53. Stop reaches a tool call in flight, not just the gap between steps: an MCP server that
+// never answers used to hold a stopped run for its full two-minute call timeout.
+{
+	const mcpTool = { name: 'mcp__s__hang', description: 'hangs', parameters: { type: 'object', properties: {} } };
+	const mcp = { tools: () => [mcpTool], call: () => new Promise(() => { }) };
+	const provider = {
+		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+		async listModels() { return []; },
+		async runAgentStep() { return { content: '', toolCalls: [{ id: 'h1', name: 'mcp__s__hang', args: {} }] }; },
+	};
+	const controller = new AbortController();
+	setTimeout(() => controller.abort(), 200);
+	const started = Date.now();
+	await assert.rejects(
+		new AgentRunner(provider, approver, 3, { mcp }).run([{ role: 'user', content: 'go' }], { ...params, signal: controller.signal }, noopCallbacks()),
+		err => err?.name === 'AbortError',
+	);
+	assert.ok(Date.now() - started < 5_000, `stopped promptly (${Date.now() - started}ms)`);
+}
+
+// 54. Auto falls back past a failing inferred candidate for provider failures too (quota,
+// rejected key, outage), not only for model-not-found — and a provider-wide failure skips
+// that provider's other models, which would fail the same way. A pinned model never falls
+// back, and the implementer only falls back before it has done anything.
+{
+	const { fallbackScope, nextCandidate } = await import(new URL('../out/auto/orchestrator.js', import.meta.url));
+	const cand = (providerId, model, extra = {}) => ({ role: 'plan', roleLabel: 'Planning', providerId, providerLabel: providerId.toUpperCase(), model, source: 'inferred', ready: true, ...extra });
+	const list = [cand('a', 'a-1'), cand('a', 'a-2'), cand('b', 'b-1')];
+	assert.strictEqual(fallbackScope(new Error('A: rate limited (HTTP 429)')), 'provider');
+	assert.strictEqual(fallbackScope(new Error('A: authentication failed (HTTP 401).')), 'provider');
+	assert.strictEqual(fallbackScope(new Error('model_not_found: a-1')), 'model');
+	assert.strictEqual(fallbackScope(new DOMException('Aborted', 'AbortError')), undefined);
+	assert.strictEqual(nextCandidate(list, 0, new Error('A: rate limited (HTTP 429)')), 2, 'a provider failure skips that provider\'s other model');
+	assert.strictEqual(nextCandidate(list, 0, new Error('model_not_found')), 1, 'a model failure may try its sibling');
+	assert.strictEqual(nextCandidate(list, 2, new Error('HTTP 429')), -1, 'nothing left');
+
+	// End to end through the orchestrator: plan on provider a hits a 429, b answers.
+	const used = { plan: [], code: [] };
+	const makeProvider = id => ({
+		info: { id, label: id.toUpperCase(), supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+		async listModels() { return []; },
+		async streamChat(request) {
+			used.plan.push(`${id}:${request.model}`);
+			if (id === 'a') { throw new Error('A: rate limited (HTTP 429)'); }
+			request.onToken('1. do it');
+			return { finishReason: 'stop' };
+		},
+		async runAgentStep(request) {
+			used.code.push(`${id}:${request.model}`);
+			if (id === 'a') { throw new Error('A: rate limited (HTTP 429)'); }
+			return { content: 'implemented', toolCalls: [] };
+		},
+	});
+	const providers = { a: makeProvider('a'), b: makeProvider('b') };
+	const registry = {
+		getMaxTokens: () => 1000, getProvider: id => providers[id], async getApiKey() { return 'k'; }, getBaseUrl: () => 'u',
+		async rotateApiKey() { return false; }, noteApiKeySuccess() { },
+		cooldowns: { markCooldown() { }, isCoolingDown: () => false, clear() { } },
+	};
+	const router = {
+		isReviewEnabled: () => false,
+		isDecompose: () => false,
+		async resolveRoleCandidates(role) { return [cand('a', 'a-1', { role }), cand('a', 'a-2', { role }), cand('b', 'b-1', { role })]; },
+	};
+	const notes = [];
+	const noop = () => { };
+	await new AutoOrchestrator(registry, router, approver, 5, undefined, undefined, 0, false, undefined).run(
+		{ history: [{ role: 'user', content: 'do it' }], baseSystemPrompt: 'base', signal: new AbortController().signal },
+		{ phase: noop, token: noop, agentStepStart: noop, agentStepEnd: noop, onToolStart: noop, onToolEnd: noop, note: t => notes.push(t) },
+	);
+	assert.deepStrictEqual(used.plan, ['a:a-1', 'b:b-1'], 'plan skipped a-2 after A\'s 429');
+	assert.strictEqual(used.code.at(-1), 'b:b-1', 'the implementer fell back before doing anything');
+	assert.ok(notes.some(n => /A failed — trying B · b-1/.test(n)), notes.join(' | '));
+
+	// A pinned model is honoured as-is: it fails rather than being swapped.
+	const pinnedRouter = { ...router, async resolveRoleCandidates(role) { return [cand('a', 'a-1', { role, source: 'configured' })]; } };
+	used.plan.length = 0;
+	await assert.rejects(new AutoOrchestrator(registry, pinnedRouter, approver, 5).run(
+		{ history: [{ role: 'user', content: 'do it' }], baseSystemPrompt: 'base', signal: new AbortController().signal },
+		{ phase: noop, token: noop, agentStepStart: noop, agentStepEnd: noop, onToolStart: noop, onToolEnd: noop, note: noop },
+	), /429/);
+	assert.deepStrictEqual(used.plan, ['a:a-1']);
+}
+
+// 55. A write-capable sub-agent gets the editing rules a plain Agent run follows; a research
+// one does not need them. Neither is told its writes require approval (false under the
+// default policy).
+for (const readOnly of [false, true]) {
+	const systems = [];
+	const provider = {
+		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+		async listModels() { return []; },
+		async runAgentStep(request) {
+			systems.push(request.messages[0]?.role === 'system' ? request.messages[0].content : '');
+			if (systems.length === 1) {
+				return { content: '', toolCalls: [{ id: 'sp', name: 'spawn_subagent', args: { goal: 'fix a.ts', readOnly } }] };
+			}
+			return { content: 'done', toolCalls: [] };
+		},
+	};
+	await new AgentRunner(provider, approver, 4, { maxContextTokens: 120_000 })
+		.run([{ role: 'system', content: 'PARENT' }, { role: 'user', content: 'go' }], params, noopCallbacks());
+	const child = systems.find(x => /SUB-AGENT/.test(x)) ?? '';
+	assert.ok(child, 'the delegate ran');
+	assert.ok(!/require user approval/.test(child), `readOnly=${readOnly}: no false approval claim`);
+	assert.strictEqual(/never copy that gutter/.test(child), !readOnly, `readOnly=${readOnly}: editing rules only when it can edit`);
+	assert.ok(!/ask_user|update_todos/.test(child), 'no rules about tools a delegate lacks');
+}
+
+// 56. Tool-call ids are unique across a run. Backends that omit ids get `call_0` synthesized
+// on every step (and prose-recovered calls `text_call_0`), and everything that edits the
+// conversation pairs calls with results by id.
+{
+	const sentIds = [];
+	const provider = {
+		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+		async listModels() { return []; },
+		async runAgentStep(request) {
+			sentIds.push(request.messages.flatMap(m => [...(m.toolCalls ?? []).map(c => `call:${c.id}`), ...(m.role === 'tool' ? [`result:${m.toolCallId}`] : [])]));
+			return sentIds.length <= 2
+				? { content: '', toolCalls: [{ id: 'call_0', name: 'read_file', args: { path: `f${sentIds.length}.ts` } }, { id: 'call_0', name: 'list_dir', args: { path: '.' } }] }
+				: { content: 'done', toolCalls: [] };
+		},
+	};
+	await new AgentRunner(provider, approver, 5, { readOnly: true }).run([{ role: 'user', content: 'go' }], params, noopCallbacks());
+	assert.deepStrictEqual(sentIds.at(-1), [
+		'call:call_0', 'call:call_0_1', 'result:call_0', 'result:call_0_1',
+		'call:call_0_2', 'call:call_0_3', 'result:call_0_2', 'result:call_0_3',
+	], 'every call has its own id, and each result carries the id of its own call');
 }
 
 console.log('test-agent-loop: all assertions passed');

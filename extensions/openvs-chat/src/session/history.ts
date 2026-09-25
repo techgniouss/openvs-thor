@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { withoutImages } from './persistence';
 import { HistoryEntry, SessionDeps, SessionState } from './types';
 
 /**
@@ -42,7 +43,7 @@ export function archiveSession(
 		id: session.id,
 		title,
 		messages: session.messages.map(m => m.images?.length
-			? { role: m.role, content: `🖼 (image attachment not kept in history)\n${m.content}`, kind: m.kind }
+			? { ...withoutImages(m), content: `🖼 (image attachment not kept in history)\n${m.content}` }
 			: m),
 		savedAt: deps.now(),
 	};

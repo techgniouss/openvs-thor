@@ -20,6 +20,9 @@ import { mintToken, verifyToken, hashForStorage, timingSafeEqualHex } from './to
 import { buildVapidJwt, sendPayloadLessPush, type PushSubscriptionInfo } from './push.ts';
 import { isEnvelope, isControlFrame, type Envelope, type ControlFrame, type PushFrame } from './protocol.ts';
 
+/** Wrong pairing codes a room tolerates before its live codes are withdrawn; see `WorkspaceRoom.failedClaims`. */
+const MAX_FAILED_CLAIMS = 10;
+
 /** WebSocket tag identifying the single host connection for this room. */
 export const HOST_TAG = 'host';
 
@@ -129,6 +132,14 @@ export class WorkspaceRoom {
 	 */
 	private readonly pairingAttempts = new Map<string, AttemptState>();
 
+	/**
+	 * Wrong codes presented since this room last minted one. The per-code counter above only
+	 * ever sees claims of a code that exists, so a wrong guess counted nowhere and guessing was
+	 * unlimited; past {@link MAX_FAILED_CLAIMS} every live code is withdrawn. In memory for the
+	 * same reason as that counter: an eviction resets a rate limit, it grants nothing.
+	 */
+	private failedClaims = 0;
+
 	constructor(state: DurableObjectState, env: Env) {
 		this.state = state;
 		this.env = env;
@@ -198,6 +209,7 @@ export class WorkspaceRoom {
 		this.state.acceptWebSocket(server, [HOST_TAG]);
 		const identity: SocketIdentity = { tag: HOST_TAG, connectedAt: Date.now() };
 		server.serializeAttachment(identity);
+		this.notifyClientsHostStatus(true);
 		return new Response(null, { status: 101, webSocket: pair[0] });
 	}
 
@@ -273,6 +285,11 @@ export class WorkspaceRoom {
 			)
 			.toArray()[0];
 		if (!row || row.usedAt !== null) {
+			this.failedClaims++;
+			if (this.failedClaims >= MAX_FAILED_CLAIMS) {
+				this.state.storage.sql.exec('UPDATE pairing SET usedAt = ? WHERE usedAt IS NULL', Date.now());
+				return new Response('too many wrong codes — ask for a new pairing code', { status: 429 });
+			}
 			return new Response('invalid or already-used code', { status: 403 });
 		}
 		if (isExpired(row.expiresAt, Date.now())) {
@@ -505,7 +522,10 @@ export class WorkspaceRoom {
 				// first `ready`/`listSkills`/`listMcp`). Replay-from-`lastSeq` (the plan's `resume`/
 				// `snapshotNeeded` pair) isn't built yet, so `lastSeq: 0` always means "start fresh";
 				// nothing currently reads it as anything else.
-				const welcome: Envelope = { v: 1, t: 'c', seq: 0, p: { c: 'welcome', lastSeq: 0 } };
+				// A client is also told whether VS Code is here right now — see `HostStatusFrame`.
+				const welcome: Envelope = isHostTag(tag)
+					? { v: 1, t: 'c', seq: 0, p: { c: 'welcome', lastSeq: 0 } }
+					: { v: 1, t: 'c', seq: 0, p: { c: 'welcome', lastSeq: 0, hostOnline: this.state.getWebSockets(HOST_TAG).length > 0 } };
 				ws.send(JSON.stringify(welcome));
 				return;
 			}
@@ -532,23 +552,27 @@ export class WorkspaceRoom {
 			case 'bye':
 				ws.close(1000, frame.reason ?? 'bye');
 				return;
+			case 'ping': {
+				// The auto-responder only matches the exact seq-0 ping string; a ping carrying
+				// any other seq (older clients stamped a running one) lands here and still has to
+				// be answered, or the peer's missed-pong check closes its socket every minute.
+				ws.send(HEARTBEAT_PONG_JSON);
+				return;
+			}
 			case 'resume':
 			case 'snapshotNeeded':
-			case 'ping':
 			case 'pong':
 			case 'welcome':
 			case 'paired':
 			case 'revoked':
 			case 'deviceConnected':
+			case 'hostStatus':
 				// `resume`/`snapshotNeeded` (replay-from-`lastSeq`) are genuinely not built yet —
 				// see the `hello` case's own doc — and belong to Phase 5's extension-side
 				// `socket.ts` for reconnect bookkeeping the DO does not need to referee; auth is
-				// already settled at WS-upgrade time (`upgradeHost`/`upgradeClient`). `ping`/`pong`
-				// never reach here at all (the constructor's auto-response answers them without
-				// waking a hibernated DO); accepted-but-inert here only so a stray one from a
-				// client that raced the auto-responder doesn't close the connection. `welcome`,
-				// `paired`, `revoked` and `deviceConnected` are all DO→peer frames, never received
-				// back.
+				// already settled at WS-upgrade time (`upgradeHost`/`upgradeClient`). `pong` is
+				// the relay's own reply, never expected back. `welcome`, `paired`, `revoked`,
+				// `deviceConnected` and `hostStatus` are all DO→peer frames, never received back.
 				return;
 			default: {
 				const unreachable: never = frame;
@@ -582,6 +606,7 @@ export class WorkspaceRoom {
 		const expiresAt = Date.now() + PAIRING_TTL_MS;
 		this.state.storage.sql.exec('INSERT OR REPLACE INTO pairing (codeHash, expiresAt, usedAt) VALUES (?, ?, NULL)', codeHash, expiresAt);
 		this.pairingAttempts.set(codeHash, INITIAL_ATTEMPTS);
+		this.failedClaims = 0;
 		const paired: Envelope = { v: 1, t: 'c', seq: 0, p: { c: 'paired', code, expiresAt } };
 		ws.send(JSON.stringify(paired));
 	}
@@ -663,11 +688,30 @@ export class WorkspaceRoom {
 
 	webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean): void {
 		// Tag bookkeeping is owned by the runtime's hibernatable-WebSocket support — once a
-		// socket closes it simply stops appearing in `state.getWebSockets()`, so there is nothing
-		// keyed by this specific socket to clean up by hand. Kept as an explicit handler (rather
-		// than omitted) so a later phase has an obvious place to hang a closing side effect (e.g.
-		// notifying the host that a device disconnected) without hunting for where it belongs.
-		void ws; void code; void reason; void wasClean;
+		// socket closes it stops appearing in `state.getWebSockets()`, so there is nothing keyed
+		// by it to clean up by hand. The one side effect: when the room's last host leaves, its
+		// clients are told (a takeover's displaced socket closing is not that — the new host is
+		// already tagged by then). The closing socket is excluded explicitly, since the runtime
+		// may still list it while this handler runs.
+		void code; void reason; void wasClean;
+		if (isHostTag(this.state.getTags(ws)[0] ?? '') && !this.state.getWebSockets(HOST_TAG).some(other => other !== ws)) {
+			this.notifyClientsHostStatus(false);
+		}
+	}
+
+	/** Tells every connected client whether the host is here — see `HostStatusFrame`. */
+	private notifyClientsHostStatus(online: boolean): void {
+		const frame: Envelope = { v: 1, t: 'c', seq: 0, p: { c: 'hostStatus', online } };
+		const json = JSON.stringify(frame);
+		for (const socket of this.state.getWebSockets()) {
+			if (isClientTag(this.state.getTags(socket)[0] ?? '')) {
+				try {
+					socket.send(json);
+				} catch {
+					// A client socket mid-close — it resyncs on its own reconnect.
+				}
+			}
+		}
 	}
 
 	webSocketError(ws: WebSocket, error: unknown): void {

@@ -7,6 +7,7 @@ import {
 	AgentRequest, AgentStep, ChatMessage, ChatProvider, ChatRequest, FinishReason, ModelEntry, ProviderInfo,
 	RetryInfo, STREAM_FETCH_OPTS, StreamChatResult, ToolCall, apiFetch, describeHttpError, retryNotice,
 } from './types';
+import { takesDefaultSamplingOnly } from './openaiCompatible';
 
 /**
  * Provider for Google's Antigravity IDE OAuth → Code Assist API (`cloudcode-pa`), the
@@ -425,7 +426,10 @@ async function generateContent(
 		project: projectId,
 		request: {
 			contents,
-			generationConfig: { temperature: 0.3, maxOutputTokens: maxTokens },
+			// Gemini 3 is documented to loop below its default temperature; older models keep 0.3.
+			generationConfig: takesDefaultSamplingOnly(model)
+				? { maxOutputTokens: maxTokens }
+				: { temperature: 0.3, maxOutputTokens: maxTokens },
 			...(tools ? { tools } : {}),
 		},
 	};

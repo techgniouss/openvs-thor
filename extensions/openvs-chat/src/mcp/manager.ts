@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { createHash } from 'crypto';
 import * as vscode from 'vscode';
 import { ToolSpec } from '../providers/types';
 import { McpStdioClient, McpStdioConfig, McpToolDef } from './client';
@@ -117,11 +118,67 @@ export function safeToolName(serverId: string, toolName: string, taken: Readonly
 }
 
 /**
+ * Decides whether a server a *project* defined may start. Resolves true to start it.
+ * See {@link McpManager}'s constructor.
+ */
+export type ProjectServerConsent = (id: string, config: McpServerConfig, file: string) => Promise<boolean>;
+
+/**
+ * The consent `extension.ts` wires in: a modal naming exactly what would run, remembered per
+ * workspace against a hash of the server's config — so a config the repository later changes
+ * (a different command, a different URL) asks again instead of inheriting the old answer.
+ */
+export function promptingConsent(memento: vscode.Memento): ProjectServerConsent {
+	return async (id, config, file) => {
+		const key = consentKey(id, config);
+		const remembered = memento.get<boolean>(key);
+		if (remembered !== undefined) {
+			return remembered;
+		}
+		const what = config.url
+			? `connect to ${config.url}`
+			: `run: ${[config.command, ...(config.args ?? [])].join(' ')}`;
+		const choice = await vscode.window.showWarningMessage(
+			`This workspace's ${file} defines an MCP server "${id}" that would ${what}. Start it?`,
+			{ modal: true, detail: 'Servers from a repository run with your permissions and see the agent\'s tool calls. Only allow ones you recognize. Your answer is remembered until the server\'s config changes.' },
+			'Allow', 'Deny');
+		// A dismissed dialog is not remembered, so the question comes back next time.
+		if (choice) {
+			await memento.update(key, choice === 'Allow');
+		}
+		return choice === 'Allow';
+	};
+}
+
+/**
  * Discovers MCP servers from global settings (`openvsChat.mcp.servers`) and a project file
  * (`.openvs/mcp.json` or `.vscode/mcp.json`), connects to them, and exposes their tools to
- * the agent under namespaced names. stdio servers only start in a trusted workspace.
+ * the agent under namespaced names. Servers only start in a trusted workspace, and a project's own servers only once allowed.
  */
+/** The workspace-state key a project server's consent is remembered under: its id and exact config. */
+function consentKey(id: string, config: unknown): string {
+	return `openvsChat.mcpConsent.${createHash('sha256').update(JSON.stringify({ id, config })).digest('hex')}`;
+}
+
+/**
+ * Records that the user allowed a project server themselves — for a server added through the
+ * extension's own "Add MCP Server" command, which would otherwise ask the person who just
+ * added it for permission to run it.
+ */
+export async function rememberProjectConsent(memento: vscode.Memento, id: string, config: unknown): Promise<void> {
+	await memento.update(consentKey(id, config), true);
+}
+
 export class McpManager implements McpToolset, vscode.Disposable {
+	/**
+	 * @param projectConsent Asked before starting any server defined by the workspace's own
+	 * `.openvs/mcp.json` / `.vscode/mcp.json`. Workspace trust alone let cloning a repository
+	 * and opening the chat spawn whatever command its config named — VS Code's own MCP support
+	 * asks first. Servers from the user's own settings are never asked about. Defaults to
+	 * refusing, so a caller that wires nothing gets the safe behavior.
+	 */
+	constructor(private readonly projectConsent: ProjectServerConsent = async () => false) { }
+
 	private readonly clients = new Map<string, McpClient>();
 	private readonly toolSpecs: ToolSpec[] = [];
 	/** namespaced tool name -> { server, tool, readOnly } */
@@ -154,7 +211,7 @@ export class McpManager implements McpToolset, vscode.Disposable {
 
 	private async startAll(): Promise<void> {
 		const generation = this.generation;
-		const servers = await this.loadConfig();
+		const { servers, fromProject } = await this.loadConfig();
 		for (const [id, cfg] of Object.entries(servers)) {
 			if (this.generation !== generation) {
 				return; // superseded by a reconnect
@@ -172,6 +229,14 @@ export class McpManager implements McpToolset, vscode.Disposable {
 			if (!vscode.workspace.isTrusted) {
 				this.status.push(`${id}: skipped (workspace not trusted).`);
 				continue;
+			}
+			const projectFile = fromProject.get(id);
+			if (projectFile && !await this.projectConsent(id, cfg, projectFile)) {
+				this.status.push(`${id}: not started (defined by ${projectFile}; not allowed).`);
+				continue;
+			}
+			if (this.generation !== generation) {
+				return; // superseded while the user was deciding
 			}
 			await this.startServer(id, cfg, generation);
 		}
@@ -277,9 +342,13 @@ export class McpManager implements McpToolset, vscode.Disposable {
 		this.status.length = 0;
 	}
 
-	/** Merges global settings with a project config file (project wins on id collisions). */
-	private async loadConfig(): Promise<Record<string, McpServerConfig>> {
+	/**
+	 * Merges global settings with a project config file (project wins on id collisions), and
+	 * records which ids came from a project file — those need consent to start.
+	 */
+	private async loadConfig(): Promise<{ servers: Record<string, McpServerConfig>; fromProject: Map<string, string> }> {
 		const merged: Record<string, McpServerConfig> = {};
+		const fromProject = new Map<string, string>();
 		const global = vscode.workspace.getConfiguration('openvsChat').get<Record<string, McpServerConfig>>('mcp.servers') ?? {};
 		Object.assign(merged, global);
 
@@ -292,11 +361,14 @@ export class McpManager implements McpToolset, vscode.Disposable {
 					const servers = parsed.servers ?? parsed.mcpServers ?? parsed;
 					if (servers && typeof servers === 'object') {
 						Object.assign(merged, servers);
+						for (const id of Object.keys(servers)) {
+							fromProject.set(id, file);
+						}
 					}
 				}
 			}
 		}
-		return merged;
+		return { servers: merged, fromProject };
 	}
 
 	private async tryReadJson(uri: vscode.Uri): Promise<any | undefined> {

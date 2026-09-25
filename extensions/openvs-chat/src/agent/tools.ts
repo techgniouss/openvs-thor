@@ -4,9 +4,12 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { spawn } from 'child_process';
+import { promises as fsp } from 'fs';
+import * as nodePath from 'path';
 import * as vscode from 'vscode';
 import { MALFORMED_ARGS } from '../providers/toolCalls';
 import { ToolCall, ToolSpec, isAbortError } from '../providers/types';
+import { FileWrite } from './checkpoint';
 import { Guardrails, WorkspacePath, autoApproves, autoApprovesWrites, checkCommand, checkPath, describeWorkspaceUri, loadGuardrails, normalizeWorkspacePath, resolveWorkspacePath } from './guardrails';
 import { resolveAgentShell } from './shell';
 
@@ -190,7 +193,7 @@ export const AGENT_TOOLS: ToolSpec[] = [
 	},
 	{
 		name: 'run_command',
-		description: 'Run a shell command and return its output. Requires user approval. Use for builds, tests, git, etc. Runs in the workspace root unless you pass "cwd".',
+		description: 'Run a shell command and return its output. Requires user approval. Use for builds, tests, git, etc. Runs in the workspace root unless you pass "cwd". The command must finish on its own: never start a dev server, a watcher (--watch) or anything interactive — it would hold the run until the timeout kills it.',
 		parameters: {
 			type: 'object',
 			properties: {
@@ -209,8 +212,14 @@ export const AGENT_TOOLS: ToolSpec[] = [
  * and Ask mode needs it as much as Agent mode does — "what does this page say" and "check
  * the current API" are questions, not tasks. Its egress is governed by the approval policy
  * (see {@link fetchUrl}), not by this list.
+ *
+ * `list_agent_sessions` belongs here for the same reason: it reads the other open tabs'
+ * titles/run state and changes nothing. Like `ask_user`/`spawn_subagent` it is handled by
+ * `AgentRunner` itself rather than {@link executeTool} (it needs the sibling-session map,
+ * which lives in `chatViewProvider.ts` — see `AgentOptions.a2a`), so it never reaches the
+ * generic dispatch below; it is listed here purely for this classification.
  */
-export const READ_ONLY_TOOL_NAMES = ['read_file', 'list_dir', 'search_files', 'glob_files', 'fetch_url'];
+export const READ_ONLY_TOOL_NAMES = ['read_file', 'list_dir', 'search_files', 'glob_files', 'fetch_url', 'list_agent_sessions'];
 
 /**
  * Every name the model can call as a tool, including the ones the agent loop handles
@@ -222,7 +231,7 @@ export const READ_ONLY_TOOL_NAMES = ['read_file', 'list_dir', 'search_files', 'g
  * retries the same call. `update_todos` is spelled out rather than imported to keep this
  * module free of a dependency on the agent loop.
  */
-const CALLABLE_TOOL_NAMES = new Set([...AGENT_TOOLS.map(t => t.name), 'ask_user', 'update_todos', 'spawn_subagent']);
+const CALLABLE_TOOL_NAMES = new Set([...AGENT_TOOLS.map(t => t.name), 'ask_user', 'update_todos', 'spawn_subagent', 'list_agent_sessions', 'send_agent_message']);
 
 /**
  * How many options an {@link ASK_USER_TOOL} call may offer. Two is the minimum for a
@@ -288,8 +297,47 @@ export const SPAWN_SUBAGENT_TOOL: ToolSpec = {
 	},
 };
 
+/**
+ * Agent-to-agent (A2A) discovery tool: lists the other open chat tabs so a top-level Agent
+ * run can find a session id to address with {@link SEND_AGENT_MESSAGE_TOOL}. Handled by
+ * {@link AgentRunner} (not {@link executeTool}) — it needs the sibling-session map, which
+ * only `chatViewProvider.ts` has (see `AgentOptions.a2a`). Never offered to a `spawn_subagent`
+ * delegate; only a top-level, user-initiated session may discover or address another tab.
+ */
+export const LIST_AGENT_SESSIONS_TOOL: ToolSpec = {
+	name: 'list_agent_sessions',
+	description: 'List the other open chat tabs (their session id, title, and whether each is currently running), so you can address one with send_agent_message. Never includes this session itself.',
+	parameters: {
+		type: 'object',
+		properties: {},
+	},
+};
+
+/**
+ * Agent-to-agent (A2A) messaging tool: sends a text message to another open chat tab's
+ * agent, addressed by session id. Handled by {@link AgentRunner}, gated behind the same
+ * approval machinery as every other side-effecting tool (`runOneTool`'s MCP-call branch),
+ * plus a small per-run cap (`Guardrails.maxAgentMessages`) — see `AgentOptions.a2a`'s doc
+ * for the full delivery story (a live run is steered; an idle one is queued for its next
+ * turn). One explicit call per message: this does NOT start a reply loop — the model
+ * decides whether and when to send again.
+ */
+export const SEND_AGENT_MESSAGE_TOOL: ToolSpec = {
+	name: 'send_agent_message',
+	description: 'Send a text message to another open chat tab\'s agent, addressed by session id (get one from list_agent_sessions). Use this to hand off a question, ask for a review, or start a discussion between two tabs — one message per call; it does not wait for or fetch a reply. If the target is mid-run, it is delivered live and picked up on its next step; if idle, it is queued into that tab\'s conversation for the next time it runs.',
+	parameters: {
+		type: 'object',
+		properties: {
+			targetSessionId: { type: 'string', description: 'The session id of the chat tab to message (from list_agent_sessions). Cannot be this session\'s own id.' },
+			message: { type: 'string', description: 'The message body to send.' },
+			expectsReply: { type: 'boolean', description: 'True if you want the other agent to reply back to this session with its own send_agent_message call. Adds a one-line instruction on how to reply.' },
+		},
+		required: ['targetSessionId', 'message'],
+	},
+};
+
 /** What kind of side effect an approval covers; also the granularity of "always allow". */
-export type ApprovalKind = 'write' | 'command' | 'mcp';
+export type ApprovalKind = 'write' | 'command' | 'mcp' | 'agent_message';
 
 /** One request for the user's permission to take a side-effecting action. */
 export interface ApprovalRequest {
@@ -344,6 +392,12 @@ export interface ToolApprover {
 	confirm(request: ApprovalRequest): Promise<ApprovalResult>;
 	/** Puts a question to the user and resolves with their answer as plain text. */
 	ask(question: UserQuestion): Promise<string>;
+	/**
+	 * Told about every file write that succeeded, with the text before and after, so the host
+	 * can offer to undo the run (see `RunCheckpoint`). Optional: a caller with nothing to undo
+	 * into simply omits it.
+	 */
+	recordWrite?(write: FileWrite): void;
 }
 
 export interface ToolResult {
@@ -541,7 +595,7 @@ export function normalizeToolCall(call: ToolCall): ToolCall {
 }
 
 /** Executes a single tool call, applying guardrails and prompting for approval on side effects. */
-export async function executeTool(rawCall: ToolCall, approver: ToolApprover, guardrails?: Guardrails, limits?: ToolLimits): Promise<ToolResult> {
+export async function executeTool(rawCall: ToolCall, approver: ToolApprover, guardrails?: Guardrails, limits?: ToolLimits, signal?: AbortSignal): Promise<ToolResult> {
 	const call = normalizeToolCall(rawCall);
 	// Arguments that never parsed are reported as such, with the text quoted back. Falling
 	// through would run the tool with no arguments at all, and its complaint ("an empty path
@@ -586,7 +640,7 @@ export async function executeTool(rawCall: ToolCall, approver: ToolApprover, gua
 			case 'glob_files':
 				return await globFiles(asString(call.args.pattern), asNumber(call.args.limit));
 			case 'fetch_url':
-				return await fetchUrl(asString(call.args.url), asBoolean(call.args.raw), approver, g, limits?.maxReadChars);
+				return await fetchUrl(asString(call.args.url), asBoolean(call.args.raw), approver, g, limits?.maxReadChars, signal);
 			case 'write_file': {
 				const found = pathArg(true);
 				return found.ok ? await writeFile(found.target, asString(call.args.content), approver, g)
@@ -611,11 +665,11 @@ export async function executeTool(rawCall: ToolCall, approver: ToolApprover, gua
 				const command = commandTextOf(call.args);
 				const raw = asString(call.args.cwd).trim();
 				if (!raw) {
-					return await runCommand(root, '', command, approver, g);
+					return await runCommand(root, '', command, approver, g, signal);
 				}
 				const found = locate(raw, false, g);
 				return found.ok
-					? await runCommand(found.target.uri, found.target.display, command, approver, g)
+					? await runCommand(found.target.uri, found.target.display, command, approver, g, signal)
 					: { result: found.error, isError: true };
 			}
 			default:
@@ -981,8 +1035,51 @@ const CLOBBER_RATIO = 0.4;
 /** Files smaller than this are too short for the ratio test to mean anything. */
 const CLOBBER_MIN_CHARS = 200;
 
+/**
+ * Why a write to `target` would land outside its workspace folder through a symbolic link
+ * (or junction), or undefined when it would not.
+ *
+ * `checkPath` confines the *path*, not where the filesystem takes it: a link inside the
+ * workspace that points elsewhere let a write, approved or auto-approved as a workspace edit,
+ * change a file anywhere the user can write. Resolved from the deepest part of the path that
+ * exists, since a new file's own path does not exist yet. Writes only: reading through links
+ * (`npm link`, pnpm stores) is ordinary and harmless. Local files only — a remote or virtual
+ * workspace has no local path to resolve, and the error path is "allow", matching how an
+ * unresolvable root is treated.
+ */
+async function linkEscape(target: WorkspacePath): Promise<string | undefined> {
+	if (target.uri.scheme !== 'file') {
+		return undefined;
+	}
+	let root: string;
+	try {
+		root = await fsp.realpath(target.root.fsPath);
+	} catch {
+		return undefined;
+	}
+	for (let probe = target.uri.fsPath; ;) {
+		try {
+			const real = await fsp.realpath(probe);
+			const rel = nodePath.relative(root, real);
+			return rel === '..' || rel.startsWith(`..${nodePath.sep}`) || nodePath.isAbsolute(rel)
+				? `Writing ${target.display} is blocked: it resolves through a link to ${real}, outside the workspace.`
+				: undefined;
+		} catch {
+			const parent = nodePath.dirname(probe);
+			if (parent === probe) {
+				return undefined;
+			}
+			probe = parent;
+		}
+	}
+}
+
 async function writeFile(target: WorkspacePath, content: string, approver: ToolApprover, g: Guardrails): Promise<ToolResult> {
 	const path = target.display;
+	const escape = await linkEscape(target);
+	if (escape) {
+		return { result: escape, isError: true };
+	}
 	const existing = await readIfExists(target.uri);
 	// A drastic shrink is never auto-approved, whatever the policy says: it is the
 	// signature of a truncated model response, and the write is not reversible.
@@ -1012,6 +1109,7 @@ async function writeFile(target: WorkspacePath, content: string, approver: ToolA
 		}
 	}
 	await vscode.workspace.fs.writeFile(target.uri, new TextEncoder().encode(content));
+	approver.recordWrite?.({ uri: target.uri, path, before: existing, after: content });
 	return { result: `Wrote ${content.length} characters to ${path}.`, isError: false };
 }
 
@@ -1331,6 +1429,10 @@ function applyEdit(current: string, edit: FileEdit, path: string, label: string)
 
 async function editFile(target: WorkspacePath, edits: FileEdit[], approver: ToolApprover, g: Guardrails): Promise<ToolResult> {
 	const path = target.display;
+	const escape = await linkEscape(target);
+	if (escape) {
+		return { result: escape, isError: true };
+	}
 	if (!edits.length) {
 		return { result: 'edit_file requires either oldText/newText or a non-empty "edits" array.', isError: true };
 	}
@@ -1368,6 +1470,7 @@ async function editFile(target: WorkspacePath, edits: FileEdit[], approver: Tool
 		}
 	}
 	await vscode.workspace.fs.writeFile(target.uri, new TextEncoder().encode(updated));
+	approver.recordWrite?.({ uri: target.uri, path, before: current, after: updated });
 	return { result: `Replaced ${replacements} occurrence(s) in ${path}.`, isError: false };
 }
 
@@ -1660,7 +1763,7 @@ function htmlToText(html: string): string {
  * response is *untrusted input* — a page can contain text addressed to the model — so it
  * is handed over labelled as data, in the same way a fetched page is elsewhere.
  */
-async function fetchUrl(rawUrl: string, raw: boolean, approver: ToolApprover, g: Guardrails, maxChars?: number): Promise<ToolResult> {
+async function fetchUrl(rawUrl: string, raw: boolean, approver: ToolApprover, g: Guardrails, maxChars?: number, signal?: AbortSignal): Promise<ToolResult> {
 	let url: URL;
 	try {
 		url = new URL(rawUrl.trim());
@@ -1687,7 +1790,14 @@ async function fetchUrl(rawUrl: string, raw: boolean, approver: ToolApprover, g:
 
 	const abort = new AbortController();
 	const timer = setTimeout(() => abort.abort(), FETCH_TIMEOUT_MS);
+	// The user's Stop ends the fetch too, rather than leaving the run waiting out the timeout.
+	// Rethrown as a cancellation below, not reported as a timed-out page.
+	const stop = () => abort.abort();
+	signal?.addEventListener('abort', stop, { once: true });
 	try {
+		if (signal?.aborted) {
+			throw new DOMException('Aborted', 'AbortError');
+		}
 		const response = await fetch(url, {
 			redirect: 'follow',
 			signal: abort.signal,
@@ -1724,12 +1834,16 @@ async function fetchUrl(rawUrl: string, raw: boolean, approver: ToolApprover, g:
 			+ (clipped ? ` Showing the first ${cap} of ${text.length} characters.` : '');
 		return { result: `${head}\n\n${clipped ? text.slice(0, cap) : text}`, isError: false };
 	} catch (err) {
+		if (signal?.aborted) {
+			throw new DOMException('Aborted', 'AbortError');
+		}
 		if (abort.signal.aborted) {
 			return { result: `${url} did not respond within ${Math.round(FETCH_TIMEOUT_MS / 1000)}s.`, isError: true };
 		}
 		return { result: `Could not fetch ${url}: ${err instanceof Error ? err.message : String(err)}`, isError: true };
 	} finally {
 		clearTimeout(timer);
+		signal?.removeEventListener('abort', stop);
 	}
 }
 
@@ -1760,7 +1874,31 @@ async function readCapped(response: Response, maxBytes: number): Promise<string>
 	return text;
 }
 
-async function runCommand(dir: vscode.Uri, dirLabel: string, command: string, approver: ToolApprover, g: Guardrails): Promise<ToolResult> {
+/**
+ * Ends a command and every process it started. `child.kill()` ends only the shell the command
+ * runs in: its children (npm, then node, then the test runner) survive it, and on Windows
+ * nothing reaps them. `taskkill /T` takes the tree there; elsewhere the command runs as the
+ * leader of its own process group, which a negative pid signals as a whole.
+ */
+/** How long Stop waits for a killed command to exit before returning anyway. */
+const STOP_GRACE_MS = 3_000;
+
+function killTree(child: ReturnType<typeof spawn>): void {
+	if (child.pid === undefined) {
+		return;
+	}
+	try {
+		if (process.platform === 'win32') {
+			spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true }).on('error', () => child.kill());
+		} else {
+			process.kill(-child.pid, 'SIGTERM');
+		}
+	} catch {
+		child.kill();
+	}
+}
+
+async function runCommand(dir: vscode.Uri, dirLabel: string, command: string, approver: ToolApprover, g: Guardrails, signal?: AbortSignal): Promise<ToolResult> {
 	if (!command.trim()) {
 		return { result: 'Empty command.', isError: true };
 	}
@@ -1793,34 +1931,62 @@ async function runCommand(dir: vscode.Uri, dirLabel: string, command: string, ap
 		}
 	}
 	const shell = resolveAgentShell(g.shell);
-	return new Promise<ToolResult>(resolvePromise => {
+	if (signal?.aborted) {
+		throw new DOMException('Aborted', 'AbortError');
+	}
+	return new Promise<ToolResult>((resolvePromise, rejectPromise) => {
 		const collector = new OutputCollector();
 		let settled = false;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let stopped = false;
+		// A cancellation, not a failed command: rethrown so the run ends the way the user
+		// asked, instead of the model being told the command "failed" and carrying on.
+		const cancel = () => {
+			if (!settled) {
+				settled = true;
+				clearTimeout(timer);
+				rejectPromise(new DOMException('Aborted', 'AbortError'));
+			}
+		};
+		// Settles once the process has actually exited (`close` below), so what Stop returns
+		// to is a workspace nothing is still writing into. Bounded, since a process that
+		// ignores the kill must not turn Stop into a hang of its own.
+		const onStop = () => {
+			stopped = true;
+			killTree(child);
+			setTimeout(cancel, STOP_GRACE_MS);
+		};
 		const finish = (result: ToolResult) => {
 			if (!settled) {
 				settled = true;
 				clearTimeout(timer);
+				signal?.removeEventListener('abort', onStop);
 				resolvePromise(result);
 			}
 		};
 
-		let child;
+		let child: ReturnType<typeof spawn>;
 		try {
-			child = spawn(command, { cwd: dir.fsPath, shell: shell.path ?? true, windowsHide: true });
+			// Its own process group off Windows, so `killTree` can end everything it starts.
+			child = spawn(command, { cwd: dir.fsPath, shell: shell.path ?? true, windowsHide: true, detached: process.platform !== 'win32' });
 		} catch (err) {
 			return finish({ result: `Command could not be started: ${err instanceof Error ? err.message : String(err)}`, isError: true });
 		}
+		signal?.addEventListener('abort', onStop, { once: true });
 
 		let timedOut = false;
-		const timer = setTimeout(() => {
+		timer = setTimeout(() => {
 			timedOut = true;
-			child.kill();
+			killTree(child);
 		}, g.commandTimeoutMs);
 
 		child.stdout?.on('data', (chunk: Buffer) => collector.add(chunk.toString()));
 		child.stderr?.on('data', (chunk: Buffer) => collector.add(chunk.toString()));
 		child.on('error', err => finish({ result: `Command failed to run: ${err.message}`, isError: true }));
-		child.on('close', (code, signal) => {
+		child.on('close', (code, exitSignal) => {
+			if (stopped) {
+				return cancel();
+			}
 			const out = collector.render();
 			// A timeout is the one case where the exit status is meaningless, so it is
 			// reported as such rather than as a failing build the model would try to fix.
@@ -1834,7 +2000,7 @@ async function runCommand(dir: vscode.Uri, dirLabel: string, command: string, ap
 				});
 			}
 			const failed = code !== 0;
-			const status = failed ? `\n\n[exit code ${code ?? `killed by ${signal}`}]` : '';
+			const status = failed ? `\n\n[exit code ${code ?? `killed by ${exitSignal}`}]` : '';
 			finish({ result: (out || '(no output)') + status, isError: failed });
 		});
 	});

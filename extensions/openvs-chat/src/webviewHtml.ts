@@ -19,7 +19,7 @@ export const CHAT_APP_HTML = `
 		<section id="settingsPanel" class="hidden">
 			<div class="settings-header panel-header">
 				<h2>Settings</h2>
-				<button id="closeSettings" class="panel-close" title="Close settings (Esc)">✕ Close</button>
+				<button id="closeSettings" class="panel-close" title="Close settings (Esc)"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 8.707l3.646 3.647.708-.707L8.707 8l3.647-3.646-.707-.708L8 7.293 4.354 3.646l-.707.708L7.293 8l-3.646 3.646.707.708L8 8.707z"/></svg>Close</button>
 			</div>
 			<div class="settings-header"><h2>Providers</h2></div>
 			<div id="providerList"></div>
@@ -85,14 +85,14 @@ export const CHAT_APP_HTML = `
 			<label class="review-toggle"><input type="checkbox" id="completionsEnabled" /> Inline completions — suggest code as you type</label>
 
 			<div class="settings-header"><h2>Remote control</h2></div>
-			<p class="hint">Pair a phone or another device to drive this chat panel remotely — send messages, steer runs, and answer approval prompts from anywhere. Requires <code>openvsChat.remote.enabled</code> and your own deployed relay (<code>openvsChat.remote.relayUrl</code>) — run <strong>OpenVS Thor: Remote: Deploy Your Own Relay</strong> from the Command Palette to set one up in one step, then <strong>OpenVS Thor: Remote: Enable Remote Control</strong>.</p>
+			<p class="hint">Pair a phone to drive this chat panel from anywhere: send messages, switch and create chats, steer runs, and answer approval prompts. Turn it on below. By default OpenVS runs the relay on this computer and reaches your phone through Cloudflare Tunnel (installed for you if needed), so there is nothing to deploy. To use a relay you deployed to Cloudflare instead, set <code>openvsChat.remote.relayUrl</code>.</p>
 			<div id="remotePanel"></div>
 		</section>
 
 		<section id="historyPanel" class="hidden">
 			<div class="settings-header panel-header">
 				<h2>Chat History</h2>
-				<button id="closeHistory" class="panel-close" title="Close history (Esc)">✕ Close</button>
+				<button id="closeHistory" class="panel-close" title="Close history (Esc)"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 8.707l3.646 3.647.708-.707L8.707 8l3.647-3.646-.707-.708L8 7.293 4.354 3.646l-.707.708L7.293 8l-3.646 3.646.707.708L8 8.707z"/></svg>Close</button>
 			</div>
 			<p class="hint">Closed chats are saved here automatically. Click one to reopen it in a tab.</p>
 			<div id="historyList"></div>
@@ -128,24 +128,31 @@ export const CHAT_APP_HTML = `
 						<option value="yolo">⚡ Full Auto</option>
 					</select>
 					<select id="providerSelect" title="Provider"></select>
-					<select id="modelSelect" title="Model"></select>
+					<span class="model-picker">
+						<select id="modelSelect" title="Model"></select>
+						<button id="refreshModels" class="icon-button" title="Refresh models from provider">
+							<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M13.5 2.5v4h-4l1.62-1.62A4.98 4.98 0 0 0 3 8a5 5 0 0 0 9.9 1h1.02A6 6 0 1 1 11.83 4.17L13.5 2.5z"/></svg>
+						</button>
+					</span>
 					<span id="autoSummary" class="auto-summary hidden" title="Auto routing — configure in ⚙ Providers"></span>
-					<button id="refreshModels" class="icon-button" title="Refresh models from provider">
-						<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M13.5 2.5v4h-4l1.62-1.62A4.98 4.98 0 0 0 3 8a5 5 0 0 0 9.9 1h1.02A6 6 0 1 1 11.83 4.17L13.5 2.5z"/></svg>
-					</button>
 					<span class="spacer"></span>
-					<button id="attachButton" class="icon-button" title="Attach active file / selection">
-						<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M10.57 2.27a2.75 2.75 0 0 1 3.89 3.89l-6.72 6.72a4.25 4.25 0 0 1-6.01-6.01l6.01-6.01.71.71-6.01 6.01a3.25 3.25 0 1 0 4.6 4.6l6.72-6.72a1.75 1.75 0 1 0-2.48-2.48L4.92 9.34a.75.75 0 0 0 1.06 1.06l5.66-5.66.71.71-5.66 5.66a1.75 1.75 0 0 1-2.48-2.48l6.36-6.36z"/></svg>
-					</button>
-					<button id="enhanceButton" class="icon-button" title="Enhance prompt with AI">
-						<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1l1.5 4L14 6.5 9.5 8 8 12 6.5 8 2 6.5 6.5 5 8 1zm5 9l.75 2 2 .75-2 .75L13 15.5l-.75-2-2-.75 2-.75L13 10z"/></svg>
-					</button>
-					<button id="historyButton" class="icon-button" title="Chat history">
-						<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1.5a6.5 6.5 0 1 1 0 13 6.5 6.5 0 0 1 0-13zm0 1.3a5.2 5.2 0 1 0 0 10.4A5.2 5.2 0 0 0 8 2.8zm.65 1.7v3.23l2.55 1.53-.67 1.11L7.35 8.6V4.5h1.3z"/></svg>
-					</button>
-					<button id="settingsButton" class="icon-button" title="Providers & settings">
-						<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M9.1 1l.35 1.79c.47.16.91.4 1.31.69l1.72-.6 1.1 1.9-1.37 1.19a5.6 5.6 0 0 1 0 1.56l1.37 1.19-1.1 1.9-1.72-.6c-.4.29-.84.53-1.31.69L9.1 15H6.9l-.35-1.79a5.5 5.5 0 0 1-1.31-.69l-1.72.6-1.1-1.9 1.37-1.19a5.6 5.6 0 0 1 0-1.56L2.42 7.28l1.1-1.9 1.72.6c.4-.29.84-.53 1.31-.69L6.9 1h2.2zM8 5.5A2.5 2.5 0 1 0 8 10.5 2.5 2.5 0 0 0 8 5.5z"/></svg>
-					</button>
+					<span class="composer-actions">
+						<button id="attachButton" class="icon-button" title="Attach active file / selection">
+							<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M10.57 2.27a2.75 2.75 0 0 1 3.89 3.89l-6.72 6.72a4.25 4.25 0 0 1-6.01-6.01l6.01-6.01.71.71-6.01 6.01a3.25 3.25 0 1 0 4.6 4.6l6.72-6.72a1.75 1.75 0 1 0-2.48-2.48L4.92 9.34a.75.75 0 0 0 1.06 1.06l5.66-5.66.71.71-5.66 5.66a1.75 1.75 0 0 1-2.48-2.48l6.36-6.36z"/></svg>
+						</button>
+						<button id="imageButton" class="icon-button" title="Attach images (or paste a screenshot)">
+							<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M1.5 11.5l3.5-3.5 3 3 2-2 4.5 4.5"/><circle cx="11" cy="5.8" r="1.2"/></svg>
+						</button>
+						<button id="enhanceButton" class="icon-button" title="Enhance prompt with AI">
+							<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1l1.5 4L14 6.5 9.5 8 8 12 6.5 8 2 6.5 6.5 5 8 1zm5 9l.75 2 2 .75-2 .75L13 15.5l-.75-2-2-.75 2-.75L13 10z"/></svg>
+						</button>
+						<button id="historyButton" class="icon-button" title="Chat history">
+							<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1.5a6.5 6.5 0 1 1 0 13 6.5 6.5 0 0 1 0-13zm0 1.3a5.2 5.2 0 1 0 0 10.4A5.2 5.2 0 0 0 8 2.8zm.65 1.7v3.23l2.55 1.53-.67 1.11L7.35 8.6V4.5h1.3z"/></svg>
+						</button>
+						<button id="settingsButton" class="icon-button" title="Providers & settings">
+							<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M9.1 1l.35 1.79c.47.16.91.4 1.31.69l1.72-.6 1.1 1.9-1.37 1.19a5.6 5.6 0 0 1 0 1.56l1.37 1.19-1.1 1.9-1.72-.6c-.4.29-.84.53-1.31.69L9.1 15H6.9l-.35-1.79a5.5 5.5 0 0 1-1.31-.69l-1.72.6-1.1-1.9 1.37-1.19a5.6 5.6 0 0 1 0-1.56L2.42 7.28l1.1-1.9 1.72.6c.4-.29.84-.53 1.31-.69L6.9 1h2.2zM8 5.5A2.5 2.5 0 1 0 8 10.5 2.5 2.5 0 0 0 8 5.5z"/></svg>
+						</button>
+					</span>
 				</div>
 			</div>
 		</footer>

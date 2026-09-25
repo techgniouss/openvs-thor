@@ -120,13 +120,31 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   parallel. While a run streams, typed input is **queued** (Ask/Plan — auto-sent on
   completion) or **steers** the live agent run (injected as a user turn before the next
   loop step via `steerQueues`).
+  The queue is **host-owned** (`SessionState.queue`, handed to every client in each
+  `sessions` push), so every client edit goes back through `setQueue` — the panel's
+  `persistQueue` and the PWA's are the same call. The panel once kept its queue only locally,
+  and the next `sessions` push (opening or switching a tab mid-run) replaced it with the host's
+  empty copy. Every client also drains the queue on `done`; the host admits one drain per
+  finished run (`session/queueDrain.ts`'s `QueueDrainGate`, sends marked `fromQueue`) and
+  resyncs any other client, since a second drain aborted the run the first had just started.
+  Open tabs and the History archive are **restored at construction**
+  (`restoreSessionState`: `persistence.restoredSessions`, every tab idle, plus the archive
+  merged from both places it is saved). Nothing used to read them back, so a restart dropped
+  the open tabs unarchived, History could not be reopened, and the first archive save
+  afterwards overwrote every earlier conversation. History deletes go to the store by id
+  (`deleteHistory`) — sending the whole list could only be merged, so deleted chats came back.
+  `test-queue-drain.mjs` and `test-session-store.mjs` pin both.
 - `src/providers/` — one file per model backend (`openai.ts`, `anthropic.ts`, `nvidia.ts`,
   `openrouter.ts`, `groq.ts`, `mistral.ts`, `cloudflare.ts` (Workers AI), `kimi.ts`
-  (Moonshot), `qwen.ts` (DashScope), `custom.ts` (any OpenAI-compatible endpoint —
-  Ollama/LM Studio/vLLM/etc., no key required),
+  (Moonshot), `qwen.ts` (DashScope), `zai.ts` (Z.AI/Zhipu GLM), `opencodeZen.ts`
+  (OpenCode Zen — not the `opencode` CLI), `xkiro.ts` (the xkiro.com gateway), `copilot.ts`,
+  `grok.ts`, `kiro.ts` (OAuth-proxy backends — see below), `custom.ts` (any OpenAI-compatible
+  endpoint — Ollama/LM Studio/vLLM/etc., no key required),
   `openaiCompatible.ts`) implementing the shared `ChatProvider` interface (`types.ts`),
   with `toolCalls.ts` holding the model-agnostic robustness layer: it repairs the malformed
-  tool-call JSON weaker models emit (fences, Python literals, trailing commas, truncation)
+  tool-call JSON weaker models emit (fences, Python literals and single-quoted dicts, raw line
+  breaks inside strings — the commonest, from unescaped `write_file` content — trailing commas,
+  truncation)
   and recovers tool calls a model wrote into its prose (`<tool_call>`, `<function=…>`,
   fenced JSON) — `agentRunner.recoverTextToolCalls` applies the latter to every provider,
   and `tools.normalizeToolCall` maps other products' tool/argument names onto ours (including
@@ -168,6 +186,47 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   tool schemas (~1.9k tokens built-in, unbounded once MCP servers connect) are charged
   against the context budget via `estimateToolsTokens` — counting only the messages
   understated every agent request by that whole amount.
+  That fixed part (system prompt + schemas) is the one thing trimming can never shrink, so
+  every send builds **two prompt tiers** (`chatViewProvider.basePrompts`/`systemPrompts`):
+  the full one, and a **compact** one (`persona/prompts.ts`'s `compact` option — condensed
+  identity and doctrine, no thinking scaffold, rules capped at `COMPACT_RULES_CHARS`, skills
+  left out). `context.needsCompactPrompt` switches to it once the fixed part exceeds half the
+  request budget; the agent loop (`enforcePromptBudget`, one-way, re-checked after a 413
+  shrinks the budget) also condenses the tool schemas to first sentences
+  (`compactToolSpecs`), and `streamBudgeted` does the same for the plain path and Auto's text
+  phases. The user is told once per model; `openvsChat.persona.compactPrompt` (`auto` /
+  `always` / `never`) overrides the switch. Relatedly, `requestBudgets` splits a window too
+  small for the configured reply plus a usable conversation the way it splits a stated
+  allowance — an 8k-window model used to get an 8k conversation *and* an 8192 reservation.
+  The rest of a request is fitted too: attached context is built with `context.contextTurn`
+  so `trimMessages`' last pass may cut it from the end (Edit mode's whole file deliberately
+  is not — cutting it would return the file without its tail); Ask's auto-attached editors
+  are capped at a quarter of the budget; every tool's output except the self-paging
+  `read_file`/`fetch_url` is cut to the same per-call cap (`capToolOutput`, head + tail); and
+  `context.unfittableRequest` refuses up front, with the fix named, a request whose own
+  message (or Edit-mode file) cannot fit however it is trimmed. The MCP tool hint is added
+  per request by `AgentRunner.outgoing`, only while the MCP schemas are actually offered.
+  **Extended thinking** (`openvsChat.anthropic.thinking`, `auto`/`off`): `anthropic.ts`'s
+  `thinkingStyle` maps each Claude model to the API's own rule — adaptive with
+  `display: "summarized"` on 4.7+ (reasoning is otherwise hidden), plain adaptive on 4.6, a
+  4k `budget_tokens` on Haiku 4.5 and older, nothing where unsupported, and the parameter
+  simply omitted on models whose thinking cannot be turned off (Fable, Mythos, Opus 5.5).
+  Thinking deltas stream between the transcript's thinking marks; a step's signed
+  `thinking`/`redacted_thinking` blocks ride on `AgentStep.thinkingBlocks` →
+  `ChatMessage.thinkingBlocks`, and are replayed for the **current tool round only** (the last
+  assistant turn). A block's signature binds the conversation before it, and this harness
+  rewrites earlier turns (trimming, compaction, the compact-prompt swap) — replaying older
+  blocks would 400 on accounts created from 2026-08-31; dropping a leading run is allowed.
+  Against api.anthropic.com the request also opts into `thinking-binding-controls` with
+  `drop_block`; anywhere else a thinking-related 400 is retried once with all thinking
+  stripped. Prefill is **per model** (`ChatProvider.supportsPrefill`): 4.6+ and any request
+  with thinking on reject it, so declaring it provider-wide broke every continuation on a
+  current Claude model. `test-anthropic.mjs` pins all of this.
+  **Sampling overrides are model-aware**: `OpenAICompatibleProvider.requestExtras` (and
+  Antigravity, via `takesDefaultSamplingOnly`) drops `temperature`/`top_p` for models that
+  take only their default — Kimi K2.5+ rejects any temperature (HTTP 400, which failed every
+  request to Kimi's own suggested models), OpenAI reasoning models reject overrides, and
+  Gemini 3 / gpt-oss are documented to loop below their default.
   The shared client streams reasoning through `reasoningDelta`, which accepts every spelling
   in use — `reasoning_content` (DeepSeek-R1-style), `reasoning` (Groq, OpenRouter) and the
   object-wrapped form — because a turn spent entirely thinking carries no `content` and no
@@ -176,15 +235,85 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   error** (`throwStreamError`): NVIDIA NIM and other vLLM-based gateways report failures as
   an SSE event on an HTTP 200, and skipping them turned a stated provider error into the
   same silent "empty reply" stall. The Anthropic client has always raised these.
-  A 150s first-byte timeout is used for chat POSTs (free tiers queue server-side). NVIDIA's model list is
+  A 150s first-byte timeout is used for chat POSTs (free tiers queue server-side); `readSSE`
+  cancels the body reader on abort and on early exit, so Stop releases the connection instead
+  of leaving it draining. NVIDIA's model list is
   filtered to chat-capable models. Keys are stored in VS Code `SecretStorage`, never in
   plaintext settings; `OPENROUTER_API_KEY` / `MOONSHOT_API_KEY` / `DASHSCOPE_API_KEY` env
   vars also work. `openai.ts` additionally routes through `chatgptBackend.ts` (the ChatGPT
   Codex Responses API) whenever the stored OpenAI credential is a ChatGPT OAuth token
-  (detected via `isChatGptToken`) rather than an `sk-` API key. `src/oauth.ts` holds the
+  (detected via `isChatGptToken`) rather than an `sk-` API key. That route asks for the
+  reasoning summary Codex streams (retried without the field if the backend ever refuses it)
+  and announces a model substitution instead of crediting the reply to a model that never ran. `src/oauth.ts` holds the
   shared `OAuthTokenStore` used by all web sign-in flows (Claude, ChatGPT, and OpenRouter's
   one-click PKCE sign-in via `signInOpenRouter`), refreshing tokens transparently near
-  expiry.
+  expiry. Every flow's `state` is its own random value, checked on return — never the PKCE
+  verifier (Claude's once was, which put the verifier in the authorize URL) and never
+  `Math.random` (`auth.ts`'s callback state is all that keeps a crafted `vscode://` link out of
+  the key store).
+  `copilot.ts`, `grok.ts` and `kiro.ts` are a **third, deliberately separate** provider
+  category: each calls another vendor's own internal client backend (GitHub Copilot Chat's,
+  the Grok CLI's, CodeWhisperer's) rather than a documented public API — the same category
+  `AntigravityProvider` already established, with the same account-ban risk its doc comment
+  states plainly and every one of these three repeats. Copilot and Grok authenticate via
+  RFC 8628 device flow (`src/deviceAuth.ts` — a generic client, no per-vendor knowledge; only
+  `authorization_pending`/`slow_down` keep it polling, any other stated error ends it, and a
+  dropped connection mid-poll is retried rather than failing an already-approved sign-in) with
+  native VS Code sign-in UI in `src/deviceSignIn.ts`'s `signInWithDeviceFlow` (a cancellable
+  progress notification showing the code, no webview changes needed since every provider
+  card already posts the same generic `signIn` message `handleSignIn` branches on). Kiro
+  instead **imports** a credential Kiro's own IDE/CLI already wrote
+  (`deviceSignIn.ts`'s `importKiroCredential`, reading `~/.aws/sso/cache/kiro-auth-token.json`)
+  — it implements no sign-in flow of its own. All three subclass `providers/oauthProxy.ts`'s
+  `OAuthProxyChatProvider`, which caches the short-lived "wire" `WireSession` (token, expiry,
+  and Copilot's per-account API host — once one field per provider, which sent one pooled
+  account's token to another's host) minted from the
+  long-lived stored credential (Copilot's two-stage GitHub-token → Copilot-token exchange;
+  Grok/Kiro's simpler refresh-when-near-expiry) per credential string, de-duplicating a
+  concurrent burst onto one in-flight mint — run on its own signal with a 30s bound, so a Stop
+  in the tab that started it no longer fails the same request in every other tab. Requests go
+  through `withWireSession`, which re-mints once on a 401 (a token revoked before its stated
+  expiry used to stay cached until then). A mint that refreshes returns `updatedCredential`,
+  saved over the old one through `registry.replaceStoredKey` and followed in memory by
+  `successor` — refresh tokens that rotate are single-use. All three sit in `auto/router.ts`'s
+  `NOT_AUTO_INFERRED`, alongside `antigravity`: Auto mode must never select one of these on
+  the user's behalf.
+  `providers/webCookie/` is a **fourth** category, riskier still: `geminiWebProvider.ts`'s
+  `GeminiWebProvider` (id `web_gemini`) decrypts a real signed-in Chrome profile's own Google
+  session cookies (`chromeCookies.ts` — Windows DPAPI via a `powershell.exe` one-liner to
+  unwrap Chrome's AES-256-GCM master key, then Node's built-in `crypto` per cookie; **the one
+  dependency this extension carries**, `sql.js`, reads the `Cookies` SQLite file with no
+  native build step) and replays them against `gemini.google.com`'s **consumer chat UI** via
+  its `batchexecute` wire format (`extractGeminiText`/`parseSessionTokens`, ported from a
+  companion project's verified-working implementation) — not an API-shaped backend at all.
+  Off by **default** behind its own setting (`openvsChat.webGemini.enabled`, checked on every
+  call — the extra gate `NOT_AUTO_INFERRED` membership alone doesn't give, since that only
+  stops *automatic* selection) and Windows-only (`isPlatformSupported`); on any other platform
+  or with Chrome's newer App-Bound Encryption ("v20") it fails honestly rather than guessing.
+  Single-turn (the upstream takes one prompt string, no `messages` array). Multi-account reuses
+  the ordinary key-rotation machinery from `keyRotation.ts` rather than a bespoke pool: each
+  stored "key" here is a Chrome **user-data-directory path** naming one profile, and the
+  "Sign in" button (`chatViewProvider.ts`) auto-fills the platform default rather than
+  prompting for anything, since there is nothing to paste.
+  `providers/claudeCodeCli.ts`'s `ClaudeCodeCliProvider` (id `claude-code-cli`) is a **fifth**
+  category — BYOA (bring your own agent) rather than BYOK: it spawns the user's own,
+  already-installed Claude Code CLI (`claude -p … --output-format text`, or
+  `openvsChat.claude-code-cli.cliPath` for a non-PATH install) as a subprocess and streams its
+  stdout back as a plain chat reply (the prompt goes in on **stdin** — as an argument it hit
+  Windows' ~32k command-line cap — and on Windows a non-`.exe` binary, i.e. npm's
+  `claude.cmd`, is launched through a shell as one command string, with the model name
+  validated first), so someone with an existing Claude Code subscription can
+  reuse it without a separate Anthropic API key. Deliberately narrow: single-shot passthrough
+  only (the whole conversation is flattened into one prompt on every call — there is no
+  server-side session to resume), `info.supportsTools: false` and no `runAgentStep`, so it is
+  never wired into this extension's own Agent-mode tool loop and can never bypass
+  `agentRunner.ts`/`guardrails.ts` — whatever the CLI does internally to produce its answer
+  stays internal, only the final text comes back (the CLI reports some failures, an expired
+  sign-in among them, on stdout with exit 1, so a failed run's error quotes its stdout tail when
+  stderr is empty). `visionModelPatterns` is the unmatchable
+  sentinel (`antigravity.ts`'s pattern), not an empty list, because an empty list means
+  "assumed vision-capable" and this provider never sends attached images. Excluded from Auto
+  inference in `router.ts` for the same reason `custom` is: a local CLI may not be installed.
 - `src/agent/` — the Agent-mode tool loop: `tools.ts` (read/list/write files, run commands,
   `fetch_url`, plus `ask_user`, which blocks the loop on a multiple-choice question).
   `fetch_url` is the agent's only route off the machine — a URL the user pasted, docs that
@@ -201,6 +330,28 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   path and touch another), `agentRunner.ts` (the loop itself, including `spawn_subagent`
   delegation and the completion gate that refuses to call a run "done" while the model's
   own `update_todos` checklist has open items or it wrote files without verifying them).
+  A delegate's own tool calls now stream live under its `spawn_subagent` card instead of
+  staying opaque until the whole delegation finishes: `AgentCallbacks.onToolStart`/`onToolEnd`
+  carry an optional `parentCallId`, `runSubagent` forwards the child's tool activity through
+  it (narration/step lifecycle stays batched into the final summary as before — only tool
+  activity is worth surfacing mid-run), and `media/main.js` nests the rendered card under a
+  `.tool-children` group, falling back to a top-level card if the parent scrolled out of view
+  rather than dropping the event.
+  **Agent-to-agent (A2A) messaging** lets a top-level session's agent address another open
+  chat tab: `list_agent_sessions` (read-only) discovers a target by id/title/running-state,
+  `send_agent_message` delivers text to it. Both are offered only at `depth === 0`
+  (`AgentOptions.a2a`, injected from `chatViewProvider.ts`'s `buildA2A` — `AgentRunner` has no
+  knowledge of sibling sessions itself) and never forwarded into a `spawn_subagent` child's
+  options, so a delegate can never reach another tab however deep the nesting. Delivery has
+  two honestly-reported outcomes: a target with a live steerable run gets the message pushed
+  onto `steerQueues` — the exact mechanism real user-typed steering already uses — and is told
+  `'live'`; an idle target gets the header-prefixed message appended as a durable transcript
+  turn (`TranscriptEntry.fromAgentSession`, deliberately not a `kind`, so it stays a real
+  turn in `sendableMessages`) and is told `'queued'`, never `'live'`. `send_agent_message` is
+  gated by the same hard `autoApproves`/`approver.confirm` machinery as `run_command`/MCP
+  calls, plus a small per-run cap (`Guardrails.maxAgentMessages`, default 3) bounding a
+  runaway back-and-forth between two tabs — no reply-loop orchestration, no `responseId`
+  threading beyond that.
   A run is bounded on **two** axes, because they come apart: `openvsChat.agent.maxSteps`
   caps how many times the model is asked (Full Auto extends itself to 2× that, nothing
   else does), and `openvsChat.agent.maxRunMinutes` caps how long the asking may take —
@@ -215,10 +366,40 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   spellings, three reset formats) into a per-model `RateLimitTracker` held on the provider
   singleton, and `agentRunner.adoptRequestCeiling` re-derives *both* budgets from it — reply
   reservation and conversation — before the request that would have broken it. It may only
-  ever **tighten**: the allowance is tokens-per-request, not a window, so letting a roomy one
-  raise the budget would trade a rate-limit rejection for a context-length one. When no
+  ever **tighten**: a roomy allowance says nothing about the context window, so letting it
+  raise the budget would trade a rate-limit rejection for a context-length one. Only
+  `RateLimitSnapshot.requestCeiling` is used this way (and for pacing), and only the
+  `x-ratelimit-*` family sets it: those backends charge the whole request, reply reservation
+  included, against a per-minute window and refuse one larger than it. Anthropic's
+  input-token limit counts only *uncached* input and output is limited separately, so it
+  stays a quota gauge (`limitTokens`) — read as a ceiling it cut a tier-1 key's 200k-window
+  model to ~30k per request and compacted away the cache. When no
   header is offered the same ceiling is still learned from the HTTP 413 body
-  (`parseTokenLimit`), one wasted request later. `apiFetch` also takes a `pace` hook: when a
+  (`parseTokenLimit`), one wasted request later.
+  The same reading also drives a **proactive** notice, layered on top of that reactive
+  machinery rather than replacing it: `rateLimitStatus` (a pure function over a
+  `RateLimitSnapshot`, also exposed as `RateLimitTracker.status`) classifies a model's
+  last-known allowance as `'ok'` / `'near'` (<20% remaining) / `'critical'` (<5%) /
+  `'unknown'` (no reading, or one past `SNAPSHOT_TTL_MS`) — never invented from nothing.
+  `chatViewProvider.ts`'s `maybeNoticeRateLimit` posts a one-line `{ type: 'info' }` notice
+  on `'near'`/`'critical'` after a successful request, on both the plain streaming path and
+  the agent loop's `onStepSuccess` hook, throttled to once per (provider, model) per 5
+  minutes so a long run sitting at `'critical'` doesn't repeat it every step.
+  A stated rate limit is a *ceiling*; `providers/keyRotation.ts`'s `KeyRotator` and
+  `providers/cooldown.ts`'s `CooldownTracker` are what a session does about actually hitting
+  one. `ProviderRegistry.getApiKeys` returns a provider's primary stored key plus any backup
+  keys from its "Additional API keys" panel field; `withProviderResilience`
+  (`providers/resilience.ts`) wraps every request-issuing call site (plain chat, Agent-mode
+  steps and sub-agents via `AgentOptions.onKeyFailure`/`onStepSuccess`, compaction's
+  summarizer, Auto's text and implementer phases, commit-message generation) and on a
+  401/403/429 rotates to the next stored key and retries once, recording a quota cooldown on
+  the (provider, model) pair either way. `auto/router.ts`'s `resolveRoleCandidates` skips a
+  cooling-down inferred candidate in favor of the next-ranked one, falling back to the
+  cooling candidates only when every inferred option is cooling at once — a stale cooldown
+  costing one avoidable 429 beats Auto refusing to run. All three are session-scoped and
+  in-memory, same convention as `RateLimitTracker` below: a stale rotation or cooldown is
+  worth at most one wasted request, since the next one re-learns the truth.
+  `apiFetch` also takes a `pace` hook: when a
   reading says the request cannot fit what is left of the current window, it waits out the
   refill instead of spending a request to be refused — Groq counts *failed* requests against
   the daily budget. All its backoff sleeps are abortable, so Stop is instant. Each
@@ -270,6 +451,27 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   read-only tool calls run concurrently (`openvsChat.agent.parallelReads`) — the guards
   are evaluated in order before anything is dispatched, so batching can't be used to slip
   past the repeat-read breaker.
+  Every successful `write_file`/`edit_file` is reported through `ToolApprover.recordWrite`
+  into a per-run `RunCheckpoint` (`agent/checkpoint.ts`), so `/undo` restores the tab's last
+  run: files changed again since are left alone, created files go to the trash, and command
+  side effects are stated as untracked. In memory only (last 10 runs per tab). Writes are
+  also refused when the path resolves through a symlink/junction to outside the workspace
+  (`tools.linkEscape`); `checkPath` alone confines only the path string. Reads are not.
+  Stop reaches a tool call in flight, not only the gap between steps: `executeTool` takes the
+  run's signal, `run_command` kills the whole process tree (`taskkill /T` on Windows, a
+  process group elsewhere) and settles once it has exited, `fetch_url` aborts, and MCP calls
+  are raced against it (`untilStopped`). Edit mode (whole-file and inline actions) snapshots
+  its target per request (`EditTarget`: uri, range, version, original text) and stores each
+  proposal by id; Apply names the id. There used to be one view-wide target that every send
+  reset, so with parallel tabs an edit could be dropped or written into another file. An
+  auto-apply stands down if the file changed while the model worked.
+  Tool-call ids are made unique per run (`AgentRunner.withUniqueCallIds`): backends that omit
+  ids get `call_<index>` per step and prose recovery `text_call_<index>`, and everything that
+  edits the conversation (orphan dropping, eliding, `forgetElidedReads`) pairs by id.
+  The **Undo** button is the same undo: the host posts `checkpoint` (`checkpointRunId` + files;
+  an empty list once undone) and both `media/main.js` and the PWA draw a bar under the run
+  whose button sends `undoRun` for exactly that run. `checkpointRunId`, not `runId`, because
+  clients drop messages whose `runId` names a superseded run.
   Approvals and questions reach the user as inline cards in the chat tab that raised them,
   via the per-run `SessionApprover` in `chatViewProvider.ts` (host side) and
   `media/prompts.js` (rendering) — never as a global modal, so the card can carry a diff,
@@ -314,10 +516,20 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   merely drawn: after a runtime fallback the phase header no longer names the model that answered,
   and `test-auto-router.mjs` is what keeps the routing itself honest (nothing else exercises
   the real router — `test-agent-loop.mjs` drives the orchestrator against a stub).
+  **Runtime fallback** (inferred roles only; a pin is never substituted) is decided by
+  `orchestrator.nextCandidate`, used by every phase and by the non-agent Auto path:
+  `fallbackScope` returns `'model'` for model-not-found (a sibling model may serve) and
+  `'provider'` for 401/403/429/5xx/network (that provider's other models are skipped). The
+  implementer falls back only while it has done nothing. Note the agent loop *reports* a
+  provider failure as `RunResult.failure` rather than throwing — the implementer's fallback
+  used to live in a `catch` that never ran, so it never fell back at all. Write-capable
+  sub-agents get `persona/prompts.ts`'s `SUBAGENT_WRITE_RULES` (the compact editing rules).
 - `src/completions/` — Copilot-style inline ghost-text completions, twelve small modules
   glued together by `inlineProvider.ts`'s `OpenVSInlineCompletionProvider`: `context.ts`
   (windows the prefix/suffix around the cursor, LF-normalized, with the file's import block
-  extracted separately so a window that has slid past the top doesn't lose it),
+  extracted separately so a window that has slid past the top doesn't lose it — stepping over
+  a license header, shebang, directive or docstring and following multi-line imports to their
+  closing bracket, since stopping at the first non-import line found nothing in most files),
   `exclusions.ts` (credential-file and secret-line denylist, scheme allowlist, trust and
   language gates — see below), `prompt.ts` (the FIM stop sequences and the chat-fallback
   two-turn prompt), `sanitize.ts` (repairs a chat model's reply into insertable text — see
@@ -341,7 +553,9 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   continue code, they narrate, fence, and frequently echo back the prefix and suffix they
   were just given. **The sanitizer in `sanitize.ts` is load-bearing, not cosmetic** — every
   rule in it (strip an inline reasoning block, unwrap or reject a fence, drop a restated
-  prefix/suffix by longest-overlap, cap lines, cut at the first line that both dedents and
+  prefix/suffix by longest-overlap — except an overlap that is the completion's own opening
+  bracket (`arr.map(` → `(x) => …`), told apart by bracket balance, cap lines, cut at the
+  first line that both dedents and
   closes a bracket) corresponds to a failure mode actually observed from those backends, runs
   in a fixed order because later rules assume earlier ones already fired, and is what stands
   between a raw completion and a user seeing "sure, here's the completion:" as ghost text or
@@ -374,6 +588,41 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   completion response's rate-limit headers — `fetchOpts` bundles a `pace` hook that sleeps
   out a refill window, which is correct for a step that can afford to wait and wrong for a
   request whose cursor position may no longer exist by the time it would resolve.
+  A failing backend backs off (`HealthTracker.recordFailure`: 2s doubling to 60s, reset by
+  any success; explicit invokes still go through), and a 401/403/429 records the same
+  cooldown chat does, so an inferred completion model rotates to the next candidate.
+- `src/remote/` — remote control: a paired phone drives the chat panel through a relay.
+  `remoteService.ts` owns the connection; `remoteSink.ts` is the bus sink every outbound message
+  passes through (`redactForRemote` is the content boundary — base64 images become counts, and a
+  turn an editor action wrote (`TranscriptEntry.fromEditor`) never shows its selected code);
+  `coalescer.ts` batches tokens. User turns reach every *other* client as `userTurn` (the sender
+  echoes its own), so each device shows the same conversation. Heartbeat pings are sent as the
+  exact seq-0 string the relay auto-answers — any other seq went unanswered and dropped every
+  link once a minute. A dead link (two missed pongs, or a handshake that never opens) is
+  *abandoned* — replaced at once, its late events ignored — rather than `close()`d and waited
+  on, since on a dead link that close event can take minutes. **Two relay modes** (`openvsChat.remote.relayMode`): *hosted* dials the
+  Cloudflare Worker in `openvs-relay/`; *local* (the default when no `relayUrl` is set) runs
+  `remote/local/relayServer.ts` — the same protocol, a hand-written RFC 6455 server
+  (`websocket.ts`, no dependency) — on loopback, and publishes it with Cloudflare Tunnel
+  (`tunnel.ts`: finds or installs `cloudflared`, runs a quick or named tunnel). Locally, only
+  rooms the extension registered exist, and host endpoints refuse requests carrying
+  `Cf-Connecting-Ip` (i.e. anything through the tunnel). Both relays cap failed pairing-code
+  claims per room (`MAX_FAILED_CLAIMS`, 10): past it the room's outstanding codes are withdrawn
+  and claims answer 429 until a fresh code is minted, so a six-character code cannot be
+  brute-forced through a public tunnel. Both serve the PWA with anti-framing, nosniff and
+  no-referrer headers (`STATIC_SECURITY_HEADERS` / `pwa/_headers`). Images a phone uploads
+  (`remote/attachments.ts`) are typed by their leading bytes, never the client's label (the
+  type is re-sent with every later request, and a provider refuses a mismatch), and an upload
+  idle for `UPLOAD_IDLE_MS` is dropped so its bytes stop counting against the session cap.
+  `revokeDevice` refuses when the socket is down (the frame would be silently dropped) and
+  resolves whether the relay confirmed. `deploy.ts` mints `RELAY_PEPPER` only when the Worker
+  does not exist yet — replacing it signs out every paired device, so any other
+  `secret list` failure stops the deploy. The phone app is shipped as
+  `relay-pwa/`, a copy of `openvs-relay/pwa` kept equal by `scripts/sync-relay-pwa.mjs` +
+  `test-relay-pwa-sync.mjs` — edit the original, then sync. A quick tunnel's address changes on
+  every start (phones re-pair) and some ISPs' DNS blocks trycloudflare.com; a named tunnel
+  (`openvsChat.remoteSetTunnel`) fixes both. The Windows installer offers to install
+  `cloudflared` via winget (`build/win32/code.iss`).
 - `src/mcp/` — Model Context Protocol clients and multi-server lifecycle manager
   (`manager.ts`); merges global (`openvsChat.mcp.servers`) and per-project
   (`.openvs/mcp.json` / `.vscode/mcp.json`) server configs; project overrides global.
@@ -389,7 +638,12 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   than inlining them — a screenshot's base64 serialized whole is re-sent on every later
   agent step and ends the run on a small per-request allowance. The trust gate covers
   remote servers as well as spawned ones: a `url` in a project's own mcp.json aims the
-  agent's tool calls, and their arguments, at an endpoint the workspace chose.
+  agent's tool calls, and their arguments, at an endpoint the workspace chose. Trust alone is
+  not enough for a server a *project* file defines: `McpManager` takes a `ProjectServerConsent`
+  (refuse by default) and `extension.ts` wires `promptingConsent` — a modal naming the exact
+  command/URL, remembered per workspace against a hash of that server's config, so a changed
+  config asks again. Servers from the user's own settings, and ones added through `mcpAdd`, are
+  not asked about. `test-mcp-consent.mjs` pins this.
 - `src/rules.ts` — loads always-on "soft steering" instructions from `openvsChat.rules` plus
   **every** present file in `openvsChat.ruleFiles` (default `.openvs/rules.md`, `AGENTS.md`,
   `.github/copilot-instructions.md`, `.cursorrules`), each labelled with its source and
@@ -397,7 +651,9 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   is capped at 12k chars — earlier files win, so order the setting by priority.
 - `src/skills.ts` — activatable instruction packs; four ship bundled verbatim under
   `skills/*.md` (caveman, impeccable, uiux-pro-max, agent-browser), user skills can be added
-  via settings or `.openvs/skills/*.md`. The `openvsChat.createSkill` command (also the
+  via settings, `.openvs/skills/<id>.md` or the published layout `.openvs/skills/<id>/SKILL.md`
+  (standard `name:`/`description:` frontmatter is read, falling back to the first `# heading` /
+  `> quote`). The `openvsChat.createSkill` command (also the
   "＋ New Skill" button in the panel and `/skill new`) scaffolds a workspace skill file.
   MCP servers can likewise be registered from the UI: `openvsChat.mcpAdd` writes to
   `.openvs/mcp.json` or the global setting, and the settings panel shows per-server status.

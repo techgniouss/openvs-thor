@@ -43,6 +43,11 @@ const KNOWN = new Set(['read_file', 'list_dir', 'search_files', 'glob_files', 'w
 		['Here you go: {"path":"src/a.ts"} — done', { path: 'src/a.ts' }],                // narrated
 		['{"path":"src/a.ts", "content":"x', { path: 'src/a.ts', content: 'x' }],         // cut off mid-string
 		['{"path":"src/a.ts", "edits":[{"oldText":"a","newText":"b"}', { path: 'src/a.ts', edits: [{ oldText: 'a', newText: 'b' }] }],
+		// Raw line breaks/tabs inside a string — a write_file whose content was not escaped.
+		['{"path":"a.py","content":"def f():\n\treturn 1\n"}', { path: 'a.py', content: 'def f():\n\treturn 1\n' }],
+		// A Python dict: single quotes, with an apostrophe inside a double-quoted value left alone.
+		["{'path': 'src/a.ts', 'recursive': True, 'note': \"don't\"}", { path: 'src/a.ts', recursive: true, note: "don't" }],
+		["{'content': 'it\\'s \"quoted\"'}", { content: 'it\'s "quoted"' }],
 	];
 	assert.deepStrictEqual(cases.map(([raw]) => parseToolArgs(raw)), cases.map(([, want]) => want));
 }

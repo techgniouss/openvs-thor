@@ -56,6 +56,24 @@ const doc = (text, extra = {}) => ({
 	assert.ok(!w.prefix.includes('import'), 'the prefix window has slid past the imports');
 }
 
+// Preamble before the imports is stepped over and a multi-line import is followed to its close.
+// Stopping at the first non-import line returned nothing for any file opening with a license
+// header — every file in this repository — and cut `import {` at its first name.
+{
+	const importsOf = text => m.buildWindow(doc(text), text.length, { prefixChars: 10, suffixChars: 10, importChars: 500 }).imports;
+	assert.deepStrictEqual([
+		importsOf('/*---\n * Copyright\n *---*/\n\n\'use strict\';\nimport {\n\ta,\n\tb,\n} from \'x\';\nimport c from \'c\';\n\nfoo();\nimport late from \'no\';'),
+		importsOf('#!/usr/bin/env python\n"""Module doc.\n\nMore."""\n# comment\nfrom a import (\n    b,\n)\nimport os\n\ndef f(): pass'),
+		importsOf('package main\n\nimport (\n\t"fmt"\n\t"os"\n)\n\nfunc main() {}'),
+		importsOf('#pragma once\n#include <vector>\nint x;'),
+	], [
+		'import {\n\ta,\n\tb,\n} from \'x\';\nimport c from \'c\';',
+		'from a import (\n    b,\n)\nimport os',
+		'package main\nimport (\n\t"fmt"\n\t"os"\n)',
+		'#include <vector>',
+	]);
+}
+
 // A file with no import block yields an empty string, not undefined.
 assert.strictEqual(m.buildWindow(doc('const a = 1;'), 12, limits).imports, '');
 

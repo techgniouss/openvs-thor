@@ -313,4 +313,35 @@ assert.strictEqual(m.normalizeFinishReason(undefined), undefined);
 	}), err => m.isAbortError(err));
 }
 
+// Stop reaches a stream paused mid-reply: the read ends at once and the connection is
+// cancelled, so the provider stops generating. It used to wait for the next chunk (or the
+// idle timeout), and the provider went on generating into a connection nobody read.
+{
+	let cancelled = false;
+	const body = new ReadableStream({
+		start(controller) { controller.enqueue(new TextEncoder().encode('data: {"a":1}' + String.fromCharCode(10))); },
+		cancel() { cancelled = true; },
+	});
+	const controller = new AbortController();
+	const started = Date.now();
+	setTimeout(() => controller.abort(), 100);
+	await assert.rejects(
+		m.readSSE(new Response(body), () => { }, controller.signal, { idleMs: 60_000 }),
+		err => err.name === 'AbortError',
+	);
+	assert.ok(Date.now() - started < 5_000, 'promptly, not at the idle timeout');
+	assert.strictEqual(cancelled, true, 'the connection is closed');
+}
+
+// A caller that throws mid-stream (a provider's in-band error event) also closes it.
+{
+	let cancelled = false;
+	const body = new ReadableStream({
+		start(controller) { controller.enqueue(new TextEncoder().encode('data: {"error":"x"}' + String.fromCharCode(10))); },
+		cancel() { cancelled = true; },
+	});
+	await assert.rejects(m.readSSE(new Response(body), () => { throw new Error('in-band error'); }, new AbortController().signal, { idleMs: 60_000 }), /in-band error/);
+	assert.strictEqual(cancelled, true);
+}
+
 console.log('test-sse: all assertions passed');

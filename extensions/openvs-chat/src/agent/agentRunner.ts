@@ -4,16 +4,17 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { McpToolset } from '../mcp/manager';
-import { SUBAGENT_PREAMBLE } from '../persona/prompts';
+import { SUBAGENT_PREAMBLE, SUBAGENT_WRITE_RULES } from '../persona/prompts';
 import { stripThinking, stripThinkingTags } from '../persona/thinking';
 import { TodoItem, UPDATE_TODOS_TOOL, parseTodoUpdate } from '../persona/todos';
+import { isKeyFailure } from '../providers/resilience';
 import { extractTextToolCalls } from '../providers/toolCalls';
 import { AgentStep, CONTINUE_PROMPT, ChatProvider, ChatMessage, ToolCall, ToolSpec, endsInRepeatLoop, isAbortError, isTransientProviderError } from '../providers/types';
 import { budgetsForCeiling } from './contextWindow';
 import { CACHED_COMPACT_TRIGGER, COMPACT_TRIGGER, SUMMARY_MAX_TOKENS, canCompact, compactMessages, compactionThreshold, shouldCompact } from './compaction';
-import { elidedToolCallIds, estimateMessagesTokens, estimateToolsTokens, isContextLengthError, parseTokenLimit, pruneToolOutput, trimMessages } from './context';
+import { capToolOutput, compactToolSpecs, elidedToolCallIds, estimateMessagesTokens, estimateTokens, estimateToolsTokens, isContextLengthError, needsCompactPrompt, parseTokenLimit, pruneToolOutput, trimMessages, withSystemPrompt } from './context';
 import { Guardrails, autoApproves, loadGuardrails, resolveWorkspacePath } from './guardrails';
-import { AGENT_TOOLS, ASK_USER_TOOL, AskOption, MAX_ASK_OPTIONS, READ_ONLY_TOOL_NAMES, SPAWN_SUBAGENT_TOOL, ToolApprover, ToolLimits, VerifyCommand, asBoolean, asString, commandTextOf, detectVerificationCommands, executeTool, isVerificationCommand } from './tools';
+import { AGENT_TOOLS, ASK_USER_TOOL, AskOption, LIST_AGENT_SESSIONS_TOOL, MAX_ASK_OPTIONS, READ_ONLY_TOOL_NAMES, SEND_AGENT_MESSAGE_TOOL, SPAWN_SUBAGENT_TOOL, ToolApprover, ToolLimits, VerifyCommand, asBoolean, asString, commandTextOf, detectVerificationCommands, executeTool, isVerificationCommand } from './tools';
 
 const MCP_PREFIX = 'mcp__';
 
@@ -28,6 +29,13 @@ export interface RunResult {
 	readonly reason: StopReason;
 	/** Human-readable explanation shown to the user for non-`done` outcomes. */
 	readonly detail?: string;
+	/**
+	 * The provider error that ended the run, when that is why it ended. The run reports a
+	 * failure as a result rather than throwing (so what it did stays on screen), which left a
+	 * caller that could route around it — Auto's implementer falling back to its next
+	 * candidate — nothing to decide on: its fallback sat in a `catch` that never ran.
+	 */
+	readonly failure?: Error;
 }
 
 /**
@@ -93,6 +101,12 @@ const MIN_STATED_CONTEXT_TOKENS = 1_000;
  */
 const MAX_TOOL_SCHEMA_SHARE = 0.5;
 
+/** Tools that already size their own output to `ToolLimits.maxReadChars`. */
+const SELF_PAGING_TOOLS = ['read_file', 'fetch_url'];
+
+/** MCP tools named in the system prompt's hint; the schemas carry the rest. */
+const MCP_HINT_NAMES = 20;
+
 /**
  * Share of the conversation budget one `read_file` result may occupy, and the characters-
  * per-token ratio used to convert one into the other — the same 4:1 the estimator uses.
@@ -144,6 +158,14 @@ const TUNING_HINT_TOKENS = 25_000;
  * rounds don't consume the step budget — no work was done, so none was spent.
  */
 const MAX_STEP_RETRIES = 3;
+
+/**
+ * How many times one step will rotate to a different stored API key on a 401/403/429
+ * before giving up on rotation and falling through to the ordinary transient-retry (or
+ * failure) path. Small and separate from {@link MAX_STEP_RETRIES}: without a cap, two
+ * dead keys would rotate back and forth between each other forever on every retry.
+ */
+const MAX_KEY_ROTATION_ATTEMPTS = 3;
 
 /** Backoff before re-asking a step, by retry index. Short: the transport already backed off. */
 const STEP_RETRY_DELAYS_MS = [1_000, 3_000, 8_000];
@@ -262,10 +284,16 @@ export interface AgentCallbacks {
 	onToken(delta: string): void;
 	/** The current step finished producing text (authoritative full content). */
 	onStepEnd(content: string): void;
-	/** A tool call is about to run. */
-	onToolStart(call: ToolCall): void;
-	/** A tool call finished. */
-	onToolEnd(call: ToolCall, result: string, isError: boolean): void;
+	/**
+	 * A tool call is about to run. `parentCallId`, when set, is the `id` of the
+	 * `spawn_subagent` call this one is running nested under — a delegate's own tool
+	 * activity, forwarded live from `runSubagent` so the UI can nest it under that call's
+	 * card instead of it appearing as an unrelated top-level event. Unset for every
+	 * top-level call, including `spawn_subagent` itself.
+	 */
+	onToolStart(call: ToolCall, parentCallId?: string): void;
+	/** A tool call finished. `parentCallId` mirrors {@link onToolStart}'s. */
+	onToolEnd(call: ToolCall, result: string, isError: boolean, parentCallId?: string): void;
 	/** An out-of-band note (e.g. reaching the step limit). */
 	onNote(text: string): void;
 	/** The agent replaced its visible task checklist (top-level agent only). */
@@ -285,7 +313,49 @@ interface SubagentBudget {
 	spawned: number;
 }
 
-interface AgentOptions {
+/** One other open chat tab, as offered to the model by `list_agent_sessions`. */
+export interface AgentSessionInfo {
+	readonly id: string;
+	readonly title: string;
+	/** Whether that tab currently has a run in flight. */
+	readonly running: boolean;
+}
+
+/**
+ * The outcome of a `send_agent_message` delivery, as reported by {@link AgentA2A.sendMessage}.
+ * `'live'` means the target has an in-flight steerable run and will see the message on its
+ * next loop step; `'queued'` means the target is idle and the message was appended to its
+ * conversation for the next time it runs — never claimed as `'live'`, since nothing is
+ * watching it yet. `ok: false` covers a target that no longer exists (raced with
+ * `list_agent_sessions`) or any other delivery failure. Discriminated on `ok` (not an
+ * ad hoc `'error' in outcome` check) per this repo's `local/code-no-in-operator` rule.
+ */
+export type AgentMessageDelivery =
+	| { readonly ok: true; readonly delivered: 'live' | 'queued' }
+	| { readonly ok: false; readonly error: string };
+
+/**
+ * Agent-to-agent (A2A) messaging capability, injected into a TOP-LEVEL session's
+ * `AgentRunner` only — see {@link AgentOptions.a2a}. `AgentRunner` has no knowledge of
+ * sibling sessions itself (only `chatViewProvider.ts`'s session map does), so this is a
+ * narrow interface passed in, the same inversion `AgentOptions.onKeyFailure` already uses
+ * for key rotation: the agent loop stays decoupled from `ChatViewProvider`.
+ */
+export interface AgentA2A {
+	/** This run's own session id, so a self-targeted send is refused without a round trip. */
+	readonly selfId: string;
+	/** The other open top-level chat sessions — excludes {@link selfId}. */
+	listSessions(): AgentSessionInfo[];
+	/**
+	 * Delivers `message` to `targetSessionId`. The caller ({@link AgentRunner.sendAgentMessage})
+	 * has already checked `targetSessionId !== selfId` and that it appears in
+	 * {@link listSessions}, so this only needs to re-check existence defensively (the target
+	 * tab may have closed between those two calls) and perform the actual delivery.
+	 */
+	sendMessage(targetSessionId: string, message: string, expectsReply: boolean): Promise<AgentMessageDelivery>;
+}
+
+export interface AgentOptions {
 	guardrails?: Guardrails;
 	/** Nesting depth (0 = the top-level agent). */
 	depth?: number;
@@ -348,6 +418,46 @@ interface AgentOptions {
 	traceTiming?: boolean;
 	/** Reads the clock. Injectable so the wall-clock ceiling is testable without sleeping. */
 	now?: () => number;
+	/**
+	 * Called when a step fails with a 401/403/429 — a failure a *different* stored API key
+	 * has a real chance of surviving, unlike a 5xx or a network error. Returning a new key
+	 * string retries the same step with it (mutating `params.apiKey` in place, so every
+	 * later step in this run also uses it); returning `undefined` means no spare key exists,
+	 * and the failure falls through to the ordinary transient-retry/failure path below.
+	 * Kept as an injectable hook rather than a direct `ProviderRegistry` dependency so the
+	 * agent loop stays decoupled from key storage — the host wires this to
+	 * `withProviderResilience`'s rotation logic.
+	 */
+	onKeyFailure?: (message: string) => Promise<string | undefined>;
+	/**
+	 * Called after any step succeeds. The host uses this to clear a quota cooldown recorded
+	 * by an earlier failed step in the same run — the (provider, model) pair isn't actually
+	 * out of capacity once a step against it succeeds, whichever key made that happen.
+	 */
+	onStepSuccess?: () => void;
+	/**
+	 * Agent-to-agent messaging (`list_agent_sessions`/`send_agent_message`). Offered as tools
+	 * only when this is set AND {@link depth} is 0 — i.e. only for a top-level, user-initiated
+	 * session's own run. `runSubagent` below deliberately does NOT forward this to the child
+	 * options it builds, so a `spawn_subagent` delegate can never see or call either tool,
+	 * however deep the nesting: that bounds the whole feature's blast radius to the tabs a
+	 * user actually opened, with no delegate-spawns-delegate path to a cross-tab message.
+	 */
+	a2a?: AgentA2A;
+	/**
+	 * The condensed system prompt to send instead of the seed's own once the full one, with
+	 * the tool schemas, no longer leaves the conversation room inside the request budget (see
+	 * `needsCompactPrompt`). The tool schemas are condensed at the same moment. Absent, the
+	 * run always sends the seed's prompt and the full schemas, as before.
+	 */
+	compactSystemPrompt?: string;
+	/**
+	 * Reports the switch to {@link compactSystemPrompt}. The host throttles it, since a
+	 * small-budget model makes the same switch on every run. Absent, the run notes it itself.
+	 */
+	onCompactPrompt?: (notice: string) => void;
+	/** Send {@link compactSystemPrompt} and the condensed schemas from the first request, whatever the budget. */
+	forceCompactPrompt?: boolean;
 }
 
 /**
@@ -380,6 +490,12 @@ export class AgentRunner {
 	private readonly now: () => number;
 	/** When this run started, so the wall-clock ceiling and the closing summary agree on elapsed. */
 	private startedAt = 0;
+	/**
+	 * The run's abort signal, handed to every tool call so Stop ends a running command or
+	 * fetch at once. The loop itself only checks between steps, so without this a hung
+	 * `npm test` held a stopped run until the command timeout killed it.
+	 */
+	private runSignal?: AbortSignal;
 	/** Largest prompt this run sent, in estimated tokens — the number that explains a slow run. */
 	private peakPromptTokens = 0;
 	/** Estimated tokens in the most recently sent prompt, for the per-step timing trace. */
@@ -441,6 +557,26 @@ export class AgentRunner {
 	private appliedCeiling?: number;
 	/** Set once the MCP tool schemas were found not to fit the budget; they are then omitted. */
 	private mcpSchemasDropped = false;
+	/** See {@link AgentOptions.onKeyFailure}. */
+	private readonly onKeyFailure?: (message: string) => Promise<string | undefined>;
+	/** See {@link AgentOptions.onStepSuccess}. */
+	private readonly onStepSuccess?: () => void;
+	/** See {@link AgentOptions.a2a}. Only ever set when {@link depth} is 0 — see that doc. */
+	private readonly a2a?: AgentA2A;
+	/** `send_agent_message` calls this run has made so far, capped at {@link Guardrails.maxAgentMessages}. */
+	private agentMessagesSent = 0;
+	/**
+	 * Tool-call ids already used in this run's conversation. Backends that omit ids get
+	 * `call_<index>` synthesized per step, and prose-recovered calls `text_call_<index>`, so
+	 * every step reused the same few; see {@link withUniqueCallIds}.
+	 */
+	private readonly usedCallIds = new Set<string>();
+	/** See {@link AgentOptions.compactSystemPrompt}. */
+	private readonly compactSystem?: string;
+	/** See {@link AgentOptions.onCompactPrompt}. */
+	private readonly onCompactPrompt?: (notice: string) => void;
+	/** Set once the full prompt was found not to fit; one-way, like {@link mcpSchemasDropped}. */
+	private compactPrompt = false;
 
 	constructor(
 		private readonly provider: ChatProvider,
@@ -457,7 +593,10 @@ export class AgentRunner {
 		this.steering = opts?.steering;
 		this.contextBudget = opts?.maxContextTokens ?? DEFAULT_CONTEXT_TOKENS;
 		this.outputCap = opts?.maxOutputTokens;
-		if (this.outputCap) {
+		// A budget handed in below the normal floor was derived from a real limit — a stated
+		// allowance, or a window too small for the default (see `requestBudgets`). Keeping the
+		// normal floor there made the blind halving retry *raise* the budget over that limit.
+		if (this.outputCap || (this.contextBudget > 0 && this.contextBudget < MIN_CONTEXT_TOKENS)) {
 			// The inherited budget was derived from a stated ceiling; the normal floor would
 			// silently raise it back over that ceiling before the first request.
 			this.contextFloor = MIN_STATED_CONTEXT_TOKENS;
@@ -469,6 +608,13 @@ export class AgentRunner {
 		this.maxRunMs = opts?.maxRunMs ?? DEFAULT_MAX_RUN_MS;
 		this.traceTiming = opts?.traceTiming ?? false;
 		this.now = opts?.now ?? Date.now;
+		this.onKeyFailure = opts?.onKeyFailure;
+		this.onStepSuccess = opts?.onStepSuccess;
+		this.a2a = opts?.a2a;
+		this.compactSystem = opts?.compactSystemPrompt;
+		this.onCompactPrompt = opts?.onCompactPrompt;
+		// The user chose it, so there is nothing to announce.
+		this.compactPrompt = !!opts?.forceCompactPrompt && this.compactSystem !== undefined;
 	}
 
 	/**
@@ -483,8 +629,14 @@ export class AgentRunner {
 		this.answeredReads.clear();
 	}
 
-	/** The tools offered this run: read-only set for research sub-agents; otherwise the full set, plus delegation and any MCP tools. */
+	/** The tool schemas sent with each request: {@link toolSet}, condensed once the compact prompt is in use. */
 	private tools(): ToolSpec[] {
+		const tools = this.toolSet();
+		return this.compactPrompt ? compactToolSpecs(tools) : tools;
+	}
+
+	/** The tools offered this run: read-only set for research sub-agents; otherwise the full set, plus delegation and any MCP tools. */
+	private toolSet(): ToolSpec[] {
 		if (this.readOnly) {
 			const readTools = AGENT_TOOLS.filter(t => READ_ONLY_TOOL_NAMES.includes(t.name));
 			// The top-level read-only loop is Ask/Plan, where the user is present and a
@@ -495,6 +647,13 @@ export class AgentRunner {
 		const base = [...AGENT_TOOLS];
 		if (this.depth === 0) {
 			base.push(UPDATE_TODOS_TOOL, ASK_USER_TOOL);
+			// Belt-and-suspenders on top of `runSubagent` simply never forwarding `a2a` to a
+			// child's options: a delegate can never reach depth 0, so this alone would already
+			// exclude it, but checking depth explicitly here matches how ASK_USER_TOOL above
+			// is scoped and keeps the two guards from being able to drift apart.
+			if (this.a2a) {
+				base.push(LIST_AGENT_SESSIONS_TOOL, SEND_AGENT_MESSAGE_TOOL);
+			}
 		}
 		if (this.depth < this.guardrails.maxSubagentDepth && this.budget.spawned < this.guardrails.maxSubagents) {
 			base.push(SPAWN_SUBAGENT_TOOL);
@@ -510,6 +669,7 @@ export class AgentRunner {
 			throw new Error(`${this.provider.info.label} does not support Agent mode.`);
 		}
 		this.startedAt = this.now();
+		this.runSignal = params.signal;
 		try {
 			return await this.loop(seed, params, callbacks);
 		} finally {
@@ -551,9 +711,15 @@ export class AgentRunner {
 
 	private async loop(seed: ChatMessage[], params: AgentParams, callbacks: AgentCallbacks): Promise<RunResult> {
 		const messages: ChatMessage[] = [...seed];
+		for (const m of seed) {
+			for (const call of m.toolCalls ?? []) {
+				this.usedCallIds.add(call.id);
+			}
+		}
 		let truncationRounds = 0;
 		let emptyRounds = 0;
 		let stepRetries = 0;
+		let keyRotationAttempts = 0;
 		// Text carried across a max-token cutoff, plus how many provisional turns hold it in
 		// `messages`. The pieces are rejoined before the next step is judged, so a response
 		// the limit cut in half is read as the one answer the model meant to write.
@@ -615,7 +781,7 @@ export class AgentRunner {
 				// pruning already keeps requests small, compacting as well buys nothing and
 				// costs a summarizer round trip — which is itself a model call, so the saving
 				// would be handed straight back.
-				&& shouldCompact(this.pruned(messages), this.contextWindow, this.contextBudget, this.compactTrigger, this.toolOverhead())
+				&& shouldCompact(this.pruned(this.outgoing(messages)), this.contextWindow, this.contextBudget, this.compactTrigger, this.toolOverhead())
 				&& canCompact(messages, this.keepHead)) {
 				const compacted = await this.compact(messages, params);
 				if (compacted) {
@@ -635,7 +801,7 @@ export class AgentRunner {
 					if (estimateMessagesTokens(head) >= compactionThreshold(this.contextWindow, this.contextBudget, this.compactTrigger)) {
 						this.compactionExhausted = true;
 						callbacks.onNote('The conversation is still near the context limit after compacting — older tool output will be trimmed from here on.');
-					} else if (shouldCompact(this.pruned(messages), this.contextWindow, this.contextBudget, this.compactTrigger, this.toolOverhead())) {
+					} else if (shouldCompact(this.pruned(this.outgoing(messages)), this.contextWindow, this.contextBudget, this.compactTrigger, this.toolOverhead())) {
 						// Compacted, and STILL over the threshold. Once is the transient case the
 						// head check above deliberately tolerates — bulky recent turns roll into the
 						// compactable middle a step or two later, and compacting them does pay.
@@ -675,6 +841,23 @@ export class AgentRunner {
 				// streaming a step that will never arrive. Empty content discards whatever the
 				// failed attempt streamed — the retry re-streams it from the start.
 				callbacks.onStepEnd('');
+
+				// A 401/403/429 is not "transient" under isTransientProviderError below (a bad
+				// key never recovers on its own) — but a DIFFERENT stored key might work right
+				// now, and skipping this would kill the whole run on the first quota hit even
+				// when the user configured a backup key for exactly this. Tried before the
+				// generic transient-retry check, and outside stepRetries' budget: rotating to a
+				// working key is progress, not a flaky-provider retry.
+				if (isKeyFailure(message) && this.onKeyFailure && keyRotationAttempts < MAX_KEY_ROTATION_ATTEMPTS) {
+					const nextKey = await this.onKeyFailure(message);
+					if (nextKey !== undefined) {
+						params.apiKey = nextKey;
+						keyRotationAttempts++;
+						callbacks.onNote(`${message} — retrying with a different stored API key…`);
+						continue;
+					}
+				}
+
 				if (!isTransientProviderError(message) || stepRetries >= MAX_STEP_RETRIES) {
 					// Ending with a result rather than throwing keeps everything the run
 					// accomplished on screen and says plainly why it stopped.
@@ -683,6 +866,7 @@ export class AgentRunner {
 						detail: stepRetries
 							? `The provider kept failing after ${stepRetries} retries, so the run stopped with the task unfinished: ${message}`
 							: `The run stopped because the provider failed: ${message}`,
+						failure: err instanceof Error ? err : new Error(message),
 					};
 				}
 				const delayMs = this.retryDelaysMs[Math.min(stepRetries, this.retryDelaysMs.length - 1)];
@@ -693,6 +877,8 @@ export class AgentRunner {
 			}
 			// The step arrived, so earlier failures were a blip rather than a broken provider.
 			stepRetries = 0;
+			keyRotationAttempts = 0;
+			this.onStepSuccess?.();
 			if (this.traceTiming) {
 				const secs = ((this.now() - startedStep) / 1_000).toFixed(1);
 				callbacks.onNote(`step ${step + 1}: ${secs}s · ~${Math.round(this.lastPromptTokens / 1_000)}k prompt tokens · ${raw.toolCalls.length} tool call(s)`);
@@ -767,7 +953,7 @@ export class AgentRunner {
 			// the empty counter on every round and loop forever.
 			const productive = !!result.content.trim() || result.toolCalls.length > 0;
 			if (productive) {
-				messages.push({ role: 'assistant', content: result.content, toolCalls: result.toolCalls });
+				messages.push({ role: 'assistant', content: result.content, toolCalls: result.toolCalls, thinkingBlocks: result.thinkingBlocks });
 				// The turn arrived, so any earlier empty replies were a transient blip.
 				emptyRounds = 0;
 			}
@@ -792,7 +978,7 @@ export class AgentRunner {
 								// tables are name patterns, so a model can pass them and still be unable to run
 								// Agent mode. Worth naming — "provider hiccup" sends the user back to retry a
 								// model that will fail identically every time.
-								+ (result.finishReason === 'stop' && this.tools().length
+								+ (result.finishReason === 'stop' && this.toolSet().length
 									? 'It ended every turn cleanly with nothing to say, which usually means it cannot call tools — pick a model marked with a wrench in the model list, or use Ask mode.'
 									: 'This is usually a provider hiccup — send "continue" to resume, or switch models.'),
 						};
@@ -1010,6 +1196,95 @@ export class AgentRunner {
 			: { result: `The user dismissed the question without answering. Proceed with the most reasonable option and say which you chose.${dropped}`, isError: false };
 	}
 
+	/** Lists the other open chat tabs for `list_agent_sessions`. See {@link AgentA2A.listSessions}. */
+	private listAgentSessions(): { result: string; isError: boolean } {
+		// `this.depth !== 0` is unreachable today — `runSubagent` below never forwards `a2a`
+		// to a child's options, so a delegate's `this.a2a` is always undefined — but checked
+		// explicitly anyway so this stays refused even if a future change to `runSubagent`
+		// accidentally started passing it through. Requirement: only a top-level,
+		// user-initiated session may use either A2A tool.
+		if (!this.a2a || this.depth !== 0) {
+			return { result: 'Agent-to-agent messaging is not available in this run.', isError: true };
+		}
+		const sessions = this.a2a.listSessions();
+		if (!sessions.length) {
+			return { result: 'No other chat tabs are open right now.', isError: false };
+		}
+		const lines = sessions.map(s => `- id "${s.id}": "${s.title}" (${s.running ? 'running' : 'idle'})`);
+		return { result: `Other open chat tabs:\n${lines.join('\n')}`, isError: false };
+	}
+
+	/**
+	 * Sends one `send_agent_message` call: validates the arguments, enforces the per-run
+	 * cap and the approval gate (same machinery as `callMcp` above — see this tool's own
+	 * doc), then hands off to {@link AgentA2A.sendMessage} for the actual delivery.
+	 */
+	private async sendAgentMessage(call: ToolCall): Promise<{ result: string; isError: boolean }> {
+		// See the matching check in `listAgentSessions` above for why `depth !== 0` is
+		// checked explicitly rather than relied on implicitly via `a2a` being unset.
+		if (!this.a2a || this.depth !== 0) {
+			return { result: 'Agent-to-agent messaging is not available in this run.', isError: true };
+		}
+		const targetSessionId = asString(call.args.targetSessionId).trim();
+		const message = asString(call.args.message).trim();
+		if (!targetSessionId) {
+			return { result: 'send_agent_message requires a non-empty "targetSessionId" — call list_agent_sessions to find one.', isError: true };
+		}
+		if (!message) {
+			return { result: 'send_agent_message requires a non-empty "message".', isError: true };
+		}
+		if (targetSessionId === this.a2a.selfId) {
+			return { result: 'A session cannot send a message to itself.', isError: true };
+		}
+		const target = this.a2a.listSessions().find(s => s.id === targetSessionId);
+		if (!target) {
+			return { result: `No open chat tab with session id "${targetSessionId}". Call list_agent_sessions to see what's open right now.`, isError: true };
+		}
+		if (this.agentMessagesSent >= this.guardrails.maxAgentMessages) {
+			return {
+				result: `You have already sent ${this.agentMessagesSent} agent-to-agent message(s) this run (limit ${this.guardrails.maxAgentMessages}). `
+					+ 'Stop sending further cross-tab messages — continue the task another way.',
+				isError: true,
+			};
+		}
+		// Same hard approval gate every other side-effecting tool goes through
+		// (`runOneTool`'s MCP-call branch, `callMcp` above): a model choosing to inject text
+		// into another running agent is a real side effect, and this must be no easier to
+		// talk around than `run_command`/`fetch_url` — respecting whatever policy the user
+		// has set (default `yolo`, same as everything else; nothing here is a separate rung).
+		if (!autoApproves(this.guardrails)) {
+			const { approved, feedback } = await this.approver.confirm({
+				kind: 'agent_message',
+				signature: `send_agent_message:${targetSessionId}`,
+				title: `Send a message to "${target.title}"?`,
+				detail: `Sends text to another open chat tab's agent (session "${targetSessionId}"), which will read and act on it.`,
+				preview: message,
+				previewLanguage: 'text',
+			});
+			if (!approved) {
+				const reason = feedback?.trim();
+				return {
+					result: reason
+						? `The user denied sending this agent-to-agent message and said: "${reason}".`
+						: 'The user denied sending this agent-to-agent message. Try a different approach rather than repeating it.',
+					isError: true,
+				};
+			}
+		}
+		const expectsReply = asBoolean(call.args.expectsReply);
+		const outcome = await this.a2a.sendMessage(targetSessionId, message, expectsReply);
+		if (!outcome.ok) {
+			return { result: outcome.error, isError: true };
+		}
+		this.agentMessagesSent++;
+		return {
+			result: outcome.delivered === 'live'
+				? `Delivered live to "${target.title}" (session "${targetSessionId}") — it will see this on its next step.`
+				: `"${target.title}" (session "${targetSessionId}") is idle right now, so the message was queued into its conversation for the next time it runs — it has NOT seen it yet.`,
+			isError: false,
+		};
+	}
+
 	/**
 	 * Asks the model for one step, keeping the conversation inside the context budget.
 	 * If the provider still rejects it as too big, the budget is cut and the step is
@@ -1042,14 +1317,16 @@ export class AgentRunner {
 		// second request onward the ceiling is known rather than guessed. Applied here, before
 		// the request is built, so a run that started inside the allowance never grows out of
 		// it and earns the rejection the previous phase could only recover from.
-		const stated = this.provider.rateLimit?.(params.model)?.limitTokens;
+		const stated = this.provider.rateLimit?.(params.model)?.requestCeiling;
 		if (stated && this.adoptRequestCeiling(stated, params.maxTokens)) {
 			callbacks.onNote(`${this.provider.info.label} allows ~${stated} tokens per request on this model — sizing each step to fit, replies capped at ${this.outputCap}.`);
 		}
 		// After the ceiling, since that is what can make a tool set that fitted stop fitting.
+		// The prompt check comes last: it is judged against whatever tool set survived.
 		this.enforceToolBudget(callbacks);
+		this.enforcePromptBudget(messages, callbacks);
 		try {
-			return this.recoverTextToolCalls(await ask(this.contextBudget));
+			return this.withUniqueCallIds(this.recoverTextToolCalls(await ask(this.contextBudget)));
 		} catch (err) {
 			if (!(err instanceof Error) || !isContextLengthError(err.message)) {
 				throw err;
@@ -1066,7 +1343,10 @@ export class AgentRunner {
 				this.contextBudget = Math.max(this.contextFloor, Math.floor(this.contextBudget / 2));
 				callbacks.onNote(`The conversation outgrew the model's context window — trimming older tool output and retrying.`);
 			}
-			return this.recoverTextToolCalls(await ask(this.contextBudget));
+			// The smaller budget may no longer carry the full prompt, and trimming cannot
+			// shrink it — without this the retry resends the same fixed part and fails alike.
+			this.enforcePromptBudget(messages, callbacks);
+			return this.withUniqueCallIds(this.recoverTextToolCalls(await ask(this.contextBudget)));
 		}
 	}
 
@@ -1118,7 +1398,7 @@ export class AgentRunner {
 		const conversationBudget = Math.max(this.contextFloor, budget - this.toolOverhead());
 		// Measured after both passes, so the figure is what the provider was actually asked
 		// to read rather than what the run is holding.
-		const sent = this.measured(trimMessages(this.pruned(messages), conversationBudget));
+		const sent = this.measured(trimMessages(this.pruned(this.outgoing(messages)), conversationBudget));
 		this.forgetElidedReads(messages, sent);
 		return sent;
 	}
@@ -1143,6 +1423,99 @@ export class AgentRunner {
 			// Only a wholesale replacement kills an earlier read. See `pruneToolOutput`.
 			wholeFileWriteTool: 'write_file',
 		});
+	}
+
+	/**
+	 * `step` with every tool-call id unique across the run.
+	 *
+	 * An id pairs an assistant's call with its result, and everything that edits the
+	 * conversation keys on it: dropping orphaned results, eliding old output, un-remembering
+	 * elided reads. With `call_0` in every step those matched the wrong turns — a result
+	 * kept for a call that was trimmed away, a fresh read forgotten because an old one with the
+	 * same id was elided — and strict backends reject a conversation that repeats an id.
+	 * Renamed here, before the step is recorded, so the call and its result agree.
+	 */
+	private withUniqueCallIds(step: AgentStep): AgentStep {
+		if (!step.toolCalls.length) {
+			return step;
+		}
+		let changed = false;
+		const toolCalls = step.toolCalls.map(call => {
+			const base = call.id || 'call';
+			let id = base;
+			for (let n = 1; this.usedCallIds.has(id); n++) {
+				id = `${base}_${n}`;
+			}
+			this.usedCallIds.add(id);
+			if (id === call.id) {
+				return call;
+			}
+			changed = true;
+			return { ...call, id };
+		});
+		return changed ? { ...step, toolCalls } : step;
+	}
+
+	/** `messages` with the compact system prompt in place once the run has switched to it. */
+	private fitted(messages: ChatMessage[]): ChatMessage[] {
+		return this.compactPrompt && this.compactSystem !== undefined ? withSystemPrompt(messages, this.compactSystem) : messages;
+	}
+
+	/**
+	 * `messages` exactly as a step sends them: {@link fitted}, plus a line naming the MCP tools
+	 * while their schemas are actually offered.
+	 *
+	 * The line used to be written into the seed's system prompt by the host, so it survived
+	 * {@link enforceToolBudget} dropping the schemas it described: the model was told to prefer
+	 * tools it could no longer call, and called them. Deriving it per request from the same
+	 * state {@link toolSet} reads keeps the two from disagreeing, and gives it to Auto's
+	 * implementer and to sub-agents, which never had it. Never written into the run's messages,
+	 * so compaction cannot bake a stale copy in.
+	 */
+	private outgoing(messages: ChatMessage[]): ChatMessage[] {
+		const sent = this.fitted(messages);
+		const mcpTools = this.readOnly || !this.mcp || this.mcpSchemasDropped ? [] : this.mcp.tools();
+		if (!mcpTools.length || sent[0]?.role !== 'system') {
+			return sent;
+		}
+		const names = mcpTools.slice(0, MCP_HINT_NAMES).map(t => t.name).join(', ');
+		const more = mcpTools.length > MCP_HINT_NAMES ? ', …' : '';
+		return withSystemPrompt(sent, `${sent[0].content}\n\nYou also have ${mcpTools.length} MCP tools (names start with "mcp__"): ${names}${more}. Prefer them when they fit better than the generic file/command tools.`);
+	}
+
+	/**
+	 * Switches the run to the compact prompt once the full one no longer fits.
+	 *
+	 * The system prompt and the tool schemas ride on every request and are the one part no
+	 * trimming pass can shrink. On a backend with a small per-request allowance (Groq's 8k
+	 * free tier, an 8k-window local model) the full pair — doctrine, project rules, active
+	 * skills, ~2k tokens of schemas — can take most or all of the budget, so every request is
+	 * either refused or leaves too little room for a single file read to survive trimming.
+	 * Condensing both is the one lever left that keeps the run working.
+	 *
+	 * Judged against the current budget, which only ever shrinks, so the switch is one-way
+	 * and never flips back and forth between steps.
+	 */
+	private enforcePromptBudget(messages: ChatMessage[], callbacks: AgentCallbacks): void {
+		if (this.compactPrompt || this.compactSystem === undefined || messages[0]?.role !== 'system') {
+			return;
+		}
+		const systemTokens = estimateTokens(messages[0].content);
+		const fixed = systemTokens + this.toolOverhead();
+		if (!needsCompactPrompt(systemTokens, this.toolOverhead(), this.contextBudget)) {
+			return;
+		}
+		this.compactPrompt = true;
+		// The memoized figure counted the full schemas.
+		this.toolTokens = undefined;
+		const after = estimateTokens(this.compactSystem) + this.toolOverhead();
+		const notice = `This model's request budget (~${round1k(this.contextBudget)}k tokens) is too small for the full instructions and tool definitions (~${round1k(fixed)}k) to leave room for the work, `
+			+ `so this run uses the compact prompt (~${round1k(after)}k): condensed instructions and tool descriptions, project rules shortened, active skills left out.`;
+		if (this.onCompactPrompt) {
+			this.onCompactPrompt(notice);
+		} else {
+			callbacks.onNote(notice);
+		}
 	}
 
 	/**
@@ -1218,6 +1591,19 @@ export class AgentRunner {
 	}
 
 	/**
+	 * A tool outcome with its text cut to what this run's budget can carry. See `capToolOutput`.
+	 * `read_file` and `fetch_url` are left alone: they already page to the same limit and end
+	 * with a note naming the exact range shown, which a cut through the middle would falsify.
+	 */
+	private fitOutput(call: ToolCall, outcome: { result: string; isError: boolean }): { result: string; isError: boolean } {
+		if (SELF_PAGING_TOOLS.includes(call.name)) {
+			return outcome;
+		}
+		const max = this.toolLimits().maxReadChars ?? 0;
+		return { result: capToolOutput(outcome.result, max), isError: outcome.isError };
+	}
+
+	/**
 	 * Estimated tokens the tool schemas add to every request of this run.
 	 *
 	 * Memoized: the set is fixed by depth, read-only-ness and the connected MCP servers,
@@ -1256,7 +1642,7 @@ export class AgentRunner {
 		if (step.toolCalls.length || !step.content.trim()) {
 			return step;
 		}
-		const known = new Set(this.tools().map(t => t.name));
+		const known = new Set(this.toolSet().map(t => t.name));
 		// The raw content, not the thinking-stripped version: whatever is left becomes the
 		// visible bubble, and stripping here would silently delete the model's reasoning.
 		const { calls, text } = extractTextToolCalls(step.content, known);
@@ -1268,25 +1654,52 @@ export class AgentRunner {
 
 	/** Runs the summarizer through the same provider/model; failures return undefined so the run falls back to trimming. */
 	private async compact(messages: ChatMessage[], params: AgentParams) {
-		return compactMessages(messages, async (toSummarize, maxTokens) => {
+		// The summarizer is sent the head too, and trimming cannot shrink the system prompt
+		// there either. Its result replaces the run's messages, which is what makes the switch
+		// stick for the rest of the run.
+		return compactMessages(this.fitted(messages), async (toSummarize, maxTokens) => {
 			let text = '';
 			// Counted like any other request: compaction is a model call over the bulkiest
 			// part of the conversation, so a ledger that omitted it would credit compaction
 			// with a saving it had partly spent. No tool schemas here — this call carries none.
 			this.totalPromptTokens += estimateMessagesTokens(toSummarize);
 			this.requestCount++;
-			await this.provider.streamChat({
+			const cappedMaxTokens = Math.min(maxTokens, this.outputCap ?? maxTokens);
+			const send = (apiKey: string) => this.provider.streamChat({
 				messages: toSummarize,
 				model: params.model,
-				apiKey: params.apiKey,
+				apiKey,
 				baseUrl: params.baseUrl,
 				// Subject to the same reply ceiling as a step: on a backend that charges the
 				// reservation against a per-minute allowance, asking for more than the
 				// allowance permits fails before the model reads a word.
-				maxTokens: Math.min(maxTokens, this.outputCap ?? maxTokens),
+				maxTokens: cappedMaxTokens,
 				signal: params.signal,
 				onToken: delta => { text += delta; },
 			});
+			try {
+				await send(params.apiKey);
+			} catch (err) {
+				// compactMessages swallows a thrown summarizer failure and falls back to the
+				// lossy trim, so a rotated key here is a pure win with no new failure mode —
+				// one retry, same shape as a step's own key-failure handling above, just
+				// without the step-loop's retry-count bookkeeping (this runs at most once
+				// per compaction, not once per step).
+				const message = err instanceof Error ? err.message : String(err);
+				const nextKey = isKeyFailure(message) ? await this.onKeyFailure?.(message) : undefined;
+				if (nextKey === undefined) {
+					throw err;
+				}
+				params.apiKey = nextKey;
+				text = '';
+				// A second real HTTP request, same as a rotated retry in the main step loop
+				// (a fresh `step()` call there re-does its own accounting) — the ledger must
+				// count it too, or a rotated compaction reads as cheaper than it was.
+				this.totalPromptTokens += estimateMessagesTokens(toSummarize);
+				this.requestCount++;
+				await send(nextKey);
+			}
+			this.onStepSuccess?.();
 			// Reasoning models stream their chain of thought through onToken too;
 			// the stored summary must not carry it.
 			return stripThinking(text);
@@ -1314,6 +1727,25 @@ export class AgentRunner {
 			}
 			if (call.name === SPAWN_SUBAGENT_TOOL.name) {
 				spawnCalls.push(call);
+				continue;
+			}
+			// Handled here rather than falling through to the read-only batch path below:
+			// `list_agent_sessions` IS in READ_ONLY_TOOL_NAMES (for classification — see that
+			// list's doc), but it is never dispatched through `executeTool`, so a batch would
+			// hand it to the generic "no tool called…" fallback instead of actually listing
+			// sessions. Checked before that path, exactly like SPAWN_SUBAGENT_TOOL above.
+			if (call.name === LIST_AGENT_SESSIONS_TOOL.name) {
+				callbacks.onToolStart(call);
+				const outcome = this.listAgentSessions();
+				callbacks.onToolEnd(call, outcome.result, outcome.isError);
+				outcomes.push({ call, ...outcome });
+				continue;
+			}
+			if (call.name === SEND_AGENT_MESSAGE_TOOL.name) {
+				callbacks.onToolStart(call);
+				const outcome = await this.sendAgentMessage(call);
+				callbacks.onToolEnd(call, outcome.result, outcome.isError);
+				outcomes.push({ call, ...outcome });
 				continue;
 			}
 			// A run of adjacent read-only calls has no side effects and no ordering between
@@ -1464,9 +1896,10 @@ export class AgentRunner {
 			callbacks.onToolEnd(call, refusal, true);
 			return { call, result: refusal, isError: true };
 		}
-		const { result, isError } = call.name.startsWith(MCP_PREFIX)
+		const outcome = call.name.startsWith(MCP_PREFIX)
 			? await this.callMcp(call)
-			: await executeTool(call, this.approver, this.guardrails, this.toolLimits());
+			: await executeTool(call, this.approver, this.guardrails, this.toolLimits(), this.runSignal);
+		const { result, isError } = this.fitOutput(call, outcome);
 		this.recordToolOutcome(call, key, isRead, isError);
 		callbacks.onToolEnd(call, result, isError);
 		return { call, result, isError };
@@ -1500,7 +1933,7 @@ export class AgentRunner {
 			}
 			let pending = shared.get(p.key);
 			if (!pending) {
-				pending = executeTool(p.call, this.approver, this.guardrails, this.toolLimits());
+				pending = executeTool(p.call, this.approver, this.guardrails, this.toolLimits(), this.runSignal).then(r => this.fitOutput(p.call, r));
 				shared.set(p.key, pending);
 			}
 			return pending;
@@ -1542,7 +1975,10 @@ export class AgentRunner {
 				};
 			}
 		}
-		return this.mcp.call(call.name, call.args);
+		// Raced against Stop: an MCP call may take up to its two-minute timeout, and the
+		// loop only checks for Stop between steps. The server-side call is left to finish
+		// or time out on its own; the run just stops waiting for it.
+		return untilStopped(this.mcp.call(call.name, call.args), this.runSignal);
 	}
 
 	/** Runs a nested sub-agent for one delegation call, returning its summary as the tool result. */
@@ -1594,6 +2030,17 @@ export class AgentRunner {
 				: 0,
 			traceTiming: this.traceTiming,
 			now: this.now,
+			// Inherited so a delegate that hits a 401/403/429 rotates the same way the parent
+			// would, instead of failing outright the first time it needs a backup key. `params`
+			// (mutated in place on rotation) is the same object the parent holds, so a rotation
+			// here is visible to the parent's own later steps too — correct, since it's the
+			// same underlying credential pool for the same provider.
+			onKeyFailure: this.onKeyFailure,
+			onStepSuccess: this.onStepSuccess,
+			// Its prompt is already minimal, so this is the same text: offering it lets the
+			// delegate condense its tool schemas on the same budget the parent needed to.
+			compactSystemPrompt: subagentSystem(readOnly),
+			onCompactPrompt: () => { /* the parent has already said so, or the budget was never short */ },
 		});
 
 		const log: string[] = [];
@@ -1610,8 +2057,19 @@ export class AgentRunner {
 					onStepStart: () => { /* nested steps aren't surfaced individually */ },
 					onToken: () => { /* nested narration is captured in the summary */ },
 					onStepEnd: content => { if (content) { finalText = content; log.push(content); } },
-					onToolStart: c => log.push(`• ${c.name}(${shortArgs(c.args)})`),
-					onToolEnd: (_c, r, e) => log.push(`  ${e ? '⚠ ' : ''}${truncate(r, 300)}`),
+					// Forwarded live to the outer callbacks, tagged with `call.id` (the
+					// spawn_subagent call's own, already-rendered card) so the UI nests this
+					// delegate's activity under it instead of the user seeing nothing move
+					// until the whole delegation finishes. Narration/step lifecycle stays
+					// opaque, as above — only tool activity is worth surfacing mid-run.
+					onToolStart: c => {
+						log.push(`• ${c.name}(${shortArgs(c.args)})`);
+						callbacks.onToolStart(c, call.id);
+					},
+					onToolEnd: (c, r, e) => {
+						log.push(`  ${e ? '⚠ ' : ''}${truncate(r, 300)}`);
+						callbacks.onToolEnd(c, r, e, call.id);
+					},
 					// Surfaced to the user too: a sub-agent that quietly ran out of budget
 					// used to be invisible, leaving its half-done work unexplained.
 					onNote: t => { log.push(t); callbacks.onNote(`Sub-agent: ${t}`); },
@@ -1637,12 +2095,42 @@ export class AgentRunner {
 	}
 }
 
+/**
+ * A delegate's system prompt. A write-capable one also gets the editing rules a plain Agent
+ * run is given (locate and read before editing, the line-number gutter, no servers, verify):
+ * it used to get none of them, and was told its writes need approval, which is false under
+ * the default policy.
+ */
 function subagentSystem(readOnly: boolean): string {
 	const role = readOnly
 		? 'You are a READ-ONLY research SUB-AGENT. You may only read, list and search files — you cannot write or run commands.'
-		: 'You are a SUB-AGENT with tools to read, list, write and edit files and run commands (writes/commands require user approval).';
-	return `${role} ${SUBAGENT_PREAMBLE} You were given one focused goal and do not see the parent conversation. ` +
+		: 'You are a SUB-AGENT with tools to read, list, write and edit files and run commands.';
+	const base = `${role} ${SUBAGENT_PREAMBLE} You were given one focused goal and do not see the parent conversation. ` +
 		`Accomplish exactly that goal using your tools, then end with a concise summary of what you found or changed. Do not ask follow-up questions.`;
+	return readOnly ? base : `${base}\n${SUBAGENT_WRITE_RULES}`;
+}
+
+/** `work`, or a cancellation as soon as `signal` aborts, whichever comes first. */
+function untilStopped<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) {
+		return work;
+	}
+	if (signal.aborted) {
+		return Promise.reject(new DOMException('Aborted', 'AbortError'));
+	}
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+		signal.addEventListener('abort', onAbort, { once: true });
+		work.then(
+			value => { signal.removeEventListener('abort', onAbort); resolve(value); },
+			err => { signal.removeEventListener('abort', onAbort); reject(err); },
+		);
+	});
+}
+
+/** Tokens as thousands, to one decimal, so a sub-1k run doesn't report "~0k". */
+function round1k(tokens: number): number {
+	return Math.round(tokens / 100) / 10;
 }
 
 /**
@@ -1655,11 +2143,6 @@ function subagentSystem(readOnly: boolean): string {
  * let a model re-read the same file indefinitely just by spelling it differently — the exact
  * loop this guard exists to stop, walked straight around.
  */
-/** Tokens as thousands, to one decimal, so a sub-1k run doesn't report "~0k". */
-function round1k(tokens: number): number {
-	return Math.round(tokens / 100) / 10;
-}
-
 function repeatKey(call: ToolCall): string {
 	const args: Record<string, unknown> = { ...call.args };
 	if (typeof args.path === 'string') {

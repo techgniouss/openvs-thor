@@ -360,6 +360,10 @@ async function refreshAntigravity(refreshToken: string): Promise<StoredOAuth | '
  */
 export async function signInAnthropic(store: OAuthTokenStore): Promise<boolean> {
 	const pkce = createPkce();
+	// Its own random value. It used to be the PKCE verifier itself, which put the one secret
+	// PKCE relies on into the authorize URL — browser history, the provider's logs — where
+	// together with an intercepted code it was enough to redeem the code for a token.
+	const expectedState = base64url(randomBytes(32));
 	const url = new URL(ANTHROPIC_AUTHORIZE_URL);
 	url.searchParams.set('code', 'true');
 	url.searchParams.set('client_id', ANTHROPIC_CLIENT_ID);
@@ -368,7 +372,7 @@ export async function signInAnthropic(store: OAuthTokenStore): Promise<boolean> 
 	url.searchParams.set('scope', ANTHROPIC_SCOPES);
 	url.searchParams.set('code_challenge', pkce.challenge);
 	url.searchParams.set('code_challenge_method', 'S256');
-	url.searchParams.set('state', pkce.verifier);
+	url.searchParams.set('state', expectedState);
 
 	await vscode.env.openExternal(vscode.Uri.parse(url.toString()));
 
@@ -382,10 +386,13 @@ export async function signInAnthropic(store: OAuthTokenStore): Promise<boolean> 
 		return false;
 	}
 	const [code, state] = pasted.trim().split('#');
+	if (state !== undefined && state !== expectedState) {
+		throw new Error('That code belongs to a different sign-in attempt. Start the Claude sign-in again and paste the code it shows.');
+	}
 	const { status, json } = await postJson(ANTHROPIC_TOKEN_URL, {
 		grant_type: 'authorization_code',
 		code,
-		state: state ?? pkce.verifier,
+		state: expectedState,
 		client_id: ANTHROPIC_CLIENT_ID,
 		redirect_uri: ANTHROPIC_REDIRECT_URI,
 		code_verifier: pkce.verifier,

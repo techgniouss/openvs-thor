@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { RateLimitSnapshot } from './rateLimits';
+import { stripThinking } from '../persona/thinking';
 
 export type ChatRole = 'system' | 'user' | 'assistant' | 'tool';
 
@@ -40,7 +41,19 @@ export interface ChatMessage {
 	readonly images?: ChatImage[];
 	readonly toolCalls?: ToolCall[];
 	readonly toolCallId?: string;
+	/**
+	 * The provider's own reasoning blocks for this assistant turn, kept verbatim so they can
+	 * be replayed to the provider that produced them (Anthropic requires the thinking behind
+	 * a tool call to come back with it). Opaque to everything else, and never shown: the
+	 * readable reasoning reaches the transcript through `onToken`, not through this field.
+	 */
+	readonly thinkingBlocks?: ThinkingBlock[];
 }
+
+/** A provider reasoning block as it must be replayed: signed thinking, or redacted thinking. */
+export type ThinkingBlock =
+	| { readonly type: 'thinking'; readonly thinking: string; readonly signature: string }
+	| { readonly type: 'redacted_thinking'; readonly data: string };
 
 /** A model id plus optional capability/pricing metadata from the provider's catalog. */
 export interface ModelEntry {
@@ -139,6 +152,8 @@ export interface AgentStep {
 	readonly truncated?: boolean;
 	/** Normalized stop reason reported by the backend, when it reported one. */
 	readonly finishReason?: FinishReason;
+	/** The step's reasoning blocks, for replay with its tool calls. See {@link ChatMessage.thinkingBlocks}. */
+	readonly thinkingBlocks?: ThinkingBlock[];
 }
 
 /** The outcome of a completed {@link ChatProvider.streamChat} call. */
@@ -203,7 +218,8 @@ export interface ProviderInfo {
 	/**
 	 * True when the backend continues a trailing assistant turn in place (Anthropic's
 	 * prefill). Lets {@link streamChatWithContinuation} resume a cut-off response
-	 * seamlessly instead of asking for a continuation in a new user turn.
+	 * seamlessly instead of asking for a continuation in a new user turn. A provider whose
+	 * models differ implements {@link ChatProvider.supportsPrefill}, which takes precedence.
 	 */
 	readonly supportsAssistantPrefill?: boolean;
 	/**
@@ -437,6 +453,13 @@ export async function streamChatWithContinuation(
 			request.signal.removeEventListener('abort', relayAbort);
 		}
 		full += chunk;
+		// A declined request is not a transient empty reply: said as what it is, or the user
+		// is told to retry something that will be declined the same way.
+		if ((result?.finishReason === 'refused' || result?.finishReason === 'filtered') && !stripThinking(chunk).trim()) {
+			throw new Error(result.finishReason === 'refused'
+				? `${provider.info.label} declined this request. Rephrase it, or switch models.`
+				: `${provider.info.label}'s content filter blocked this reply. Rephrase the request, or switch models.`);
+		}
 		if (looping) {
 			request.onNotice?.(REPEAT_LOOP_NOTICE);
 			return { text: full, truncated: false };
@@ -455,14 +478,21 @@ export async function streamChatWithContinuation(
 			request.onNotice?.(REPEAT_LOOP_NOTICE);
 			return { text: full, truncated: false };
 		}
-		if (provider.info.supportsAssistantPrefill) {
+		// The streamed reasoning is not part of the answer being continued: sent back as the
+		// assistant's own words, the model would read its chain of thought as text it wrote.
+		const answer = stripThinking(full);
+		if (!answer.trim()) {
+			return { text: full, truncated };
+		}
+		const prefill = provider.supportsPrefill ? provider.supportsPrefill(request.model) : !!provider.info.supportsAssistantPrefill;
+		if (prefill) {
 			// A trailing assistant turn is continued in place. Trailing whitespace must be
 			// stripped — Anthropic rejects prefill content that ends with it (HTTP 400).
-			messages = [...request.messages, { role: 'assistant', content: full.replace(/\s+$/, '') }];
+			messages = [...request.messages, { role: 'assistant', content: answer.replace(/\s+$/, '') }];
 		} else {
 			messages = [
 				...request.messages,
-				{ role: 'assistant', content: full },
+				{ role: 'assistant', content: answer },
 				{ role: 'user', content: CONTINUE_PROMPT },
 			];
 		}
@@ -471,10 +501,22 @@ export async function streamChatWithContinuation(
 
 /**
  * A chat provider knows how to stream a completion from a specific backend.
- * Implementations must be self-contained and only use the global `fetch`.
+ * Implementations must be self-contained and only use the global `fetch` —
+ * with one deliberate, narrow exception: a local-CLI passthrough provider (`claudeCodeCli.ts`)
+ * spawns the user's already-installed CLI as a subprocess instead, because the backend it
+ * reuses is a program on the user's own PATH, not an HTTP endpoint. It stays a plain
+ * text-in/text-out `streamChat` like every other provider here — the exception is the
+ * transport, not the contract.
  */
 export interface ChatProvider {
 	readonly info: ProviderInfo;
+	/**
+	 * Whether `model` continues a trailing assistant turn in place. Overrides
+	 * {@link ProviderInfo.supportsAssistantPrefill} for a provider whose models differ:
+	 * Claude 4.6 and newer reject prefill outright (HTTP 400), as does any request with
+	 * extended thinking on, so one provider-wide flag broke every continuation there.
+	 */
+	supportsPrefill?(model: string): boolean;
 	/**
 	 * Stream a chat completion. Resolves when the stream completes, rejects on error
 	 * (including abort, which throws a DOMException named 'AbortError'). Providers
@@ -603,6 +645,13 @@ export async function readSSE(
 		}
 		onEvent(data);
 	};
+	// Stop reaches the stream itself. `apiFetch` stops linking the caller's signal once the
+	// headers arrive, so without this a Stop during a mid-stream pause (a model reasoning for a
+	// minute) waited for the next chunk — and the provider went on generating, and billing,
+	// into a connection nobody was reading. Cancelling ends the pending read at once.
+	const onAbort = () => { void reader.cancel().catch(() => { /* already closed */ }); };
+	signal.addEventListener('abort', onAbort, { once: true });
+	let finished = false;
 	try {
 		while (true) {
 			if (signal.aborted) {
@@ -623,7 +672,14 @@ export async function readSSE(
 		if (tail) {
 			emit(tail);
 		}
+		finished = true;
 	} finally {
+		signal.removeEventListener('abort', onAbort);
+		// Leaving early — a stream error event, a stall, a caller that threw — closes the
+		// connection too, rather than leaving the provider to finish a reply no one will read.
+		if (!finished) {
+			await reader.cancel().catch(() => { /* already closed */ });
+		}
 		reader.releaseLock();
 	}
 	if (signal.aborted) {
@@ -844,6 +900,7 @@ export async function apiFetch(
 				const delayMs = backoffMs(rateLimitAttempts, response);
 				opts?.onRetry?.({ attempt: rateLimitAttempts, delayMs, reason: 'rate-limit', status: 429 });
 				rateLimitAttempts++;
+				await discard(response);
 				await sleep(delayMs, signal);
 				continue;
 			}
@@ -851,6 +908,7 @@ export async function apiFetch(
 				const delayMs = backoffMs(networkAttempts, response);
 				opts?.onRetry?.({ attempt: networkAttempts, delayMs, reason: 'server', status: response.status });
 				networkAttempts++;
+				await discard(response);
 				await sleep(delayMs, signal);
 				continue;
 			}
@@ -874,6 +932,15 @@ export async function apiFetch(
 			throw lastError;
 		}
 	}
+}
+
+/**
+ * Releases a response that is being retried rather than read. An unread body keeps its
+ * connection checked out until garbage collection, so a backend answering a run of 429s or
+ * 5xxs used to accumulate open sockets, one per retry.
+ */
+async function discard(response: Response): Promise<void> {
+	await response.body?.cancel().catch(() => { /* already closed */ });
 }
 
 /**

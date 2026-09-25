@@ -137,10 +137,13 @@ below.
 
 Publishing a GitHub Release triggers
 [`release-windows.yml`](.github/workflows/release-windows.yml): a `windows-latest` runner
-installs dependencies, runs the same `gulp` tasks a local Windows build would
-(`vscode-win32-x64-min` → `vscode-win32-x64-inno-updater` → `vscode-win32-x64-system-setup`),
-and uploads the resulting installer to that release as `OpenVSSetup-x64-<version>.exe`. It
-also always publishes the exe as a workflow artifact, so a manual run (`workflow_dispatch`,
+installs dependencies, stamps the release tag's version into the build, runs the same `gulp`
+tasks a local Windows build would (`vscode-win32-x64-min` → `vscode-win32-x64-inno-updater` →
+`vscode-win32-x64-system-setup` / `-user-setup`), and uploads both installers to that release:
+`OpenVSSetup-x64-<version>.exe` (system-wide, needs admin) and
+`OpenVSUserSetup-x64-<version>.exe` (per-user). **Tag releases as a version** (`v1.128.0`),
+higher than the previous one — the workflow refuses any other tag. It
+also always publishes the exes as a workflow artifact, so a manual run (`workflow_dispatch`,
 from the Actions tab) lets you sanity-check a build without cutting a release — leave the
 `upload_to_release` input blank to just build, or set it to an existing release's tag to
 attach the result there too.
@@ -157,6 +160,19 @@ npm run gulp vscode-win32-x64-system-setup  # -> .build/win32-x64/system-setup/O
 
 Swap `-system-setup` for `-user-setup` for a per-user (no-admin) installer, or `x64` for
 `arm64` to cross-build the other architecture.
+
+### Automatic updates
+
+`product.json`'s `updateUrl` points at this repository, which switches the stock update
+service to GitHub Releases (`src/vs/platform/update/common/githubReleases.ts`). An installed
+build checks the latest release 30 seconds after startup and then hourly; when its tag is a
+higher version and the matching installer is attached, it downloads it in the background
+(verified against GitHub's SHA-256 digest) and shows **Update** in the title bar and
+**Restart to Update** in the gear menu. The per-user install also applies the update in the
+background, so the restart is instant; the system-wide install runs the installer on restart
+and asks for admin. Drafts and prereleases are never offered, and a release whose build is
+still running reads as "no update" until its installers appear. Windows only — other platforms
+report updates as disabled. `update.mode` (`none` / `manual` / `start` / `default`) controls it.
 
 ## Repository layout
 

@@ -24,19 +24,35 @@ html, body {
 
 .spacer { flex: 1 1 auto; }
 
+/* Keyboard focus for every native control that does not draw its own (the pills below
+   restate it as a border instead, and the composer box shows it for the textarea). */
+button:focus-visible, select:focus-visible, summary:focus-visible, a:focus-visible, input:focus-visible {
+	outline: 1px solid var(--vscode-focusBorder);
+	outline-offset: 1px;
+}
+
+/* The composer's pickers and icon buttons share one 24px line, so a wrapped bar still reads
+   as rows of equal controls rather than a ragged baseline. */
+#modelSelect, #providerSelect, .mode-pill, .approval-pill {
+	height: 24px;
+	padding-top: 0;
+	padding-bottom: 0;
+	font-size: 0.85em;
+	line-height: 22px;
+}
+
 #modelSelect, #providerSelect {
 	flex: 0 1 auto;
 	min-width: 0;
-	max-width: 34%;
+	max-width: 40%;
 	appearance: none;
 	-webkit-appearance: none;
 	background-color: var(--vscode-dropdown-background);
 	color: var(--vscode-dropdown-foreground);
 	border: 1px solid var(--vscode-dropdown-border, rgba(127, 127, 127, 0.35));
 	border-radius: 10px;
-	padding: 3px 20px 3px 10px;
-	font-size: 0.85em;
-	line-height: 1.4;
+	padding-left: 10px;
+	padding-right: 20px;
 	cursor: pointer;
 	overflow: hidden;
 	text-overflow: ellipsis;
@@ -55,18 +71,54 @@ html, body {
 	outline: none;
 	border-color: var(--vscode-focusBorder);
 }
+/* The model picker and its ⟳ wrap as one unit — separately, a narrow bar left the refresh
+   button stranded alone at the start of the next row. The model id is the longest, most
+   specific label on the bar, so the pair takes the slack a row leaves (within reason)
+   instead of truncating to "anthropic/cl…" beside empty space. In Auto mode both children
+   are hidden and the group goes with them. */
+.model-picker {
+	flex: 1 1 130px;
+	max-width: 264px;
+	min-width: 0;
+	display: flex;
+	align-items: center;
+	gap: 2px;
+}
+.model-picker:not(:has(> :not(.hidden))) { display: none; }
+/* The four panel actions wrap together, right-aligned — one at a time, a narrow sidebar
+   left ⚙ alone at the start of a row of its own. */
+.composer-actions {
+	flex: none;
+	display: flex;
+	align-items: center;
+	gap: 2px;
+	margin-left: auto;
+}
+#modelSelect {
+	flex: 1 1 auto;
+	max-width: none;
+}
 
 .icon-button {
 	flex: 0 0 auto;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 24px;
+	height: 24px;
+	padding: 0;
 	background: transparent;
+	color: var(--vscode-icon-foreground, var(--vscode-foreground));
 	border: none;
-	cursor: pointer;
-	font-size: 14px;
-	padding: 2px 4px;
 	border-radius: 4px;
+	cursor: pointer;
 }
-.icon-button:hover {
+.icon-button:hover:not(:disabled) {
 	background: var(--vscode-toolbar-hoverBackground);
+}
+.icon-button:disabled {
+	opacity: 0.4;
+	cursor: default;
 }
 
 .banner {
@@ -85,41 +137,57 @@ html, body {
 }
 
 /* ---- Chat tabs ---- */
+/* The strip sits on the view's own background (a webview body is transparent over the
+   sidebar or panel it lives in); painting it the editor colour drew a band of a different
+   grey across the top of the sidebar. The active tab is marked the way VS Code marks its
+   own panel titles — an underline on the strip's rule — rather than as a raised folder tab,
+   which only reads as attached when its fill matches the content below it, and here it
+   could not. The rule is an inset shadow so the active underline paints over it. */
 #tabs {
 	display: flex;
-	align-items: center;
-	gap: 3px;
-	padding: 4px 6px 0;
-	overflow-x: auto;
-	scrollbar-width: none;
-	border-bottom: 1px solid var(--vscode-panel-border, rgba(127, 127, 127, 0.2));
-	background: var(--vscode-editor-background);
+	align-items: stretch;
+	padding: 2px 8px 0;
+	box-shadow: inset 0 -1px 0 var(--vscode-panel-border, rgba(127, 127, 127, 0.2));
 	flex: 0 0 auto;
 }
-#tabs::-webkit-scrollbar { display: none; }
+/* Only the tabs scroll; + stays outside the scroller so it can never be scrolled away. */
+.tab-list {
+	position: relative;
+	display: flex;
+	align-items: stretch;
+	gap: 2px;
+	flex: 0 1 auto;
+	min-width: 0;
+	overflow-x: auto;
+	scrollbar-width: none;
+}
+.tab-list::-webkit-scrollbar { display: none; }
+.chat-tab:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
 .chat-tab {
 	display: inline-flex;
 	align-items: center;
 	gap: 5px;
-	max-width: 150px;
-	padding: 3px 8px 4px;
-	border-radius: 6px 6px 0 0;
+	max-width: 160px;
+	/* Enough for a few characters of the title: below this a tab reads as "N…", and the
+	   strip scrolls instead. */
+	min-width: 80px;
+	padding: 5px 6px 6px 8px;
+	border-radius: 4px 4px 0 0;
 	font-size: 0.82em;
 	cursor: pointer;
 	color: var(--vscode-descriptionForeground);
-	border: 1px solid transparent;
-	border-bottom: none;
 	white-space: nowrap;
 	flex: 0 1 auto;
-	min-width: 0;
 }
 .chat-tab:hover {
+	color: var(--vscode-foreground);
 	background: var(--vscode-list-hoverBackground, rgba(127, 127, 127, 0.12));
 }
+/* The tab being read keeps its whole (capped) title; the others give up the width. */
 .chat-tab.active {
+	flex-shrink: 0;
 	color: var(--vscode-foreground);
-	background: var(--vscode-editor-inactiveSelectionBackground, rgba(127, 127, 127, 0.12));
-	border-color: var(--vscode-panel-border, rgba(127, 127, 127, 0.25));
+	box-shadow: inset 0 -2px 0 var(--vscode-panelTitle-activeBorder, var(--vscode-focusBorder));
 }
 .chat-tab .tab-title {
 	overflow: hidden;
@@ -141,23 +209,37 @@ html, body {
 	0%, 100% { opacity: 0.35; transform: scale(0.85); }
 	50% { opacity: 1; transform: scale(1.15); }
 }
+/* Close shows on the active tab and on hover, as in the editor's own tab bar: a ✕ on every
+   tab is noise across a strip of parallel runs, and it took width from the titles. */
 .chat-tab .tab-close {
 	flex: 0 0 auto;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 16px;
+	height: 16px;
 	color: inherit;
 	text-decoration: none;
-	opacity: 0.5;
-	padding: 0 1px;
+	opacity: 0;
 	border-radius: 3px;
 }
+.chat-tab.active .tab-close, .chat-tab:hover .tab-close, .chat-tab .tab-close:focus-visible { opacity: 0.6; }
 .chat-tab .tab-close:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); }
 .tab-add {
 	flex: 0 0 auto;
+	align-self: center;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 22px;
+	height: 22px;
+	margin-left: 2px;
+	padding: 0;
 	background: transparent;
 	border: none;
 	color: var(--vscode-descriptionForeground);
 	font-size: 1.1em;
 	line-height: 1;
-	padding: 2px 7px 4px;
 	border-radius: 4px;
 	cursor: pointer;
 }
@@ -166,8 +248,12 @@ html, body {
 	color: var(--vscode-foreground);
 }
 
+/* Basis 0: the transcript takes whatever height is left. With `auto` it shrank in proportion
+   to its content, so in a short view a tall welcome hero kept the space and an open History
+   or Settings sheet collapsed to its title bar. */
 #messages {
-	flex: 1 1 auto;
+	flex: 1 1 0;
+	min-height: 0;
 	overflow-y: auto;
 	padding: 10px;
 	display: flex;
@@ -188,11 +274,15 @@ html, body {
 }
 
 /* ---- Empty-state hero ---- */
+/* `width: 100%` is load-bearing: centred by auto margins, a flex item sizes to fit its
+   content, and the nowrap titles in "Recent chats" made that wider than a narrow sidebar —
+   the whole hero overflowed sideways, clipping the subtitle and the times. */
 .empty {
 	margin: auto;
 	text-align: center;
 	color: var(--vscode-descriptionForeground);
 	line-height: 1.6;
+	width: 100%;
 	max-width: 340px;
 	display: flex;
 	flex-direction: column;
@@ -257,7 +347,10 @@ html, body {
 	border-color: var(--vscode-focusBorder, rgba(127, 127, 127, 0.6));
 	transform: translateY(-1px);
 }
-.empty-chip .chip-icon { font-size: 1.05em; }
+.empty-chip .chip-icon {
+	display: inline-flex;
+	color: var(--vscode-textLink-foreground, var(--vscode-focusBorder));
+}
 .empty-footnote {
 	font-size: 0.8em;
 	opacity: 0.8;
@@ -296,11 +389,18 @@ html, body {
    the answer (or under the reasoning pill) for the whole run. The working strip already
    carries an animated Thor glyph and a live verb, so the bolt was duplicate motion. */
 
+/* Blocks carry their own vertical rhythm (markdown.js emits no break beside them), so the
+   bubble's padding is the only space at its edges. */
+.message .body > :first-child { margin-top: 0; }
+.message .body > :last-child { margin-bottom: 0; }
+
 .body pre {
 	background: var(--vscode-textCodeBlock-background, rgba(127, 127, 127, 0.15));
+	margin: 0.5em 0;
 	padding: 8px;
 	border-radius: 4px;
 	overflow-x: auto;
+	tab-size: 4;
 }
 .body code {
 	font-family: var(--vscode-editor-font-family, monospace);
@@ -313,7 +413,7 @@ html, body {
 	color: var(--vscode-textLink-foreground);
 }
 .body h1, .body h2, .body h3, .body h4, .body h5, .body h6 {
-	margin: 0.5em 0 0.3em;
+	margin: 0.8em 0 0.3em;
 	line-height: 1.3;
 }
 .body h1 { font-size: 1.25em; }
@@ -321,7 +421,7 @@ html, body {
 .body h3 { font-size: 1.02em; }
 .body h4, .body h5, .body h6 { font-size: 1em; }
 .body ul, .body ol {
-	margin: 0.2em 0;
+	margin: 0.4em 0;
 	padding-left: 1.4em;
 }
 .body li { margin: 0.1em 0; }
@@ -335,7 +435,7 @@ html, body {
    rather than pushing the whole transcript sideways. */
 .body table {
 	border-collapse: collapse;
-	margin: 0.4em 0;
+	margin: 0.5em 0;
 	display: block;
 	overflow-x: auto;
 	max-width: 100%;
@@ -350,7 +450,7 @@ html, body {
 	font-weight: 600;
 }
 .body blockquote {
-	margin: 0.3em 0;
+	margin: 0.5em 0;
 	padding: 0 0 0 10px;
 	border-left: 3px solid var(--vscode-textBlockQuote-border, rgba(127, 127, 127, 0.5));
 	color: var(--vscode-descriptionForeground);
@@ -362,28 +462,50 @@ html, body {
 }
 .body del { opacity: 0.7; }
 
-/* Code-block action bar (Copy / Insert) */
+/* Code-block header: language + Copy / Insert, joined to the block it acts on. It used to
+   float above the block with a gap between them, reading as a stray toolbar. */
 .code-actions {
 	display: flex;
-	gap: 6px;
-	justify-content: flex-end;
-	margin-bottom: -4px;
+	align-items: center;
+	gap: 2px;
+	margin: 0.5em 0 0;
+	padding: 2px 4px 2px 8px;
+	background: var(--vscode-textCodeBlock-background, rgba(127, 127, 127, 0.15));
+	border-bottom: 1px solid var(--vscode-panel-border, rgba(127, 127, 127, 0.2));
+	border-radius: 4px 4px 0 0;
+}
+.code-actions + pre {
+	margin-top: 0;
+	border-radius: 0 0 4px 4px;
+}
+.code-lang {
+	flex: 1 1 auto;
+	min-width: 0;
+	font-family: var(--vscode-editor-font-family, monospace);
+	font-size: 0.78em;
+	color: var(--vscode-descriptionForeground);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
 }
 .code-actions button {
-	background: var(--vscode-button-secondaryBackground, rgba(127, 127, 127, 0.2));
-	color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+	background: transparent;
+	color: var(--vscode-descriptionForeground);
 	border: none;
-	border-radius: 4px;
-	padding: 1px 8px;
+	border-radius: 3px;
+	padding: 1px 6px;
 	font-size: 0.78em;
+	font-family: inherit;
 	cursor: pointer;
 }
 .code-actions button:hover {
-	background: var(--vscode-button-hoverBackground, rgba(127, 127, 127, 0.35));
+	background: var(--vscode-toolbar-hoverBackground, rgba(127, 127, 127, 0.25));
+	color: var(--vscode-foreground);
 }
 
+/* 10px sides: the composer's edge lines up with the transcript bubbles above it. */
 #composer {
-	padding: 8px;
+	padding: 8px 10px 10px;
 }
 
 .composer-box {
@@ -437,18 +559,21 @@ html, body {
 .send-button:hover {
 	background: var(--vscode-button-hoverBackground);
 }
+/* Stop is the one control that matters mid-run. The secondary button colour it used is the
+   input background in the default dark themes, so the circle vanished into the composer and
+   left a lone square floating beside the text. A foreground tint shows in every theme. */
 #stopButton {
-	background: var(--vscode-button-secondaryBackground, var(--vscode-button-background));
-	color: var(--vscode-button-secondaryForeground, var(--vscode-button-foreground));
+	background: color-mix(in srgb, var(--vscode-foreground) 18%, transparent);
+	color: var(--vscode-foreground);
 }
 #stopButton:hover {
-	background: var(--vscode-button-secondaryHoverBackground, var(--vscode-button-hoverBackground));
+	background: color-mix(in srgb, var(--vscode-foreground) 28%, transparent);
 }
 
 .composer-bar {
 	display: flex;
 	align-items: center;
-	gap: 5px;
+	gap: 4px 5px;
 	flex-wrap: wrap;
 }
 
@@ -460,9 +585,8 @@ html, body {
 	color: var(--vscode-button-foreground);
 	border: 1px solid transparent;
 	border-radius: 10px;
-	padding: 3px 20px 3px 10px;
-	font-size: 0.85em;
-	line-height: 1.4;
+	padding-left: 10px;
+	padding-right: 20px;
 	cursor: pointer;
 	background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8' viewBox='0 0 16 16' fill='%23ffffff'><path d='M3 6l5 5 5-5H3z'/></svg>");
 	background-repeat: no-repeat;
@@ -488,9 +612,8 @@ html, body {
 	color: var(--vscode-dropdown-foreground);
 	border: 1px solid var(--vscode-dropdown-border, rgba(127, 127, 127, 0.35));
 	border-radius: 10px;
-	padding: 3px 18px 3px 8px;
-	font-size: 0.8em;
-	line-height: 1.4;
+	padding-left: 8px;
+	padding-right: 18px;
 	cursor: pointer;
 	background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8' viewBox='0 0 16 16' fill='%23888888'><path d='M3 6l5 5 5-5H3z'/></svg>");
 	background-repeat: no-repeat;
@@ -498,6 +621,10 @@ html, body {
 }
 .approval-pill:hover {
 	border-color: var(--vscode-focusBorder, rgba(127, 127, 127, 0.6));
+}
+.approval-pill:focus-visible {
+	outline: none;
+	border-color: var(--vscode-focusBorder);
 }
 
 /* ---- Agent permissions cards (settings) ---- */
@@ -524,7 +651,7 @@ html, body {
 .approval-desc { font-size: 0.8em; color: var(--vscode-descriptionForeground); }
 
 /* ---- Settings mini buttons / header actions ---- */
-.header-actions { display: flex; gap: 6px; }
+.header-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .mini-button {
 	background: var(--vscode-button-secondaryBackground, rgba(127, 127, 127, 0.2));
 	color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
@@ -584,25 +711,62 @@ html, body {
 .mcp-row.warn { border-left-color: var(--vscode-editorWarning-foreground, #d29922); }
 
 /* ---- Queued messages ---- */
+/* `max-width` on the row, not only on the chip: a shrink-to-fit row takes its width from the
+   chip's nowrap text, so the chip's own `max-width: 100%` resolved against itself and a long
+   queued message pushed the composer sideways in a narrow sidebar instead of ellipsizing. */
 .queue-chips {
 	display: flex;
 	flex-wrap: wrap;
 	gap: 4px;
-	margin: 0 0 4px;
+	margin: 0;
 	align-self: flex-start;
-}
-.queue-chip {
-	font-size: 0.8em;
-	padding: 2px 8px;
-	border-radius: 10px;
-	background: var(--vscode-badge-background);
-	color: var(--vscode-badge-foreground);
 	max-width: 100%;
-	overflow: hidden;
-	text-overflow: ellipsis;
+}
+/* Composer chips — attached context, active skills, queued messages. One shape for all three:
+   a tinted outline pill with a muted leading icon and a round remove target, instead of the
+   solid grey badge fill, which read as three heavy buttons stacked over the input. A queued
+   message is dashed: it is pending, not attached. */
+.context-chip, .skill-chip-item, .queue-chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	min-width: 0;
+	max-width: 100%;
+	height: 22px;
+	padding: 0 3px 0 8px;
+	font-size: 0.82em;
+	color: var(--vscode-foreground);
+	background: color-mix(in srgb, var(--vscode-foreground) 7%, transparent);
+	border: 1px solid color-mix(in srgb, var(--vscode-foreground) 16%, transparent);
+	border-radius: 999px;
 	white-space: nowrap;
 }
-.queue-chip a { color: inherit; margin-left: 4px; cursor: pointer; text-decoration: none; }
+.queue-chip { border-style: dashed; }
+.context-chip > .ui-icon, .skill-chip-item > .ui-icon, .queue-chip > .ui-icon {
+	flex: none;
+	color: var(--vscode-descriptionForeground);
+}
+.chip-text {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+.chip-remove {
+	flex: none;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 16px;
+	height: 16px;
+	border-radius: 50%;
+	color: var(--vscode-descriptionForeground);
+	text-decoration: none;
+	cursor: pointer;
+}
+.chip-remove:hover {
+	color: var(--vscode-foreground);
+	background: color-mix(in srgb, var(--vscode-foreground) 14%, transparent);
+}
 
 /* ---- Steering message ---- */
 .message.steering .body {
@@ -610,6 +774,17 @@ html, body {
 }
 .message.steering .role::after {
 	content: ' · steering';
+	text-transform: none;
+	letter-spacing: normal;
+	font-weight: 400;
+}
+
+/* ---- Agent-to-agent message (send_agent_message, received) ---- */
+.message.agent-message .body {
+	border-left: 3px solid var(--vscode-charts-blue, #3794ff);
+}
+.message.agent-message .role::after {
+	content: ' · from agent';
 	text-transform: none;
 	letter-spacing: normal;
 	font-weight: 400;
@@ -625,6 +800,16 @@ html, body {
 }
 
 /* ---- Settings / providers panel ---- */
+/* In the sidebar these open as a sheet over the top of the chat; the shadow is what tells
+   its edge from the transcript still visible (and scrollable) below it. */
+#settingsPanel, #historyPanel {
+	position: relative;
+	z-index: 3;
+	/* Must stay shrinkable: in a short view the sheet gives up height before the composer
+	   is pushed off the bottom. */
+	flex: 0 1 auto;
+	box-shadow: 0 6px 10px -6px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.36));
+}
 #settingsPanel {
 	border-bottom: 1px solid var(--vscode-panel-border, transparent);
 	padding: 0 10px 12px;
@@ -648,25 +833,40 @@ body.settings-window #settingsPanel {
 	max-height: none;
 	height: 100vh;
 	border-bottom: none;
+	/* Centred by auto margins, a flex item sizes to its content, which is wider than a narrow
+	   editor column — `width` pins it to the column, as `.empty` needs for the same reason. */
+	width: 100%;
 	max-width: 860px;
 	margin: 0 auto;
 	padding: 0 24px 28px;
 	box-sizing: border-box;
+	box-shadow: none;
 }
-.settings-header { display: flex; align-items: center; justify-content: space-between; }
-/* Labeled close button in the sticky panel header — always visible, hard to miss. */
+/* Wraps rather than overflows: the MCP header's three buttons alone are wider than a narrow
+   sidebar. */
+.settings-header { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; justify-content: space-between; }
+/* Labeled close button in the sticky panel header — always visible, hard to miss. A ghost
+   button (icon + word, fill only on hover) rather than a boxed "✕ Close": the label keeps it
+   findable, the box was what made it look like a dialog from another decade. */
 .panel-close {
 	flex: 0 0 auto;
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	height: 26px;
+	padding: 0 10px 0 7px;
+	font-size: 0.88em;
+	font-family: inherit;
 	cursor: pointer;
-	font-size: 0.9em;
-	padding: 3px 10px;
-	border-radius: 4px;
-	background: var(--vscode-button-secondaryBackground, rgba(127, 127, 127, 0.15));
-	color: var(--vscode-button-secondaryForeground, inherit);
-	border: 1px solid var(--vscode-panel-border, rgba(127, 127, 127, 0.3));
+	border-radius: 6px;
+	background: transparent;
+	color: var(--vscode-descriptionForeground);
+	border: 1px solid transparent;
+	transition: background-color 0.12s ease, color 0.12s ease;
 }
 .panel-close:hover {
-	background: var(--vscode-button-secondaryHoverBackground, var(--vscode-toolbar-hoverBackground));
+	color: var(--vscode-foreground);
+	background: var(--vscode-toolbar-hoverBackground, rgba(127, 127, 127, 0.18));
 }
 /* Keep the panel title + close button visible while the provider list scrolls. */
 #settingsPanel .settings-header:first-child {
@@ -693,14 +893,28 @@ body.settings-window #settingsPanel {
 	background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
 }
 .provider-row { display: flex; gap: 6px; margin-bottom: 6px; }
-.provider-row .key-input, .provider-row .account-id-input, .provider-row .base-url-input {
+/* Every field and Save button a provider card can draw — the Cloudflare pair and the backup-key
+   box were missing from these lists and rendered as raw grey OS controls. */
+.provider-row .key-input, .provider-row .account-id-input, .provider-row .base-url-input, .provider-row .extra-keys-input {
 	flex: 1 1 auto;
+	font-family: inherit;
+	/* An input's automatic minimum is its ~20-character intrinsic width; without this the
+	   field could not shrink and pushed its Save button off a narrow panel. */
+	min-width: 0;
 	background: var(--vscode-input-background); color: var(--vscode-input-foreground);
 	border: 1px solid var(--vscode-input-border, transparent); border-radius: 4px; padding: 4px 6px;
 }
-.provider-row .save-key, .provider-row .save-account-id, .provider-row .save-base-url, .edit-apply button {
+.provider-row .extra-keys-input { resize: vertical; }
+.provider-row .key-input:focus, .provider-row .account-id-input:focus, .provider-row .base-url-input:focus, .provider-row .extra-keys-input:focus {
+	outline: none;
+	border-color: var(--vscode-focusBorder);
+}
+.provider-row .save-key, .provider-row .save-account-id, .provider-row .save-credentials, .provider-row .save-base-url, .provider-row .save-extra-keys, .edit-apply button {
 	background: var(--vscode-button-background); color: var(--vscode-button-foreground);
-	border: none; border-radius: 4px; padding: 4px 10px; cursor: pointer;
+	border: none; border-radius: 4px; padding: 4px 10px; cursor: pointer; font-family: inherit;
+}
+.provider-row .save-key:hover, .provider-row .save-credentials:hover, .provider-row .save-base-url:hover, .provider-row .save-extra-keys:hover, .edit-apply button:hover {
+	background: var(--vscode-button-hoverBackground);
 }
 .provider-advanced { margin-top: 4px; }
 .provider-advanced summary {
@@ -765,25 +979,16 @@ body.settings-window #settingsPanel {
 }
 
 /* ---- Context chip ---- */
-.context-chip {
-	margin: 0 0 4px; padding: 4px 8px; font-size: 0.85em;
-	background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
-	border-radius: 12px; align-self: flex-start; max-width: calc(100% - 20px);
-	overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.context-chip a { color: inherit; margin-left: 6px; cursor: pointer; }
-/* The skill chip holds one pill per active skill (several can be active at once). */
+.context-chip { margin: 0; align-self: flex-start; }
+/* The skill chip holds one pill per active skill (several can be active at once), so the
+   container itself drops the pill look it shares a class with. */
 #skillChip {
 	display: flex; flex-wrap: wrap; gap: 4px;
-	background: transparent; color: inherit; padding: 0;
-	overflow: visible; white-space: normal; max-width: 100%;
+	height: auto; padding: 0; font-size: inherit;
+	background: transparent; border: none;
+	white-space: normal;
 }
 #skillChip.hidden { display: none; }
-.skill-chip-item {
-	padding: 4px 8px; border-radius: 12px; white-space: nowrap;
-	background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
-}
-.skill-chip-item a { color: inherit; margin-left: 4px; cursor: pointer; text-decoration: none; }
 
 /* ---- Agent tool calls ---- */
 .tool {
@@ -806,7 +1011,21 @@ body.settings-window #settingsPanel {
 }
 .tool-glyph .thor-glyph { width: auto; height: 15px; }
 .tool.tool-error { border-left-color: var(--vscode-inputValidation-errorBorder, #f14c4c); }
-.tool-head { font-size: 0.85em; font-weight: 600; margin-bottom: 4px; }
+.tool-head {
+	display: flex;
+	align-items: flex-start;
+	gap: 6px;
+	font-size: 0.85em;
+	font-weight: 600;
+	margin-bottom: 4px;
+	overflow-wrap: anywhere;
+}
+.tool-head > .ui-icon {
+	flex: none;
+	margin-top: 2px;
+	color: var(--vscode-descriptionForeground);
+}
+.tool > details { margin-left: 19px; }
 .tool-out {
 	margin: 0; max-height: 180px; overflow: auto; font-size: 0.85em;
 	white-space: pre-wrap; word-break: break-word;
@@ -818,6 +1037,14 @@ body.settings-window #settingsPanel {
 }
 .tool-summary:hover { opacity: 1; }
 details[open] > .tool-summary { margin-bottom: 4px; }
+/* A delegated sub-agent's own tool calls, grouped under its spawn_subagent card instead of
+   appearing as unrelated top-level cards (indent + rule mirrors .thinking-body below). */
+.tool-children {
+	margin: 6px 0 0; padding-left: 10px;
+	border-left: 2px solid var(--vscode-panel-border, rgba(127,127,127,0.3));
+}
+.tool-children:empty { display: none; }
+.tool-children .tool { font-size: 0.95em; }
 
 /* ---- Reasoning ----
    Collapsed by default: a run's thinking dwarfs its answer, so it shows as a single
@@ -880,6 +1107,14 @@ details.thinking > summary:hover { color: var(--vscode-foreground); }
 	font-family: inherit; font-size: 0.9em;
 }
 .prompt-answer { margin-top: 0; }
+/* The approval card's reason box sits under the buttons, not in their flex row, so the flex
+   sizing above never applied and it rendered at the input's intrinsic ~20ch — its own
+   placeholder cut off mid-word. */
+.prompt-card > .prompt-feedback {
+	display: block;
+	width: 100%;
+	margin-top: 8px;
+}
 .prompt-options { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
 .prompt-option {
 	display: flex; flex-direction: column; gap: 2px; text-align: left;
@@ -943,9 +1178,17 @@ details.thinking > summary:hover { color: var(--vscode-foreground); }
 
 .message.info .body { background: var(--vscode-textBlockQuote-background, rgba(127,127,127,0.12)); }
 
-/* ---- Auto routing ---- */
-.auto-summary {
-	flex: 1 1 auto;
+/* ---- Auto routing ----
+   Two elements share the `auto-summary` class — this one-line toolbar readout in the composer
+   bar, and the "Models used" record closing an Auto run in the transcript — so each rule is
+   scoped to its own. Unscoped, each took the other's styling: the toolbar line grew the
+   record's dashed rule and margins, and the record inherited the toolbar's `flex: 1 1 auto`
+   plus `overflow: hidden`, which in the transcript's flex column let it shrink to its padding
+   — an 8px sliver with the models clipped away — whenever the conversation overflowed. */
+#autoSummary {
+	/* A small basis, not `auto`: the nowrap readout's full width as its basis pushed it onto
+	   a row of its own and the icon buttons onto a third. */
+	flex: 1 1 120px;
 	min-width: 0;
 	font-size: 0.8em;
 	color: var(--vscode-descriptionForeground);
@@ -964,8 +1207,17 @@ details.thinking > summary:hover { color: var(--vscode-foreground); }
 	border-top: 1px dashed var(--vscode-panel-border, rgba(127,127,127,0.3));
 	padding-top: 8px;
 }
-.auto-phase .phase-name { font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; }
-.auto-phase .phase-model { font-family: var(--vscode-editor-font-family, monospace); }
+.auto-phase .phase-name { flex: none; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; }
+/* One line, cut at the end: a long vendor/model id wrapped under the phase name broke the
+   header's single rule into a ragged two-line block. The full id is in the tooltip. */
+.auto-phase .phase-model {
+	min-width: 0;
+	font-family: var(--vscode-editor-font-family, monospace);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.auto-phase .phase-tag { flex: none; }
 .auto-phase .phase-tag {
 	margin-left: auto;
 	font-size: 0.85em; padding: 1px 6px; border-radius: 8px;
@@ -973,7 +1225,8 @@ details.thinking > summary:hover { color: var(--vscode-foreground); }
 }
 
 /* Closing "which models ran" line of an Auto run. */
-.auto-summary {
+#messages > .auto-summary {
+	flex: none;
 	display: flex;
 	flex-wrap: wrap;
 	align-items: center;
@@ -1017,8 +1270,14 @@ details.thinking > summary:hover { color: var(--vscode-foreground); }
 }
 .role-controls .role-model {
 	flex: 1 1 auto; min-width: 0;
+	background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground);
+	border: 1px solid var(--vscode-dropdown-border, transparent); border-radius: 4px; padding: 3px 4px;
+}
+.role-controls .role-model:disabled { opacity: 0.7; }
+.role-model-custom {
+	display: block; width: 100%; box-sizing: border-box; margin-top: 6px;
 	background: var(--vscode-input-background); color: var(--vscode-input-foreground);
-	border: 1px solid var(--vscode-input-border, transparent); border-radius: 4px; padding: 3px 6px;
+	border: 1px solid var(--vscode-focusBorder, var(--vscode-input-border, transparent)); border-radius: 4px; padding: 3px 6px;
 }
 .role-problem {
 	margin-top: 6px; font-size: 0.8em;
@@ -1034,8 +1293,9 @@ details.thinking > summary:hover { color: var(--vscode-foreground); }
 	display: flex;
 	flex-wrap: wrap;
 	gap: 6px;
-	margin: 0 0 4px;
+	margin: 0;
 	align-self: flex-start;
+	max-width: 100%;
 }
 .image-chip {
 	position: relative;
@@ -1050,16 +1310,24 @@ details.thinking > summary:hover { color: var(--vscode-foreground); }
 	object-fit: cover;
 	display: block;
 }
+/* A round remove badge floating on the thumbnail's corner, not a black tab glued to it. */
 .image-chip a {
 	position: absolute;
-	top: 0;
-	right: 0;
-	padding: 0 3px;
-	background: rgba(0, 0, 0, 0.6);
+	top: 3px;
+	right: 3px;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 16px;
+	height: 16px;
+	border-radius: 50%;
+	background: rgba(0, 0, 0, 0.62);
 	color: #fff;
 	text-decoration: none;
-	font-size: 0.75em;
+	opacity: 0.85;
+	transition: opacity 0.12s ease, background-color 0.12s ease;
 }
+.image-chip a:hover { opacity: 1; background: rgba(0, 0, 0, 0.82); }
 .message-images {
 	display: flex;
 	flex-wrap: wrap;
@@ -1118,15 +1386,25 @@ details.thinking > summary:hover { color: var(--vscode-foreground); }
 	color: var(--vscode-descriptionForeground);
 	margin-top: 2px;
 }
+/* Delete shows on the row being pointed at (or focused), so a list of chats reads as a list,
+   not as a column of delete buttons. */
 .history-delete {
 	flex: 0 0 auto;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 24px;
+	height: 24px;
+	padding: 0;
 	background: transparent;
 	border: none;
 	color: var(--vscode-descriptionForeground);
 	cursor: pointer;
-	border-radius: 4px;
-	padding: 2px 6px;
+	border-radius: 6px;
+	opacity: 0;
+	transition: opacity 0.12s ease, background-color 0.12s ease, color 0.12s ease;
 }
+.history-row:hover .history-delete, .history-delete:focus-visible { opacity: 1; }
 .history-delete:hover {
 	background: var(--vscode-toolbar-hoverBackground);
 	color: var(--vscode-errorForeground, #f66);
@@ -1294,12 +1572,17 @@ details.thinking > summary:hover { color: var(--vscode-foreground); }
 
 /* ---- Agent task checklist ---- */
 .todo-panel {
-	margin: 6px 8px 0;
+	margin: 6px 10px 0;
 	padding: 6px 10px;
 	border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.35));
 	border-radius: 6px;
-	font-size: 12px;
+	font-size: 0.92em;
 	background: var(--vscode-editorWidget-background);
+	/* Capped like the PWA's checklist: a long plan scrolls here rather than taking the
+	   transcript's height. */
+	flex: none;
+	max-height: 30vh;
+	overflow-y: auto;
 }
 .todo-panel.hidden { display: none; }
 .todo-title { font-weight: 600; margin-bottom: 4px; opacity: 0.8; }
@@ -1307,3 +1590,265 @@ details.thinking > summary:hover { color: var(--vscode-foreground); }
 .todo-icon { flex: none; }
 .todo-completed { opacity: 0.55; text-decoration: line-through; }
 .todo-in_progress { font-weight: 600; }
+
+/* ---- Remote control: on/off switch and pairing help ---- */
+.remote-toggle {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	margin-left: auto;
+	font-size: 0.85em;
+	cursor: pointer;
+}
+.remote-toggle-input { margin: 0; cursor: pointer; accent-color: var(--vscode-button-background); }
+.remote-pairing-hint {
+	margin: 8px 0;
+	padding: 6px 8px;
+	border-radius: 4px;
+	background: var(--vscode-textBlockQuote-background, rgba(127, 127, 127, 0.1));
+	line-height: 1.45;
+}
+
+/* ---- Scrollbars ----
+   VS Code's default webview stylesheet sets `scrollbar-color` on <html>, which Chromium takes
+   as the signal to ignore every `::-webkit-scrollbar` rule: the result was a square-ended
+   slider over a track painted in the *editor* colour, a lighter band down the side of the
+   sidebar. Handing the properties back to `auto` lets the rules below draw a floating
+   rounded thumb on a transparent track instead. Scrollers that hide their bar outright
+   (the tab strip) still win through their own higher-specificity `scrollbar-width`. */
+* {
+	scrollbar-color: auto;
+	scrollbar-width: auto;
+}
+::-webkit-scrollbar {
+	width: 10px;
+	height: 10px;
+	background: transparent;
+}
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+	background: transparent;
+}
+::-webkit-scrollbar-button {
+	display: none;
+}
+/* The transparent border inset the pill from the edge; `background-clip` keeps the colour
+   off the border so the thumb floats. Hover widens it by thinning the border. */
+::-webkit-scrollbar-thumb {
+	min-height: 32px;
+	border: 3px solid transparent;
+	border-radius: 999px;
+	background-clip: padding-box;
+	background-color: var(--vscode-scrollbarSlider-background, rgba(121, 121, 121, 0.4));
+}
+::-webkit-scrollbar-thumb:hover {
+	border-width: 2px;
+	background-color: var(--vscode-scrollbarSlider-hoverBackground, rgba(100, 100, 100, 0.7));
+}
+::-webkit-scrollbar-thumb:active {
+	background-color: var(--vscode-scrollbarSlider-activeBackground, rgba(191, 191, 191, 0.4));
+}
+
+/* ---- Checkboxes ---- */
+input[type="checkbox"] {
+	accent-color: var(--vscode-button-background);
+}
+
+/* ---- Dropdowns ----
+   A native <select> list is drawn by the OS: a square white-or-grey menu in Windows' own
+   font, ignoring the theme. Chromium's customizable select (`appearance: base-select`, in
+   the Electron this builds on) lets the open list be styled like the rest of the panel — a
+   rounded, shadowed popover in the dropdown colours with hover rows and a checkmark. Engines
+   without it skip this block and keep the native control exactly as before. `#app` lifts
+   these above the per-control rules that set `appearance: none`. */
+@supports (appearance: base-select) {
+	#app select,
+	#app select::picker(select) {
+		appearance: base-select;
+	}
+	#app select {
+		/* The chevron moves from a background image to ::picker-icon, so it can turn over
+		   while the list is open. */
+		display: inline-flex;
+		align-items: center;
+		background-image: none;
+		padding-right: 7px;
+	}
+	/* The author button (main.js's withSelectButton) is the pill's content box: unstyled,
+	   shrinkable, and ellipsizing the mirrored option text. */
+	#app select > button {
+		all: unset;
+		display: flex;
+		flex: 1 1 auto;
+		align-items: center;
+		min-width: 0;
+		overflow: hidden;
+	}
+	#app select selectedcontent {
+		display: block;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	#app select::picker-icon {
+		content: '';
+		flex: none;
+		width: 8px;
+		height: 8px;
+		margin-left: 5px;
+		background-color: currentColor;
+		mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M3 6l5 5 5-5H3z'/></svg>") center / contain no-repeat;
+		opacity: 0.7;
+		transition: rotate 0.15s ease;
+	}
+	#app select:open::picker-icon {
+		rotate: 180deg;
+	}
+	#app select::picker(select) {
+		margin: 4px 0;
+		padding: 4px;
+		max-width: min(420px, calc(100vw - 16px));
+		max-height: min(340px, 70vh);
+		overflow-y: auto;
+		color: var(--vscode-dropdown-foreground, var(--vscode-foreground));
+		background: var(--vscode-dropdown-background, var(--vscode-editorWidget-background));
+		border: 1px solid var(--vscode-dropdown-border, var(--vscode-widget-border, rgba(127, 127, 127, 0.35)));
+		border-radius: 8px;
+		box-shadow: 0 10px 28px -8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.45));
+		opacity: 0;
+		translate: 0 -4px;
+		transition: opacity 0.14s ease-out, translate 0.14s ease-out, overlay 0.14s allow-discrete, display 0.14s allow-discrete;
+	}
+	#app select:open::picker(select) {
+		opacity: 1;
+		translate: 0 0;
+	}
+	@starting-style {
+		#app select:open::picker(select) {
+			opacity: 0;
+			translate: 0 -4px;
+		}
+	}
+	/* Options inherit from their <select>, not from the popover, so the Mode pill's
+	   button-on-blue ink would otherwise carry into its list. */
+	#app select option {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		min-height: 26px;
+		padding: 4px 8px;
+		border-radius: 5px;
+		color: var(--vscode-dropdown-foreground, var(--vscode-foreground));
+		background: transparent;
+		font-weight: 400;
+		white-space: normal;
+		overflow-wrap: anywhere;
+		cursor: pointer;
+	}
+	#app select option:hover {
+		background: var(--vscode-list-hoverBackground, rgba(127, 127, 127, 0.14));
+	}
+	#app select option:focus-visible {
+		outline: 1px solid var(--vscode-focusBorder);
+		outline-offset: -1px;
+	}
+	#app select option:checked {
+		background: color-mix(in srgb, var(--vscode-focusBorder) 18%, transparent);
+	}
+	#app select option:disabled {
+		opacity: 0.5;
+		cursor: default;
+	}
+	#app select option::checkmark {
+		content: '';
+		order: 1;
+		flex: none;
+		width: 12px;
+		height: 12px;
+		margin-left: auto;
+		background-color: var(--vscode-focusBorder);
+		mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M13.3 4.3l-7 7L2.7 7.7l1-1 2.6 2.6 6-6z'/></svg>") center / contain no-repeat;
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	#app select::picker-icon,
+	#app select::picker(select) {
+		transition: none;
+	}
+}
+
+/* ---- Disclosure chevrons ----
+   A tool card's output and a provider card's advanced fields used the browser's default ▶/▼
+   triangles — a text glyph in the body font, a different weight from every other mark here.
+   One drawn chevron that turns when the section opens replaces both. */
+.tool-summary,
+.provider-advanced > summary {
+	list-style: none;
+	display: flex;
+	align-items: center;
+	gap: 4px;
+}
+.tool-summary::-webkit-details-marker,
+.provider-advanced > summary::-webkit-details-marker {
+	display: none;
+}
+.tool-summary::before,
+.provider-advanced > summary::before {
+	content: '';
+	flex: none;
+	width: 10px;
+	height: 10px;
+	background-color: currentColor;
+	mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M6 3l5 5-5 5-1-1 4-4-4-4z'/></svg>") center / contain no-repeat;
+	opacity: 0.75;
+	transition: rotate 0.15s ease;
+}
+details[open] > .tool-summary::before,
+.provider-advanced[open] > summary::before {
+	rotate: 90deg;
+}
+@media (prefers-reduced-motion: reduce) {
+	.tool-summary::before,
+	.provider-advanced > summary::before {
+		transition: none;
+	}
+}
+
+/* ---- Jump to latest ----
+   Shown while the reader has scrolled up and output is arriving below (main.js's
+   `followOutput`): the transcript no longer drags them down on every token, so this is how
+   they get back. Anchored to #composer, like the slash menu, so it floats over the foot of
+   the transcript without taking layout space. */
+.jump-latest {
+	position: absolute;
+	bottom: calc(100% + 6px);
+	left: 50%;
+	translate: -50% 0;
+	z-index: 5;
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	height: 26px;
+	padding: 0 12px 0 9px;
+	font-family: inherit;
+	font-size: 0.82em;
+	color: var(--vscode-foreground);
+	background: var(--vscode-editorWidget-background, var(--vscode-dropdown-background));
+	border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border, rgba(127, 127, 127, 0.35)));
+	border-radius: 999px;
+	box-shadow: 0 6px 16px -6px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.45));
+	cursor: pointer;
+	animation: jump-in 0.16s ease-out;
+}
+.jump-latest:hover {
+	background: var(--vscode-list-hoverBackground, var(--vscode-editorWidget-background));
+}
+@keyframes jump-in {
+	from { opacity: 0; translate: -50% 4px; }
+	to { opacity: 1; translate: -50% 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+	.jump-latest { animation: none; }
+}

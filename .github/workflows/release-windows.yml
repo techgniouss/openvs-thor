@@ -1,8 +1,16 @@
 name: Release Windows build
 
-# Builds the Windows x64 installer (OpenVSSetup-x64-<version>.exe) and attaches it to
-# a published GitHub Release. There is no other CI in this fork — see README.md,
-# "Continuous integration" — the microsoft/vscode Azure Pipelines definitions under
+# Builds the Windows x64 installers - OpenVSSetup-x64-<version>.exe (system-wide, admin)
+# and OpenVSUserSetup-x64-<version>.exe (per-user, no admin) - and attaches them to a
+# published GitHub Release. Installed builds poll this repository's latest release and
+# update themselves from those assets (src/vs/platform/update/common/githubReleases.ts),
+# matched by exact file name and by the release tag's version, so:
+#   - tag releases as a v-prefixed version (v1.128.0), higher than the last one - the app
+#     finds a version's release notes at tag v<version>;
+#   - the build is stamped with the tag's version (not package.json's), because that is
+#     what an installed build compares the next release against. A build stamped with a
+#     stale version would see its own release as newer and reinstall it every hour.
+# There is no other CI in this fork — see README.md, "Continuous integration" — the microsoft/vscode Azure Pipelines definitions under
 # build/azure-pipelines/ target Microsoft's own self-hosted infra and cannot run here.
 # This workflow is independent of those and only builds+packages, no signing/telemetry/CG.
 on:
@@ -31,10 +39,6 @@ jobs:
       npm_config_foreground_scripts: 'true'
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # extensions/copilot is neither compiled nor packaged by this build - see
-      # build/npm/dirs.ts. Skipping its ~1.3GB install saves several minutes and
-      # removes the largest batch of unsigned native prebuilds from the runner.
-      VSCODE_SKIP_COPILOT_EXTENSION_INSTALL: '1'
     steps:
       - name: Exclude build workspace from Windows Defender
         # GH-hosted windows-latest runners' real-time AV has been observed quarantining
@@ -51,8 +55,28 @@ jobs:
           Add-MpPreference -ExclusionProcess "node.exe" -ErrorAction SilentlyContinue
           Write-Host "Excluded $parent from Windows Defender real-time scanning"
 
+      - name: Validate release tag
+        # Fail in seconds rather than after an hour of building. Tagless manual runs keep
+        # package.json's version.
+        id: release
+        if: github.event_name == 'release' || inputs.upload_to_release != ''
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.upload_to_release }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not ($env:RELEASE_TAG -match '^v(\d+\.\d+\.\d+)$')) {
+            throw "Release tag '$env:RELEASE_TAG' is not a version tag (expected v1.2.3). Installed builds update to, and read release notes from, v-prefixed version tags."
+          }
+          echo "tag=$env:RELEASE_TAG" >> $env:GITHUB_OUTPUT
+          echo "version=$($Matches[1])" >> $env:GITHUB_OUTPUT
+
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # A manual run that uploads to a release must build that release's tag, not
+          # whichever branch the run was started from.
+          ref: ${{ steps.release.outputs.tag }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -101,38 +125,58 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Stamp release version
+        # After `npm ci`, which checks package.json against the lockfile.
+        if: steps.release.outputs.version != ''
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:RELEASE_VERSION
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.version=process.argv[1];fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')" $version
+          Write-Host "Building as version $version"
+
       - name: Build client (compile, mangle, minify, package)
         run: npm run gulp vscode-win32-x64-min
 
       - name: Patch inno updater icon
         run: npm run gulp vscode-win32-x64-inno-updater
 
-      - name: Build installer (Inno Setup)
+      - name: Build system installer (Inno Setup)
         run: npm run gulp vscode-win32-x64-system-setup
 
-      - name: Collect installer
+      - name: Build user installer (Inno Setup)
+        # The per-user install is the one that updates silently in the background; the
+        # system-wide one needs a UAC prompt to apply each update.
+        run: npm run gulp vscode-win32-x64-user-setup
+
+      - name: Collect installers
         id: collect
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $version = (node -p "require('./package.json').version")
-          $src = ".build\win32-x64\system-setup\OpenVSSetup.exe"
-          if (-not (Test-Path $src)) {
-            throw "Installer not found at $src - build did not produce an exe"
+          New-Item -ItemType Directory -Force -Path out\setup | Out-Null
+          # Names must match gitHubAssetName() in updateService.win32.ts exactly.
+          $installers = @(
+            @{ Src = ".build\win32-x64\system-setup\OpenVSSetup.exe"; Dest = "out\setup\OpenVSSetup-x64-$version.exe" },
+            @{ Src = ".build\win32-x64\user-setup\OpenVSSetup.exe"; Dest = "out\setup\OpenVSUserSetup-x64-$version.exe" }
+          )
+          foreach ($i in $installers) {
+            if (-not (Test-Path $i.Src)) {
+              throw "Installer not found at $($i.Src) - build did not produce an exe"
+            }
+            Move-Item -Force $i.Src $i.Dest
+            Get-Item $i.Dest | Select-Object Name, Length
           }
-          New-Item -ItemType Directory -Force -Path out\system-setup | Out-Null
-          $dest = "out\system-setup\OpenVSSetup-x64-$version.exe"
-          Move-Item -Force $src $dest
-          Write-Host "Installer: $dest"
-          Get-Item $dest | Select-Object Name, Length
-          echo "exe_path=$dest" >> $env:GITHUB_OUTPUT
           echo "version=$version" >> $env:GITHUB_OUTPUT
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
         with:
           name: OpenVSSetup-x64-${{ steps.collect.outputs.version }}
-          path: ${{ steps.collect.outputs.exe_path }}
+          path: out/setup/*.exe
           retention-days: 14
 
       - name: Upload to GitHub Release
@@ -142,5 +186,5 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = "Stop"
-          $tag = "${{ github.event_name == 'release' && github.event.release.tag_name || inputs.upload_to_release }}"
-          gh release upload $tag "${{ steps.collect.outputs.exe_path }}" --clobber
+          $tag = "${{ steps.release.outputs.tag }}"
+          gh release upload $tag (Get-ChildItem out\setup\*.exe).FullName --clobber

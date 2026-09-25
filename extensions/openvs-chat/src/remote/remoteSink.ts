@@ -25,6 +25,9 @@ import { RemoteSocket } from './socket';
 const REMOTE_TRUNCATE_BYTES = 8 * 1024;
 const TRUNCATION_SUFFIX = '\n… [truncated for remote]';
 
+/** What a remote device sees in place of an editor action's prompt — see `TranscriptEntry.fromEditor`. */
+const EDITOR_TURN_PLACEHOLDER = 'Editor action on the desktop (the selected code stays on the desktop).';
+
 /** Push notification bodies stay short — see `composePush`'s `error` case. */
 const PUSH_BODY_TRUNCATE_CHARS = 120;
 
@@ -128,6 +131,32 @@ export function redactForRemote(message: Record<string, unknown> & { type: strin
 		if (typeof value === 'string') {
 			clone[field] = truncateUtf8(value, REMOTE_TRUNCATE_BYTES) + (Buffer.byteLength(value, 'utf8') > REMOTE_TRUNCATE_BYTES ? TRUNCATION_SUFFIX : '');
 		}
+	}
+	// A `userTurn` carries the turn's attached images as base64 — hundreds of KB each, which a
+	// phone that only needs to show "1 image" would otherwise download over cellular on every
+	// message. The count is all a remote transcript renders.
+	if (Array.isArray(clone.images)) {
+		clone.imageCount = clone.images.length;
+		delete clone.images;
+	}
+	// An editor action's prompt embeds the desktop's selected code (the `inline` message that
+	// carries it is already local-only); a phone sees that the action happened, not the code.
+	if (message.type === 'userTurn' && clone.fromEditor === true) {
+		clone.content = EDITOR_TURN_PLACEHOLDER;
+	}
+	// Same for a transcript's entries: `SessionStore.windowedMessages` budgets a window by the
+	// bytes of `content` alone, so a catch-up whose tail held a few screenshots shipped
+	// megabytes past the 48KB it was sized to — the slow first paint after every reconnect.
+	if (message.type === 'transcript' && Array.isArray(clone.messages)) {
+		clone.messages = clone.messages.map(entry => {
+			if (typeof entry !== 'object' || entry === null || !Array.isArray((entry as { images?: unknown }).images)) {
+				return entry;
+			}
+			const { images, ...rest } = entry as { images: unknown[] };
+			return { ...rest, imageCount: images.length };
+		}).map(entry => (typeof entry === 'object' && entry !== null && (entry as { fromEditor?: unknown }).fromEditor === true)
+			? { ...(entry as object), content: EDITOR_TURN_PLACEHOLDER }
+			: entry);
 	}
 	if (typeof clone.baseUrl === 'string') {
 		clone.baseUrl = hostnameOnly(clone.baseUrl);

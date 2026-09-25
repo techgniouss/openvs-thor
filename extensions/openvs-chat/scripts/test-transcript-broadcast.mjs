@@ -42,8 +42,13 @@ const host = fs.readFileSync(new URL('../src/chatViewProvider.ts', import.meta.u
 // for a non-local origin — both properties, together, are what keep a remote client's own
 // resync from receiving the full transcript now that postTranscript's default is unwindowed.
 {
-	const block = /case 'sync': \{[\s\S]*?\n\t\t\t\}/.exec(host)?.[0] ?? '';
-	assert.ok(block, 'expected to find the sync case body');
+	const syncCase = /case 'sync': \{[\s\S]*?\n\t\t\t\}/.exec(host)?.[0] ?? '';
+	assert.ok(syncCase, 'expected to find the sync case body');
+	// The reply is built by postSyncTo (shared with a refused queue drain's resync); judge the
+	// case together with that helper's body, which is where the reply now lives.
+	assert.match(syncCase, /this\.postSyncTo\(origin,/, 'case \'sync\' replies through postSyncTo, to origin');
+	const helper = /private postSyncTo\([\s\S]*?\n\t\}/.exec(host)?.[0] ?? '';
+	const block = syncCase + helper;
 	assert.ok(!/this\.postTranscript\(/.test(block),
 		'case \'sync\' must not call the broadcasting postTranscript — it must reply via bus.postTo');
 	assert.match(block, /this\.bus\.postTo\(origin,\s*\{\s*type:\s*'transcript'/,

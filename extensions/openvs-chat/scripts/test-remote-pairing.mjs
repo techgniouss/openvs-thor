@@ -14,10 +14,11 @@ import assert from 'node:assert/strict';
 import { revokeDevice } from '../out/remote/pairing.js';
 
 /** A minimal fake RemoteSocket: records every `sendControl` call and lets the test feed envelopes into `onMessage` subscribers on demand. */
-function fakeSocket() {
+function fakeSocket(status = 'connected') {
 	const handlers = new Set();
 	const sent = [];
 	return {
+		getStatus() { return status; },
 		sendControl(frame) { sent.push(frame); },
 		onMessage(handler) {
 			handlers.add(handler);
@@ -92,6 +93,20 @@ function fakeSocket() {
 	assert.doesNotThrow(() => {
 		socket.feed({ v: 1, t: 'c', seq: 2, p: { c: 'revoked', deviceId: 'device-dup' } });
 	}, 'a duplicate ack after resolution is a harmless no-op, not a crash');
+}
+
+// 5. Not connected: nothing can be sent (sendControl is a no-op on a closed socket), so the call
+// fails at once instead of reporting, ten seconds later, a revoke that never left the machine.
+// A confirmed revoke resolves true, which is what lets the desktop tell the user it worked.
+{
+	const offline = fakeSocket('disconnected');
+	await assert.rejects(revokeDevice(offline, 'device-off'), /not connected/);
+	assert.deepStrictEqual(offline.sent, []);
+
+	const online = fakeSocket();
+	const done = revokeDevice(online, 'device-on');
+	online.feed({ v: 1, t: 'c', seq: 1, p: { c: 'revoked', deviceId: 'device-on' } });
+	assert.strictEqual(await done, true);
 }
 
 console.log('test-remote-pairing: all assertions passed');

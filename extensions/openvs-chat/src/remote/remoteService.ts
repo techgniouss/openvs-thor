@@ -10,6 +10,7 @@ import {
 	getWorkspaceKey, isRemoteEnabled,
 } from './config';
 import { DeviceInfo, fetchDevices, shouldDisconnectForIdle, shouldRevokeForTokenAge } from './devices';
+import { getRelayMode, LocalHosting } from './local/localHosting';
 import { buildPairingUrl, PairingResult, requestPairing, revokeDevice } from './pairing';
 import { isRemoteAllowed } from './policy';
 import { Envelope, isControlFrame } from './protocol';
@@ -34,10 +35,15 @@ const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
  * connection to a relay. Constructed in `extension.ts` beside `McpManager`, and — per the
  * plan's own framing of the choice — **owns the reference to {@link ChatViewProvider}, not the
  * other way around**: remote control is optional (off unless `openvsChat.remote.enabled` is
- * set and a relay URL is configured), the chat panel is not, and `ChatViewProvider` is already
+ * set), the chat panel is not, and `ChatViewProvider` is already
  * this extension's largest file. `ChatViewProvider` exposes a small public seam
  * (`attachRemoteSink`/`detachRemoteSink`/`dispatchRemoteMessage`/`postToSink`/
  * `getSessionStore`) instead of growing a dependency on the transport layer itself.
+ *
+ * Two ways to reach a relay (`openvsChat.remote.relayMode`): *hosted* dials the Cloudflare
+ * Worker at `relayUrl`; *local* runs the relay inside this extension (`local/relayServer.ts`),
+ * dials it on loopback, and publishes it through Cloudflare Tunnel (`local/tunnel.ts`) for the
+ * phone — see {@link LocalHosting}.
  *
  * Watches `openvsChat.remote.enabled`/`relayUrl` and starts or stops the connection to match —
  * so flipping the setting (including via the `openvsChat.remoteEnable` command) takes effect
@@ -66,6 +72,15 @@ export class RemoteService implements vscode.Disposable {
 	 * activity has been recorded yet.
 	 */
 	private lastHostActivityAt = Date.now();
+	/** Set while running in local-hosting mode (`openvsChat.remote.relayMode`): the relay and tunnel this machine runs itself. */
+	private local?: LocalHosting;
+	/**
+	 * Whether the next {@link start} may install `cloudflared` without asking — true only right
+	 * after the user turned remote on themselves (see {@link enableRequested}).
+	 */
+	private installConsent = false;
+	/** Guards {@link start} against overlapping calls. */
+	private starting = false;
 
 	constructor(
 		private readonly context: vscode.ExtensionContext,
@@ -74,6 +89,10 @@ export class RemoteService implements vscode.Disposable {
 		this.configListener = vscode.workspace.onDidChangeConfiguration(e => {
 			if (e.affectsConfiguration('openvsChat.remote.enabled') || e.affectsConfiguration('openvsChat.remote.relayUrl')) {
 				void this.sync();
+			} else if (['relayMode', 'tunnelHostname', 'localPort', 'cloudflaredPath'].some(key => e.affectsConfiguration(`openvsChat.remote.${key}`))) {
+				// How the relay is hosted changed: rebuild the connection (or start one, when the
+				// switch to local hosting is what makes it runnable at all).
+				this.restart();
 			}
 		});
 		// Registered once, for the service's whole lifetime — not per connection — so a resume
@@ -91,7 +110,7 @@ export class RemoteService implements vscode.Disposable {
 	 */
 	private onLocalActivity(): void {
 		this.lastHostActivityAt = Date.now();
-		if (!this.socket && isRemoteEnabled() && getRelayUrl()) {
+		if (!this.socket && this.canRun()) {
 			void this.start();
 		}
 	}
@@ -105,8 +124,49 @@ export class RemoteService implements vscode.Disposable {
 		if (!this.socket || !this.relayUrl || !this.publicRoomId) {
 			throw new Error('Remote control is not connected yet. Enable it (openvsChat.remoteEnable) and wait for a connection first.');
 		}
-		const { code, expiresAt } = await requestPairing(this.socket);
-		return { code, expiresAt, url: buildPairingUrl(this.relayUrl, this.publicRoomId, code) };
+		const socket = this.socket;
+		const publicRoomId = this.publicRoomId;
+		// Local hosting: the host talks to the relay on loopback, but the phone needs the
+		// tunnel's public address — wait for the tunnel if it's still coming up.
+		const base = this.local ? await this.local.publicUrl() : this.relayUrl;
+		const { code, expiresAt } = await requestPairing(socket);
+		return { code, expiresAt, url: buildPairingUrl(base, publicRoomId, code), hint: this.pairingHint() };
+	}
+
+	/**
+	 * Help for when the pairing link won't open on the phone. Only quick tunnels need it: their
+	 * trycloudflare.com addresses are refused by some ISPs' DNS (Reliance Jio among them), and
+	 * the phone itself just says "site can't be reached" with no reason given.
+	 */
+	private pairingHint(): string | undefined {
+		if (!this.local?.quickTunnel) {
+			return undefined;
+		}
+		const fix = 'On the phone, set Private DNS to one.one.one.one (Android: Settings → Network & internet → Private DNS; '
+			+ 'iPhone: install Cloudflare’s 1.1.1.1 app), then scan again — or run "OpenVS Thor: Remote: Use My Cloudflare Tunnel" '
+			+ 'for your own address that isn’t blocked and never changes.';
+		return this.local.dnsBlocked
+			? `This network blocks Cloudflare quick-tunnel addresses, so the link probably won’t open on a phone on the same Wi-Fi or carrier. ${fix}`
+			: `Link won’t open on your phone? Some networks and carriers block Cloudflare quick-tunnel addresses (*.trycloudflare.com). ${fix}`;
+	}
+
+	/**
+	 * Called by `openvsChat.remoteEnable` right before it turns the setting on: the user asked
+	 * for remote, so local hosting may install `cloudflared` without a second prompt.
+	 */
+	enableRequested(): void {
+		this.installConsent = true;
+	}
+
+	/** Whether settings allow a connection: enabled, and either local hosting or a relay URL to dial. */
+	private canRun(): boolean {
+		return isRemoteEnabled() && (getRelayMode() === 'local' || !!getRelayUrl());
+	}
+
+	/** Tears the connection down and starts it again with the current settings. */
+	private restart(): void {
+		this.stop();
+		void this.sync();
 	}
 
 	/** Human-readable connection status — `openvsChat.remoteStatus`'s implementation. */
@@ -114,10 +174,11 @@ export class RemoteService implements vscode.Disposable {
 		if (!isRemoteEnabled()) {
 			return 'disabled';
 		}
-		if (!getRelayUrl()) {
+		if (getRelayMode() === 'hosted' && !getRelayUrl()) {
 			return 'enabled, but no relay URL is configured (set openvsChat.remote.relayUrl)';
 		}
-		return this.socket?.getStatus() ?? 'not connected';
+		const connection = this.socket?.getStatus() ?? 'not connected';
+		return this.local ? `${connection} — ${this.local.status()}` : connection;
 	}
 
 	dispose(): void {
@@ -128,7 +189,7 @@ export class RemoteService implements vscode.Disposable {
 
 	/** Starts or stops the relay connection to match current settings. Idempotent — safe to call whenever settings might have changed. */
 	private async sync(): Promise<void> {
-		const shouldRun = isRemoteEnabled() && !!getRelayUrl();
+		const shouldRun = this.canRun();
 		if (shouldRun && !this.socket) {
 			await this.start();
 		} else if (!shouldRun && this.socket) {
@@ -137,7 +198,20 @@ export class RemoteService implements vscode.Disposable {
 	}
 
 	private async start(): Promise<void> {
-		const relayUrl = getRelayUrl();
+		// Settings changes and local activity can both ask for a start while one is still
+		// awaiting the local relay; a second would race it for the relay's port.
+		if (this.starting) {
+			return;
+		}
+		this.starting = true;
+		try {
+			await this.startConnection();
+		} finally {
+			this.starting = false;
+		}
+	}
+
+	private async startConnection(): Promise<void> {
 		const workspaceKey = getWorkspaceKey();
 		if (!workspaceKey) {
 			vscode.window.showWarningMessage('OpenVS remote control needs an open folder or workspace to pair a room to — open one first.');
@@ -146,7 +220,42 @@ export class RemoteService implements vscode.Disposable {
 		const roomSecret = await getOrCreateRoomSecret(this.context, workspaceKey);
 		const publicRoomId = derivePublicRoomId(roomSecret);
 		const hostToken = deriveHostToken(roomSecret);
+		let relayUrl = getRelayUrl();
+		if (getRelayMode() === 'local') {
+			const local = new LocalHosting(this.context, () => {
+				void vscode.window.showWarningMessage(
+					'The OpenVS Remote public address changed (the Cloudflare quick tunnel restarted), so paired phones need to pair again. Set up a named tunnel ("OpenVS Thor: Remote: Use My Cloudflare Tunnel") for an address that never changes.',
+					'Pair a Device').then(choice => {
+					if (choice) {
+						void vscode.commands.executeCommand('openvsChat.openSettings');
+					}
+				});
+			});
+			const askFirst = !this.installConsent;
+			this.installConsent = false;
+			try {
+				await local.start(publicRoomId, hostToken, askFirst);
+			} catch (err) {
+				local.dispose();
+				void vscode.window.showErrorMessage(`OpenVS Remote couldn't start its local relay: ${err instanceof Error ? err.message : String(err)}`);
+				return;
+			}
+			if (this.socket || !this.canRun()) {
+				// Settings flipped while the relay was starting: either another start won, or
+				// remote control was turned off — which must not be answered by connecting anyway.
+				local.dispose();
+				return;
+			}
+			this.local = local;
+			relayUrl = local.localUrl;
+			local.publicUrl().catch(err => {
+				void vscode.window.showErrorMessage(err instanceof Error ? err.message : String(err));
+			});
+		}
 
+		if (!this.canRun()) {
+			return; // turned off while the room secret was being read
+		}
 		const socket = new RemoteSocket({ relayUrl, publicRoomId, hostToken });
 		const sink = new RemoteSink(REMOTE_SINK_ID, socket);
 		this.socket = socket;
@@ -197,6 +306,8 @@ export class RemoteService implements vscode.Disposable {
 		this.hostToken = undefined;
 		this.view.setPairingHandler(undefined);
 		this.view.setDevicesHandler(undefined);
+		this.local?.dispose();
+		this.local = undefined;
 	}
 
 	private stop(): void {
@@ -309,7 +420,12 @@ export class RemoteService implements vscode.Disposable {
 		const { deviceId, name } = envelope.p;
 		void vscode.window.showInformationMessage(`${name} connected`, 'Revoke').then(choice => {
 			if (choice === 'Revoke' && this.socket) {
-				void revokeDevice(this.socket, deviceId);
+				// Someone revoking a device they did not expect to see needs to know it worked.
+				revokeDevice(this.socket, deviceId).then(
+					confirmed => confirmed
+						? vscode.window.showInformationMessage(`${name} was revoked.`)
+						: vscode.window.showWarningMessage(`The relay did not confirm revoking ${name}. Check the device list in OpenVS Chat settings.`),
+					err => vscode.window.showErrorMessage(err instanceof Error ? err.message : String(err)));
 			}
 		});
 	}
@@ -348,7 +464,8 @@ export class RemoteService implements vscode.Disposable {
 			}
 			if (shouldRevokeForTokenAge(device.createdAt, deviceTokenDays, now)) {
 				console.log(`OpenVS remote: revoking device "${device.name}" (${device.id}) — its token is older than ${deviceTokenDays}d.`);
-				void revokeDevice(socket, device.id);
+				// The next sweep retries whatever this one could not revoke.
+				revokeDevice(socket, device.id).catch(err => console.warn(`OpenVS remote: could not revoke "${device.name}".`, err));
 			}
 		}
 	}

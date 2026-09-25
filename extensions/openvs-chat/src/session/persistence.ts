@@ -49,10 +49,20 @@ export function messagesForState(
 		} else {
 			const count = m.images.length;
 			const note = `\n\n_[${count} image${count === 1 ? '' : 's'} not kept after reload]_`;
-			out.push({ role: m.role, content: (m.content || '') + note, kind: m.kind });
+			out.push({ ...withoutImages(m), content: (m.content || '') + note });
 		}
 	}
 	return out.reverse();
+}
+
+/**
+ * `entry` minus its image data, every other field intact. Entries used to be rebuilt from a
+ * hand-picked field list, so each field added to {@link TranscriptEntry} since (`fromEditor`,
+ * `fromAgentSession`, …) was silently dropped wherever an image was.
+ */
+export function withoutImages(entry: TranscriptEntry): TranscriptEntry {
+	const { images: _images, ...rest } = entry;
+	return rest;
 }
 
 /** One session's persisted shape — a {@link SessionState} minus its live-run fields. */
@@ -122,6 +132,29 @@ export function buildPersistedState(
 /** Persists `state` under {@link PERSISTENCE_KEY}. */
 export function saveState(memento: SessionMemento, state: PersistedState): Thenable<void> {
 	return memento.update(PERSISTENCE_KEY, state);
+}
+
+/**
+ * The live tabs a saved payload describes, as {@link SessionState}s ready for
+ * `SessionStore.hydrate`. A run cannot survive the extension host restarting, so every tab
+ * comes back idle — no stream, no pending prompt, no checklist — with its transcript, queue and
+ * compaction state intact.
+ */
+export function restoredSessions(saved: PersistedState | undefined): SessionState[] {
+	return (saved?.sessions ?? []).map(s => ({
+		id: s.id,
+		title: s.title,
+		messages: [...(s.messages ?? [])],
+		queue: [...(s.queue ?? [])],
+		compactSummary: s.compactSummary,
+		compactedUpTo: s.compactedUpTo,
+		mode: s.mode,
+		provider: s.provider,
+		model: s.model,
+		streaming: false,
+		pending: null,
+		todos: [],
+	}));
 }
 
 /** Reads back a previously {@link saveState}d payload, or `undefined` if none was ever saved. */

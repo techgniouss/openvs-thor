@@ -31,6 +31,8 @@
 	"linuxIconName": "openvs",
 	"licenseFileName": "LICENSE.txt",
 	"reportIssueUrl": "https://github.com/techgniouss/openvs/issues/new",
+	"updateUrl": "https://github.com/techgniouss/openvs-thor",
+	"releaseNotesUrl": "https://github.com/techgniouss/openvs-thor/releases",
 	"nodejsArtifactFeed": "",
 	"electronArtifactFeed": "",
 	"urlProtocol": "openvs",
