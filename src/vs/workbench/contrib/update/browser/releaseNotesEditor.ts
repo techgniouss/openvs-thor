@@ -19,7 +19,8 @@ import { IEnvironmentService } from '../../../../platform/environment/common/env
 import { IKeybindingService } from '../../../../platform/keybinding/common/keybinding.js';
 import { IOpenerService } from '../../../../platform/opener/common/opener.js';
 import { IProductService } from '../../../../platform/product/common/productService.js';
-import { asTextOrError, IRequestService } from '../../../../platform/request/common/request.js';
+import { asJson, asTextOrError, IRequestService } from '../../../../platform/request/common/request.js';
+import { gitHubReleaseByVersionUrl, gitHubReleaseNotesMarkdown, IGitHubRelease, parseGitHubReleasesRepo } from '../../../../platform/update/common/githubReleases.js';
 import { DEFAULT_MARKDOWN_STYLES, renderMarkdownDocument } from '../../markdown/browser/markdownDocumentRenderer.js';
 import { WebviewInput } from '../../webviewPanel/browser/webviewEditorInput.js';
 import { IWebviewWorkbenchService } from '../../webviewPanel/browser/webviewWorkbenchService.js';
@@ -87,6 +88,10 @@ export class ReleaseNotesManager extends Disposable {
 				return dirname(currentFileUri);
 			}
 		}
+		const gitHubRepo = parseGitHubReleasesRepo(this._productService.updateUrl);
+		if (gitHubRepo) {
+			return URI.parse(`https://github.com/${gitHubRepo}/releases/`);
+		}
 		return URI.parse('https://code.visualstudio.com/raw');
 	}
 
@@ -153,9 +158,13 @@ export class ReleaseNotesManager extends Disposable {
 			throw new Error('not found');
 		}
 
+		// A product updating from GitHub Releases has its notes on each release. Microsoft's
+		// notes must never stand in for them: this fork shares VS Code's version numbers, so
+		// `v1_128.md` exists there and would be shown as this product's release notes.
+		const gitHubRepo = parseGitHubReleasesRepo(this._productService.updateUrl);
 		const versionLabel = match[1].replace(/\./g, '_');
 		const baseUrl = 'https://code.visualstudio.com/raw';
-		const url = `${baseUrl}/v${versionLabel}.md`;
+		const url = gitHubRepo ? gitHubReleaseByVersionUrl(gitHubRepo, version) : `${baseUrl}/v${versionLabel}.md`;
 		const unassigned = nls.localize('unassigned', "unassigned");
 
 		const escapeMdHtml = (text: string): string => {
@@ -212,6 +221,9 @@ export class ReleaseNotesManager extends Disposable {
 				if (useCurrentFile) {
 					const file = this._codeEditorService.getActiveCodeEditor()?.getModel()?.getValue();
 					text = file ? file.substring(file.indexOf('#')) : undefined;
+				} else if (gitHubRepo) {
+					const release = await asJson<IGitHubRelease>(await this._requestService.request({ url, headers: { 'Accept': 'application/vnd.github+json' }, callSite: 'releaseNotesEditor.fetchReleaseNotes' }, CancellationToken.None));
+					text = release ? gitHubReleaseNotesMarkdown(release, version, nls.localize('releaseNotesEmpty', "No release notes were published for this version.")) : undefined;
 				} else {
 					text = await asTextOrError(await this._requestService.request({ url, callSite: 'releaseNotesEditor.fetchReleaseNotes' }, CancellationToken.None));
 				}

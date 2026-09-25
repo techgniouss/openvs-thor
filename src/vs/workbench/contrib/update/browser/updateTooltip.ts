@@ -371,7 +371,8 @@ export class UpdateTooltip extends Disposable {
 		// Latest version
 		const version = update?.productVersion;
 		if (version) {
-			const updateCommitId = update.version?.substring(0, 7);
+			// A GitHub Releases update has no build commit; its `version` is the product version.
+			const updateCommitId = update.version && update.version !== version ? update.version.substring(0, 7) : undefined;
 			this.latestVersionNode.textContent = updateCommitId
 				? localize('updateTooltip.latestVersionLabelWithCommit', "Latest Version: {0} ({1})", version, updateCommitId)
 				: localize('updateTooltip.latestVersionLabel', "Latest Version: {0}", version);

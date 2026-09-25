@@ -20,6 +20,7 @@ import { StorageScope, StorageTarget } from '../../storage/common/storage.js';
 import { IApplicationStorageMainService } from '../../storage/electron-main/storageMainService.js';
 import { ITelemetryService } from '../../telemetry/common/telemetry.js';
 import { AvailableForDownload, DisablementReason, IUpdateService, State, StateType, UpdateType } from '../common/update.js';
+import { parseGitHubReleasesRepo } from '../common/githubReleases.js';
 
 const LAST_KNOWN_VERSION_STORAGE_KEY = 'abstractUpdateService/lastKnownVersion';
 
@@ -160,6 +161,12 @@ export abstract class AbstractUpdateService implements IUpdateService {
 			return;
 		}
 
+		if (parseGitHubReleasesRepo(this.productService.updateUrl) && !this.supportsGitHubReleases()) {
+			this.setState(State.Disabled(DisablementReason.MissingConfiguration));
+			this.logService.info('update#ctor - updates are disabled as this platform cannot install from GitHub Releases');
+			return;
+		}
+
 		const updateMode = this.configurationService.getValue<'none' | 'manual' | 'start' | 'default'>('update.mode');
 		const updateModeInspection = this.configurationService.inspect<'none' | 'manual' | 'start' | 'default'>('update.mode');
 		const policyDisablesUpdates = updateModeInspection.policyValue !== undefined && !this.getProductQuality(updateModeInspection.policyValue);
@@ -273,7 +280,13 @@ export abstract class AbstractUpdateService implements IUpdateService {
 	}
 
 	private getProductQuality(updateMode: string): string | undefined {
-		return updateMode === 'none' ? undefined : this.productService.quality;
+		if (updateMode === 'none') {
+			return undefined;
+		}
+		// A GitHub Releases feed has no quality channels, and product.json in this fork carries
+		// no `quality` (setting one switches on Microsoft-only packaging in the build). Use the
+		// build's own default so updates aren't reported as disabled by the user.
+		return this.productService.quality ?? (parseGitHubReleasesRepo(this.productService.updateUrl) ? 'dev' : undefined);
 	}
 
 	private scheduleCheckForUpdates(delay = 60 * 60 * 1000): Promise<void> {
@@ -464,6 +477,15 @@ export abstract class AbstractUpdateService implements IUpdateService {
 
 	protected getUpdateType(): UpdateType {
 		return UpdateType.Archive;
+	}
+
+	/**
+	 * Whether this platform's service can check and install from a GitHub Releases
+	 * `updateUrl` (see `githubReleases.ts`). Others disable updates rather than sending
+	 * update-server requests to github.com.
+	 */
+	protected supportsGitHubReleases(): boolean {
+		return false;
 	}
 
 	protected doQuitAndInstall(): void {
