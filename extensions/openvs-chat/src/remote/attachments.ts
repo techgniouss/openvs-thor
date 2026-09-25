@@ -82,7 +82,7 @@ function decodedLength(base64: string): number {
  * stored with the image and re-sent on every later request, and a provider refuses an image
  * whose data does not match its stated type, so a wrong label broke that session for good.
  */
-function sniffImageType(data: string): string | undefined {
+export function sniffImageType(data: string): string | undefined {
 	const head = Buffer.from(data.slice(0, 24), 'base64');
 	if (head.length >= 3 && head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) {
 		return 'image/jpeg';
@@ -217,4 +217,68 @@ export class UploadAssembler {
 		this.sessionBytes.set(upload.sessionId, Math.max(0, remaining));
 		this.uploads.delete(uploadId);
 	}
+}
+
+// ---- Desktop "Attach image" dialog ----------------------------------------------------------
+
+/**
+ * Files one pick of the desktop's "Attach image" dialog hands the webview, and the largest one
+ * read. The webview downscales every image before it is sent (1568px long edge, re-encoded), so
+ * the byte cap only bounds what crosses `postMessage` as base64 on the way there — a camera
+ * photo is well under it; a 100MB TIFF renamed .png is not read at all.
+ */
+export const MAX_PICK_FILES = 5;
+export const MAX_PICK_BYTES = 20 * 1024 * 1024;
+
+/** One image the dialog returned, read and typed by its leading bytes. */
+export interface PickedImage {
+	readonly name: string;
+	readonly mimeType: string;
+	readonly data: string;
+}
+
+/**
+ * The two reads {@link readPickedImages} makes — `vscode.workspace.fs`'s own shape, narrowed so
+ * this module stays free of `vscode` and the logic can be tested against an in-memory reader.
+ */
+export interface ImageFileReader<U extends { readonly path: string }> {
+	stat(uri: U): PromiseLike<{ readonly size: number }>;
+	readFile(uri: U): PromiseLike<Uint8Array>;
+}
+
+/**
+ * Reads the files a pick returned: at most {@link MAX_PICK_FILES}, none over
+ * {@link MAX_PICK_BYTES}, each typed by its bytes (`sniffImageType` — the same check a phone's
+ * upload gets) rather than its extension. Every file left out is named in `skipped` with the
+ * reason, so the user is told rather than seeing fewer thumbnails than they chose.
+ */
+export async function readPickedImages<U extends { readonly path: string }>(
+	uris: readonly U[],
+	reader: ImageFileReader<U>,
+): Promise<{ images: PickedImage[]; skipped: string[] }> {
+	const images: PickedImage[] = [];
+	const skipped: string[] = [];
+	for (const uri of uris.slice(0, MAX_PICK_FILES)) {
+		const name = uri.path.slice(uri.path.lastIndexOf('/') + 1);
+		try {
+			const { size } = await reader.stat(uri);
+			if (size > MAX_PICK_BYTES) {
+				skipped.push(`${name} (over ${MAX_PICK_BYTES / (1024 * 1024)}MB)`);
+				continue;
+			}
+			const data = Buffer.from(await reader.readFile(uri)).toString('base64');
+			const mimeType = sniffImageType(data);
+			if (!mimeType) {
+				skipped.push(`${name} (not a PNG, JPEG, GIF or WebP image)`);
+				continue;
+			}
+			images.push({ name, mimeType, data });
+		} catch (err) {
+			skipped.push(`${name} (${err instanceof Error ? err.message : String(err)})`);
+		}
+	}
+	if (uris.length > MAX_PICK_FILES) {
+		skipped.push(`${uris.length - MAX_PICK_FILES} more (at most ${MAX_PICK_FILES} per pick)`);
+	}
+	return { images, skipped };
 }

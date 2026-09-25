@@ -124,8 +124,9 @@ const hostHandles = new Set(captures(host, /^\s*case '([a-zA-Z]+)':/gm));
  * Message types a remote (Phase 6c+) client's own reply never needs an equivalent for on the
  * desktop webview — `attachOk` confirms a chunked `attachImage` upload (see
  * `chatViewProvider.ts`'s `handleAttachImageChunk`), which only a client without a native file
- * input (the PWA) ever sends in the first place; the desktop webview attaches images locally via
- * its own file picker and never sends `attachImage` chunks to get this reply to. Kept as an
+ * input (the PWA) ever sends in the first place; the desktop webview attaches images by paste or
+ * through the host's own file dialog (`pickImages` → `pickedImages`) and never sends
+ * `attachImage` chunks to get this reply to. Kept as an
  * explicit, named exception (mirroring `test-pwa-contract.mjs`'s `EXCLUDED_FROM_PWA` for the
  * opposite asymmetry) rather than silently filtered, so a *new* sink-scoped reply type failing
  * to reach the webview fails loudly here instead of quietly joining this list.

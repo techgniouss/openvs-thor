@@ -83,8 +83,12 @@ assert.ok(hostSends.size > 20, `expected the host's outbound message set to be f
  *                    local file picker with nobody at the desktop to drive it); the read-only
  *                    `attachActive` replacement the plan describes for remote sinks is Phase 6
  *                    work, not yet sent by the host at all.
+ *  - `pickedImages` — the reply to `pickImages`, the desktop's "Attach image" dialog: local files
+ *                    posted to the desktop webview alone (`postTo(WEBVIEW_SINK_ID, …)`), and
+ *                    `pickImages` itself is `REMOTE_DENIED`. A phone attaches its own images
+ *                    through `attachImage`.
  */
-const EXCLUDED_FROM_PWA = new Set(['selectProvider', 'newChat', 'inline', 'editProposal', 'context']);
+const EXCLUDED_FROM_PWA = new Set(['selectProvider', 'newChat', 'inline', 'editProposal', 'context', 'pickedImages']);
 
 for (const excluded of EXCLUDED_FROM_PWA) {
 	assert.ok(hostSends.has(excluded), `"${excluded}" is in the exclusion list but the host no longer sends it — remove it from EXCLUDED_FROM_PWA`);

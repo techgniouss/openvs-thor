@@ -175,6 +175,7 @@
 		contextChip: $('contextChip'),
 		imageChips: $('imageChips'),
 		attachButton: $('attachButton'),
+		imageButton: $('imageButton'),
 		input: /** @type {HTMLTextAreaElement} */ ($('input')),
 		slashMenu: $('slashMenu'),
 		enhanceButton: /** @type {HTMLButtonElement} */ ($('enhanceButton')),
@@ -273,7 +274,7 @@
 			if (wasOpen.has(el.dataset.think)) { el.open = true; }
 		}
 	}
-	/** Adds Copy / Insert action buttons above each finalized code block. */
+	/** Adds a header — the fence's language, then Copy / Insert — above each finalized code block. */
 	function enhanceCodeBlocks(container) {
 		for (const pre of container.querySelectorAll('pre')) {
 			if (pre.dataset.enhanced) { continue; }
@@ -282,6 +283,12 @@
 			if (!code) { continue; }
 			const bar = document.createElement('div');
 			bar.className = 'code-actions';
+			// Always present, empty when the fence named no language: it is also what pushes
+			// the buttons to the right edge.
+			const lang = document.createElement('span');
+			lang.className = 'code-lang';
+			lang.textContent = code.dataset.language || '';
+			bar.appendChild(lang);
 			const copyBtn = document.createElement('button');
 			copyBtn.textContent = 'Copy';
 			const insertBtn = document.createElement('button');
@@ -305,13 +312,86 @@
 
 	// ---- Messages ---------------------------------------------------------------
 
+	// ---- Icons ------------------------------------------------------------------
+
+	/**
+	 * The panel's one icon set, drawn on a 16px grid. `fill` entries are the composer's own
+	 * glyphs (shared with webviewHtml.ts so the two stay one family); `stroke` entries are
+	 * outline marks at a 1.3px stroke that matches their weight. Emoji and text glyphs (✕, 📎,
+	 * 🔧) used to stand in for these — they render in whatever colour font the OS ships, at a
+	 * size and baseline no stylesheet controls, and ignore the theme's foreground entirely.
+	 */
+	const ICONS = {
+		close: { fill: 'M8 8.707l3.646 3.647.708-.707L8.707 8l3.647-3.646-.707-.708L8 7.293 4.354 3.646l-.707.708L7.293 8l-3.646 3.646.707.708L8 8.707z' },
+		chevronDown: { fill: 'M8 11.3 3.4 6.7l.9-.9L8 9.5l3.7-3.7.9.9z' },
+		paperclip: { fill: 'M10.57 2.27a2.75 2.75 0 0 1 3.89 3.89l-6.72 6.72a4.25 4.25 0 0 1-6.01-6.01l6.01-6.01.71.71-6.01 6.01a3.25 3.25 0 1 0 4.6 4.6l6.72-6.72a1.75 1.75 0 1 0-2.48-2.48L4.92 9.34a.75.75 0 0 0 1.06 1.06l5.66-5.66.71.71-5.66 5.66a1.75 1.75 0 0 1-2.48-2.48l6.36-6.36z' },
+		clock: { fill: 'M8 1.5a6.5 6.5 0 1 1 0 13 6.5 6.5 0 0 1 0-13zm0 1.3a5.2 5.2 0 1 0 0 10.4A5.2 5.2 0 0 0 8 2.8zm.65 1.7v3.23l2.55 1.53-.67 1.11L7.35 8.6V4.5h1.3z' },
+		sparkle: { fill: 'M8 1l1.5 4L14 6.5 9.5 8 8 12 6.5 8 2 6.5 6.5 5 8 1zm5 9l.75 2 2 .75-2 .75L13 15.5l-.75-2-2-.75 2-.75L13 10z' },
+		file: { stroke: 'M4 1.5h5l3 3v10H4z M9 1.5v3h3' },
+		folder: { stroke: 'M1.5 3.5h4.5l1.5 1.5h7v8.5h-13z' },
+		search: { stroke: 'M11.5 7a4.5 4.5 0 1 1-9 0 4.5 4.5 0 0 1 9 0z M10.3 10.3l4.2 4.2' },
+		pencil: { stroke: 'M11 2.5l2.5 2.5L6 12.5l-3.2.7.7-3.2z M9.5 4l2.5 2.5' },
+		terminal: { stroke: 'M1.5 3.5a1 1 0 0 1 1-1h11a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1z M4.5 6.5l2 1.5-2 1.5 M8.5 10.5h3' },
+		checklist: { stroke: 'M2 4.5l1.2 1.2L5.5 3.4 M2 10.5l1.2 1.2 2.3-2.3 M8 4.5h6 M8 10.5h6' },
+		question: { stroke: 'M14.5 8a6.5 6.5 0 1 1-13 0 6.5 6.5 0 0 1 13 0z M6.2 6.2a1.9 1.9 0 1 1 2.6 1.8c-.5.2-.8.6-.8 1.1v.4 M8 11.6v.1' },
+		branch: { stroke: 'M3.5 2v5.5a3 3 0 0 0 3 3h7 M11 8l2.5 2.5L11 13' },
+		plug: { stroke: 'M6 1.5v3 M10 1.5v3 M4 4.5h8v2.5a4 4 0 0 1-8 0z M8 11v3.5' },
+		bulb: { stroke: 'M6 12.5h4 M6.5 14.5h3 M8 1.5a4.5 4.5 0 0 0-2.6 8.2c.4.3.6.7.6 1.1v.2h4v-.2c0-.4.2-.8.6-1.1A4.5 4.5 0 0 0 8 1.5z' },
+		slash: { stroke: 'M1.5 3.5a1 1 0 0 1 1-1h11a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1z M9.5 5l-3 6' },
+		book: { stroke: 'M1.5 3h4.2A2.3 2.3 0 0 1 8 5.3v8.2a1.7 1.7 0 0 0-1.7-1.7H1.5z M14.5 3h-4.2A2.3 2.3 0 0 0 8 5.3v8.2a1.7 1.7 0 0 1 1.7-1.7h4.8z' },
+		trash: { stroke: 'M2.5 4h11 M6 4V2.5h4V4 M3.8 4l.7 9.5h7l.7-9.5 M6.5 6.5v4.5 M9.5 6.5v4.5' },
+	};
+
+	/**
+	 * Inline SVG markup for one of {@link ICONS}, sized in px and coloured by `currentColor`.
+	 * @param {keyof typeof ICONS} name
+	 * @param {number} [size]
+	 */
+	function icon(name, size = 14) {
+		const def = /** @type {{ fill?: string, stroke?: string }} */ (ICONS[name]);
+		const paint = def.fill
+			? `fill="currentColor"><path d="${def.fill}"/>`
+			: `fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="${def.stroke}"/>`;
+		return `<svg class="ui-icon" width="${size}" height="${size}" viewBox="0 0 16 16" aria-hidden="true" ${paint}</svg>`;
+	}
+
+	/**
+	 * Gives a <select> the author button of a customizable select: `<button><selectedcontent>`.
+	 * Under `appearance: base-select` (see main.css's Dropdowns section) the browser's own
+	 * button cannot ellipsize — a long model id clipped mid-word and shoved the chevron out of
+	 * the pill — while a `<selectedcontent>` mirrors the chosen option and can. Engines without
+	 * customizable select never render a button inside a select, so this is inert there.
+	 * @param {HTMLSelectElement} select
+	 */
+	function withSelectButton(select) {
+		if (!select.querySelector(':scope > button')) {
+			const button = document.createElement('button');
+			button.type = 'button';
+			button.tabIndex = -1;
+			button.appendChild(document.createElement('selectedcontent'));
+			select.prepend(button);
+		}
+		return select;
+	}
+
+	/**
+	 * Empties a select's options but keeps its {@link withSelectButton} button, which
+	 * `innerHTML = ''` would take with them.
+	 * @param {HTMLSelectElement} select
+	 */
+	function clearOptions(select) {
+		for (const child of [...select.children]) {
+			if (child.tagName !== 'BUTTON') { child.remove(); }
+		}
+	}
+
 	/** Quick-start suggestions shown on the empty chat; clicking one primes the composer. */
-	const EMPTY_SUGGESTIONS = [
-		{ icon: '💡', label: 'Explain my open file', mode: 'ask', prompt: 'Explain what the file I have open does, and how its pieces fit together.' },
-		{ icon: '🧭', label: 'Plan a feature', mode: 'plan', prompt: 'Plan how to add ' },
-		{ icon: '🤖', label: 'Let the agent fix something', mode: 'agent', prompt: 'Find and fix ' },
-		{ icon: '⚡', label: 'See all commands', mode: '', prompt: '/help' },
-	];
+	const EMPTY_SUGGESTIONS = /** @type {{ icon: keyof typeof ICONS, label: string, mode: string, prompt: string }[]} */ ([
+		{ icon: 'bulb', label: 'Explain my open file', mode: 'ask', prompt: 'Explain what the file I have open does, and how its pieces fit together.' },
+		{ icon: 'checklist', label: 'Plan a feature', mode: 'plan', prompt: 'Plan how to add ' },
+		{ icon: 'sparkle', label: 'Let the agent fix something', mode: 'agent', prompt: 'Find and fix ' },
+		{ icon: 'slash', label: 'See all commands', mode: '', prompt: '/help' },
+	]);
 
 	function renderAll() {
 		const s = cur();
@@ -343,12 +423,12 @@
 				<div class="empty-title">OpenVS Thor</div>
 				<div class="empty-sub">Ask about your code, plan a change, or hand the whole task to the agent — powered by the provider and model you choose.</div>
 				<div class="empty-chips"></div>
-				<div class="empty-footnote">Add a provider key or sign in with the ⚙ button.</div>`;
+				<div class="empty-footnote${hasCredential() ? ' hidden' : ''}">Add a provider key or sign in with the ⚙ button.</div>`;
 			const chips = /** @type {HTMLElement} */ (empty.querySelector('.empty-chips'));
 			for (const s of EMPTY_SUGGESTIONS) {
 				const chip = document.createElement('button');
 				chip.className = 'empty-chip';
-				chip.innerHTML = `<span class="chip-icon">${s.icon}</span>${escapeHtml(s.label)}`;
+				chip.innerHTML = `<span class="chip-icon">${icon(s.icon)}</span>${escapeHtml(s.label)}`;
 				chip.addEventListener('click', () => {
 					if (s.mode) { setMode(s.mode); }
 					els.input.value = s.prompt;
@@ -413,7 +493,7 @@
 		// a strip left over from the tab we just switched away from.
 		if (s.streaming) { startWorking(); } else { stopWorking(); }
 		renderOpenPrompts();
-		scrollToBottom();
+		scrollToBottom(true);
 	}
 	/**
 	 * The Undo bar under the tab's latest run that changed files (see the host's `checkpoint`
@@ -480,7 +560,10 @@
 		wrap.className = 'tool running';
 		const head = document.createElement('div');
 		head.className = 'tool-head';
-		head.textContent = toolLabel(name, args);
+		head.innerHTML = icon(toolIcon(name), 13);
+		const headText = document.createElement('span');
+		headText.textContent = toolLabel(name, args);
+		head.appendChild(headText);
 		const details = document.createElement('details');
 		const summary = document.createElement('summary');
 		summary.className = 'tool-summary';
@@ -527,7 +610,7 @@
 	}
 
 	/**
-	 * Human-readable header for a tool call: "🔧 Read src/foo.ts" rather than the raw
+	 * Human-readable header for a tool call: "Read src/foo.ts" rather than the raw
 	 * call signature with its JSON arguments. Unknown tools (MCP servers contribute
 	 * their own) fall back to the signature form, which is still accurate.
 	 */
@@ -535,17 +618,38 @@
 		const a = args || {};
 		const path = typeof a.path === 'string' ? a.path : '';
 		switch (name) {
-			case 'read_file': return `🔧 Read ${path}`;
-			case 'list_dir': return `🔧 List ${path || '.'}`;
-			case 'search_files': return `🔧 Search ${JSON.stringify(a.query ?? '')}${a.glob ? ` in ${a.glob}` : ''}`;
-			case 'glob_files': return `🔧 Find ${String(a.pattern ?? '')}`;
-			case 'write_file': return `🔧 Write ${path}`;
-			case 'edit_file': return `🔧 Edit ${path}`;
-			case 'run_command': return `🔧 Run ${trimLabel(String(a.command ?? ''), 80)}${a.cwd ? ` (in ${a.cwd})` : ''}`;
-			case 'update_todos': return '🔧 Update checklist';
-			case 'ask_user': return `🙋 Ask: ${trimLabel(String(a.question ?? ''), 70)}`;
-			case 'spawn_subagent': return `🔧 Delegate: ${trimLabel(String(a.goal ?? ''), 70)}`;
-			default: return `🔧 ${name}(${summarizeArgs(a)})`;
+			case 'read_file': return `Read ${path}`;
+			case 'list_dir': return `List ${path || '.'}`;
+			case 'search_files': return `Search ${JSON.stringify(a.query ?? '')}${a.glob ? ` in ${a.glob}` : ''}`;
+			case 'glob_files': return `Find ${String(a.pattern ?? '')}`;
+			case 'write_file': return `Write ${path}`;
+			case 'edit_file': return `Edit ${path}`;
+			case 'run_command': return `Run ${trimLabel(String(a.command ?? ''), 80)}${a.cwd ? ` (in ${a.cwd})` : ''}`;
+			case 'update_todos': return 'Update checklist';
+			case 'ask_user': return `Ask: ${trimLabel(String(a.question ?? ''), 70)}`;
+			case 'spawn_subagent': return `Delegate: ${trimLabel(String(a.goal ?? ''), 70)}`;
+			default: return `${name}(${summarizeArgs(a)})`;
+		}
+	}
+
+	/**
+	 * The mark on a tool card: what kind of thing the call does. MCP tools and anything
+	 * unrecognised get the plug — they come from a server, not from this extension.
+	 * @param {string} name
+	 * @returns {keyof typeof ICONS}
+	 */
+	function toolIcon(name) {
+		switch (name) {
+			case 'read_file': return 'file';
+			case 'list_dir': case 'glob_files': return 'folder';
+			case 'search_files': return 'search';
+			case 'write_file': case 'edit_file': return 'pencil';
+			case 'run_command': return 'terminal';
+			case 'update_todos': return 'checklist';
+			case 'ask_user': return 'question';
+			case 'spawn_subagent': return 'branch';
+			case 'fetch_url': return 'search';
+			default: return 'plug';
 		}
 	}
 
@@ -581,7 +685,47 @@
 		// write_file/edit_file confirmations are already a single short line.
 		return lines === 1 && text.length <= 120 ? text : `${lines} line${lines === 1 ? '' : 's'} of output`;
 	}
-	function scrollToBottom() { els.messages.scrollTop = els.messages.scrollHeight; }
+	/**
+	 * Whether the transcript follows new output. Every token, tool card and notice used to scroll
+	 * to the bottom unconditionally, so scrolling up to re-read something mid-run was undone by
+	 * the next token. Now output follows only while the reader is at the bottom; scrolling away
+	 * stops it, scrolling back (or "Jump to latest") resumes it.
+	 */
+	let followOutput = true;
+	/** Distance from the bottom, in px, that still counts as "at the bottom". */
+	const FOLLOW_SLACK = 48;
+
+	/** Floating "Jump to latest" pill over the composer, shown while output is not followed. */
+	const jumpEl = document.createElement('button');
+	jumpEl.type = 'button';
+	jumpEl.className = 'jump-latest hidden';
+	jumpEl.title = 'Scroll to the newest message';
+	jumpEl.innerHTML = `${icon('chevronDown', 12)}Jump to latest`;
+	jumpEl.addEventListener('click', () => scrollToBottom(true));
+	$('composer').appendChild(jumpEl);
+
+	els.messages.addEventListener('scroll', () => {
+		const m = els.messages;
+		followOutput = m.scrollHeight - m.scrollTop - m.clientHeight <= FOLLOW_SLACK;
+		if (followOutput) { jumpEl.classList.add('hidden'); }
+	}, { passive: true });
+
+	/**
+	 * Scrolls the transcript to its newest output. Without `force` it only does so while the
+	 * reader is following (see `followOutput`) — otherwise it offers "Jump to latest" instead.
+	 * `force` is for the user's own actions and for things that block on them: sending,
+	 * steering, switching tabs, an approval card.
+	 * @param {boolean} [force]
+	 */
+	function scrollToBottom(force = false) {
+		if (!force && !followOutput) {
+			jumpEl.classList.remove('hidden');
+			return;
+		}
+		els.messages.scrollTop = els.messages.scrollHeight;
+		followOutput = true;
+		jumpEl.classList.add('hidden');
+	}
 
 	/** Renders a notice bubble in the active session (no host round-trip). */
 	function showNotice(message, isError) {
@@ -603,7 +747,8 @@
 			if (m && m.type === 'promptResponse') { noteWorkingProgress(); }
 			vscode.postMessage(m);
 		},
-		scroll: () => scrollToBottom(),
+		// A card blocks the run on the user, so it is brought into view even mid-scroll.
+		scroll: () => scrollToBottom(true),
 	});
 
 	/**
@@ -693,33 +838,81 @@
 		vscode.postMessage({ type: 'closeSession', sessionId: id });
 	}
 
+	/**
+	 * The tabs scroll inside their own list, with + outside it: tabs keep a readable minimum
+	 * width, so a narrow sidebar with many chats overflows, and + inside the scroller could then
+	 * sit off-screen behind a hidden scrollbar — the one way to start a chat, unreachable.
+	 */
 	function renderTabs() {
 		if (!tabsEl) { return; }
+		const previousScroll = tabsEl.querySelector('.tab-list')?.scrollLeft || 0;
 		tabsEl.innerHTML = '';
+		const list = document.createElement('div');
+		list.className = 'tab-list';
+		list.setAttribute('role', 'tablist');
+		list.setAttribute('aria-label', 'Chats');
+		/** @type {HTMLElement | null} */
+		let activeTab = null;
 		for (const s of sessions) {
+			const active = s.id === activeSessionId;
 			const tab = document.createElement('div');
-			tab.className = 'chat-tab' + (s.id === activeSessionId ? ' active' : '') + (s.streaming ? ' busy' : '');
+			tab.className = 'chat-tab' + (active ? ' active' : '') + (s.streaming ? ' busy' : '');
 			tab.title = s.title || 'New chat';
+			// A div, so it is only reachable by keyboard because it says so.
+			tab.tabIndex = 0;
+			tab.setAttribute('role', 'tab');
+			tab.setAttribute('aria-selected', String(active));
 			tab.innerHTML = `<span class="tab-dot"></span><span class="tab-title">${escapeHtml(s.title || 'New chat')}</span>`
-				+ '<a class="tab-close" href="#" title="Close chat (saved to History)">✕</a>';
+				+ `<a class="tab-close" href="#" title="Close chat (saved to History)" aria-label="Close chat">${icon('close', 12)}</a>`;
 			tab.addEventListener('click', () => switchSession(s.id));
+			tab.addEventListener('keydown', (e) => {
+				if (e.target === tab && (e.key === 'Enter' || e.key === ' ')) {
+					e.preventDefault();
+					switchSession(s.id);
+				}
+			});
 			tab.querySelector('.tab-close')?.addEventListener('click', (e) => {
 				e.preventDefault();
 				e.stopPropagation();
 				closeSession(s.id);
 			});
-			tabsEl.appendChild(tab);
+			list.appendChild(tab);
+			if (active) { activeTab = tab; }
 		}
+		tabsEl.appendChild(list);
 		const add = document.createElement('button');
 		add.className = 'tab-add';
 		add.title = 'New chat (runs in parallel)';
+		add.setAttribute('aria-label', 'New chat');
 		add.textContent = '+';
 		add.addEventListener('click', () => createSession());
 		tabsEl.appendChild(add);
+		// A re-render (every `sessions` push) must not jump the strip back to the start; then the
+		// tab being read is brought into view if it is not — by scrollLeft on the list alone,
+		// since scrollIntoView would also scroll every ancestor.
+		list.scrollLeft = previousScroll;
+		if (activeTab) {
+			// `.tab-list` is positioned, so this is the tab's offset within the list itself.
+			const left = activeTab.offsetLeft;
+			const right = left + activeTab.offsetWidth;
+			if (left < list.scrollLeft) {
+				list.scrollLeft = left;
+			} else if (right > list.scrollLeft + list.clientWidth) {
+				list.scrollLeft = right - list.clientWidth;
+			}
+		}
 	}
+	// The strip's scrollbar is hidden, and a plain mouse wheel scrolls vertically, so without
+	// this an overflowing strip could only be scrolled with Shift+wheel or a trackpad.
+	tabsEl?.addEventListener('wheel', (e) => {
+		const list = /** @type {HTMLElement | null} */ (tabsEl.querySelector('.tab-list'));
+		if (!list || list.scrollWidth <= list.clientWidth || Math.abs(e.deltaX) >= Math.abs(e.deltaY)) { return; }
+		list.scrollLeft += e.deltaY;
+		e.preventDefault();
+	}, { passive: false });
 
 	/**
-	 * Reads a pasted image File, downscales it to at most MAX_IMAGE_DIM on its long edge,
+	 * Reads an image File (pasted or picked), downscales it to at most MAX_IMAGE_DIM on its long edge,
 	 * re-encodes as JPEG, and resolves a base64 payload ready to attach to a message.
 	 * Rejects if the result is still over MAX_IMAGE_BYTES.
 	 * @param {File} file
@@ -746,6 +939,11 @@
 					canvas.height = height;
 					const ctx = canvas.getContext('2d');
 					if (!ctx) { reject(new Error('Canvas unavailable.')); return; }
+					// JPEG has no alpha: transparent pixels were encoded as black, so a transparent
+					// PNG (a logo, a diagram, a UI icon) reached the model as dark shapes on black.
+					// White is what such an image is almost always drawn to sit on.
+					ctx.fillStyle = '#ffffff';
+					ctx.fillRect(0, 0, width, height);
 					ctx.drawImage(img, 0, 0, width, height);
 					const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
 					const base64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
@@ -777,7 +975,9 @@
 			thumb.src = `data:${img.mimeType};base64,${img.data}`;
 			const remove = document.createElement('a');
 			remove.href = '#';
-			remove.textContent = '✕';
+			remove.title = 'Remove image';
+			remove.setAttribute('aria-label', 'Remove image');
+			remove.innerHTML = icon('close', 10);
 			remove.addEventListener('click', (e) => {
 				e.preventDefault();
 				pendingImages.splice(index, 1);
@@ -792,6 +992,13 @@
 	// ---- Providers / models -----------------------------------------------------
 
 	function currentProvider() { return providers.find(p => p.id === selectedProvider); }
+
+	/**
+	 * Whether any provider has a key (saved, from the environment, or a sign-in). The welcome
+	 * screen's "Add a provider key" prompt shows only until one does — it used to show forever,
+	 * telling someone with three working providers to go and add one.
+	 */
+	function hasCredential() { return providers.some(p => p.hasApiKey || p.hasEnvKey); }
 
 	/**
 	 * Mirrors entrySupportsTools() in src/providers/types.ts — keep them in sync.
@@ -822,7 +1029,7 @@
 	function isAuto() { return selectedProvider === AUTO_PROVIDER; }
 
 	function renderProviderSelect() {
-		els.providerSelect.innerHTML = '';
+		clearOptions(els.providerSelect);
 		const autoOpt = document.createElement('option');
 		autoOpt.value = AUTO_PROVIDER;
 		autoOpt.textContent = '🤖 Auto';
@@ -917,7 +1124,7 @@
 			if (p.model) { add({ id: p.model }); }
 			for (const m of p.suggestedModels || []) { add({ id: m }); }
 		}
-		els.modelSelect.innerHTML = '';
+		clearOptions(els.modelSelect);
 		for (const e of entries) {
 			const opt = document.createElement('option');
 			// 🔧 = tool-capable (works in Agent mode); "free" = costs nothing on this provider.
@@ -1221,8 +1428,8 @@
 				</div>
 				<input class="role-model-custom hidden" type="text" placeholder="Exact model id, e.g. vendor/model-name" />
 				${r.problem ? `<div class="role-problem">⚠ ${escapeHtml(r.problem)}</div>` : ''}`;
-			const provSel = /** @type {HTMLSelectElement} */ (row.querySelector('.role-provider'));
-			const modelSel = /** @type {HTMLSelectElement} */ (row.querySelector('.role-model'));
+			const provSel = withSelectButton(/** @type {HTMLSelectElement} */ (row.querySelector('.role-provider')));
+			const modelSel = withSelectButton(/** @type {HTMLSelectElement} */ (row.querySelector('.role-model')));
 			const customInput = /** @type {HTMLInputElement} */ (row.querySelector('.role-model-custom'));
 			/** The model this row is pinned to right now — survives catalog refreshes and provider re-renders. */
 			let pinnedModel = pinned ? r.model : '';
@@ -1237,7 +1444,7 @@
 			// its current value — the list looked random and never showed the real catalog.
 			const fill = () => {
 				const providerId = provSel.value;
-				modelSel.innerHTML = '';
+				clearOptions(modelSel);
 				if (!providerId) {
 					const o = document.createElement('option');
 					o.value = '';
@@ -1340,7 +1547,7 @@
 		if (!history.length) {
 			const p = document.createElement('p');
 			p.className = 'hint';
-			p.textContent = 'No saved chats yet — close a chat tab (✕) and its conversation lands here.';
+			p.textContent = 'No saved chats yet — close a chat tab and its conversation lands here.';
 			els.historyList.appendChild(p);
 			return;
 		}
@@ -1354,7 +1561,7 @@
 					<strong>${escapeHtml(h.title || 'Untitled chat')}</strong>
 					<div class="history-meta">${escapeHtml(relTime(h.savedAt))} · ${count} message${count === 1 ? '' : 's'}</div>
 				</div>
-				<button class="history-delete" title="Delete this conversation permanently">✕</button>`;
+				<button class="history-delete" title="Delete this conversation permanently" aria-label="Delete conversation">${icon('trash')}</button>`;
 			row.addEventListener('click', () => restoreChat(h.id));
 			row.querySelector('.history-delete')?.addEventListener('click', (e) => {
 				e.stopPropagation();
@@ -1411,7 +1618,8 @@
 	function renderContext() {
 		if (!currentContext) { els.contextChip.classList.add('hidden'); return; }
 		els.contextChip.classList.remove('hidden');
-		els.contextChip.innerHTML = `📎 ${escapeHtml(currentContext.label)} <a href="#" id="removeCtx">✕</a>`;
+		els.contextChip.innerHTML = `${icon('paperclip', 12)}<span class="chip-text">${escapeHtml(currentContext.label)}</span>`
+			+ `<a href="#" id="removeCtx" class="chip-remove" title="Remove attachment" aria-label="Remove attachment">${icon('close', 10)}</a>`;
 		els.contextChip.querySelector('#removeCtx')?.addEventListener('click', (e) => {
 			e.preventDefault(); currentContext = null; renderContext();
 		});
@@ -1422,7 +1630,8 @@
 		if (!active.length) { els.skillChip.classList.add('hidden'); els.skillChip.innerHTML = ''; return; }
 		els.skillChip.classList.remove('hidden');
 		els.skillChip.innerHTML = active.map(skill =>
-			`<span class="skill-chip-item">🎓 ${escapeHtml(skill.name)} <a href="#" data-skill="${escapeHtml(skill.id)}" title="Deactivate this skill">✕</a></span>`
+			`<span class="skill-chip-item">${icon('book', 12)}<span class="chip-text">${escapeHtml(skill.name)}</span>`
+			+ `<a href="#" class="chip-remove" data-skill="${escapeHtml(skill.id)}" title="Deactivate this skill" aria-label="Deactivate skill">${icon('close', 10)}</a></span>`
 		).join('');
 		for (const link of els.skillChip.querySelectorAll('a[data-skill]')) {
 			link.addEventListener('click', (e) => {
@@ -1489,7 +1698,8 @@
 			const chip = document.createElement('span');
 			chip.className = 'queue-chip';
 			chip.title = text;
-			chip.innerHTML = `⏳ ${escapeHtml(text.length > 40 ? text.slice(0, 39) + '…' : text)} <a href="#">✕</a>`;
+			chip.innerHTML = `${icon('clock', 12)}<span class="chip-text">${escapeHtml(text)}</span>`
+				+ `<a href="#" class="chip-remove" title="Remove from queue" aria-label="Remove queued message">${icon('close', 10)}</a>`;
 			chip.querySelector('a')?.addEventListener('click', (e) => {
 				e.preventDefault();
 				s.queue.splice(index, 1);
@@ -1506,7 +1716,7 @@
 		if (s.id === activeSessionId) {
 			const body = appendMessageEl('user', text);
 			body.parentElement?.classList.add('steering');
-			scrollToBottom();
+			scrollToBottom(true);
 		}
 		saveState();
 		// Optimistic: the bubble says "delivered" before the host has said it can be. The
@@ -1966,7 +2176,7 @@
 		renderTabs();
 		updateComposer();
 		saveState();
-		scrollToBottom();
+		scrollToBottom(true);
 		// Stamped on every message the host posts back, so a superseded run's stragglers
 		// can be ignored instead of ending the run that replaced it.
 		s.runId = newRunId();
@@ -2133,9 +2343,10 @@
 	function appendPhaseHeader(label, provider, model, source) {
 		const el = document.createElement('div');
 		el.className = 'auto-phase';
+		const modelText = `${provider || ''} · ${model || ''}`;
 		el.innerHTML =
 			`<span class="phase-name">${escapeHtml(label || '')}</span>` +
-			`<span class="phase-model">${escapeHtml(provider || '')} · ${escapeHtml(model || '')}</span>` +
+			`<span class="phase-model" title="${escapeHtml(modelText)}">${escapeHtml(modelText)}</span>` +
 			`<span class="phase-tag">${source === 'configured' ? 'pinned' : 'auto'}</span>`;
 		els.messages.appendChild(el);
 		scrollToBottom();
@@ -2273,18 +2484,27 @@
 	});
 	els.mcpOpenConfig?.addEventListener('click', () => vscode.postMessage({ type: 'mcpOpenConfig' }));
 	els.attachButton.addEventListener('click', () => vscode.postMessage({ type: 'attachContext' }));
-	els.input.addEventListener('paste', (e) => {
-		const items = e.clipboardData ? [...e.clipboardData.items] : [];
-		const imageItems = items.filter(it => it.type.startsWith('image/'));
-		if (!imageItems.length) { return; }
-		e.preventDefault();
+	els.imageButton.addEventListener('click', () => {
+		// Said before the dialog, not after: otherwise the user picks files only to have every
+		// one of them refused.
+		if (pendingImages.length >= MAX_IMAGES_PER_MESSAGE) {
+			showNotice(`You can attach at most ${MAX_IMAGES_PER_MESSAGE} images per message — remove one to add another.`, true);
+			return;
+		}
+		vscode.postMessage({ type: 'pickImages' });
+	});
+	/**
+	 * Resizes image files and queues them for the next send, within the per-message cap. The
+	 * one path for every way an image arrives — a paste, or files from the "Attach image"
+	 * dialog (see 'pickedImages').
+	 * @param {File[]} files
+	 */
+	function addImageFiles(files) {
 		const availableSlots = Math.max(0, MAX_IMAGES_PER_MESSAGE - pendingImages.length);
-		if (imageItems.length > availableSlots) {
+		if (files.length > availableSlots) {
 			showNotice(`You can attach at most ${MAX_IMAGES_PER_MESSAGE} images per message.`, true);
 		}
-		for (const item of imageItems.slice(0, availableSlots)) {
-			const file = item.getAsFile();
-			if (!file) { continue; }
+		for (const file of files.slice(0, availableSlots)) {
 			resizeImage(file).then(resized => {
 				// Re-checked here: the slots above were counted before any resize finished, so two
 				// quick pastes could both claim them.
@@ -2298,6 +2518,13 @@
 				showNotice(err instanceof Error ? err.message : String(err), true);
 			});
 		}
+	}
+	els.input.addEventListener('paste', (e) => {
+		const items = e.clipboardData ? [...e.clipboardData.items] : [];
+		const imageItems = items.filter(it => it.type.startsWith('image/'));
+		if (!imageItems.length) { return; }
+		e.preventDefault();
+		addImageFiles(/** @type {File[]} */ (imageItems.map(item => item.getAsFile()).filter(Boolean)));
 	});
 	els.enhanceButton.addEventListener('click', enhance);
 	els.sendButton.addEventListener('click', send);
@@ -2368,23 +2595,19 @@
 			let text = '';
 			if (el === els.input && navigator.clipboard?.read) {
 				const items = await navigator.clipboard.read();
+				/** @type {File[]} */
+				const images = [];
 				for (const item of items) {
 					const imageType = item.types.find(t => t.startsWith('image/'));
 					if (imageType) {
-						if (pendingImages.length >= MAX_IMAGES_PER_MESSAGE) {
-							showNotice(`You can attach at most ${MAX_IMAGES_PER_MESSAGE} images per message.`, true);
-							continue;
-						}
-						const blob = await item.getType(imageType);
-						const resized = await resizeImage(new File([blob], 'pasted', { type: imageType }));
-						pendingImages.push(resized);
-						renderImageChips();
+						images.push(new File([await item.getType(imageType)], 'pasted', { type: imageType }));
 						continue;
 					}
 					if (item.types.includes('text/plain')) {
 						text += await (await item.getType('text/plain')).text();
 					}
 				}
+				if (images.length) { addImageFiles(images); }
 			} else {
 				text = await navigator.clipboard.readText();
 			}
@@ -2473,6 +2696,8 @@
 		// `transcript` push (or a run announcing itself via `runStart`) has nothing to attach
 		// to there.
 		'sessions', 'transcript', 'runStart', 'userTurn', 'commands',
+		// Images for the composer, which the Settings tab does not show.
+		'pickedImages',
 	];
 
 	window.addEventListener('message', (event) => {
@@ -2509,6 +2734,8 @@
 					}
 				}
 				renderProviderSelect();
+				// The welcome screen may already be up from before this config arrived.
+				els.messages.querySelector('.empty-footnote')?.classList.toggle('hidden', hasCredential());
 				if (!els.settingsPanel.classList.contains('hidden')) { renderSettings(); }
 				break;
 			}
@@ -2727,6 +2954,22 @@
 			case 'context':
 				currentContext = msg.context; renderContext();
 				break;
+			case 'pickedImages': {
+				// The host's reply to 'pickImages': files it read and typed by their bytes, still
+				// full size — they go through the same resize and cap as a pasted screenshot.
+				const picked = Array.isArray(msg.images) ? msg.images : [];
+				addImageFiles(picked.map(img => {
+					const binary = atob(String(img.data || ''));
+					const bytes = new Uint8Array(binary.length);
+					for (let i = 0; i < binary.length; i++) { bytes[i] = binary.charCodeAt(i); }
+					return new File([bytes], String(img.name || 'image'), { type: String(img.mimeType || '') });
+				}));
+				if (Array.isArray(msg.skipped) && msg.skipped.length) {
+					showNotice(`Not attached: ${msg.skipped.join(', ')}.`, true);
+				}
+				els.input.focus();
+				break;
+			}
 			case 'enhancedPrompt':
 				endEnhance();
 				els.input.value = msg.text || els.input.value;
@@ -2898,6 +3141,9 @@
 
 	// ---- Init -------------------------------------------------------------------
 
+	for (const select of [els.modeSelect, els.approvalSelect, els.providerSelect, els.modelSelect]) {
+		withSelectButton(select);
+	}
 	// `sessions`/`activeSessionId` start empty (see their own doc) — nothing to reflect in
 	// the mode picker yet, so this just applies the 'ask' default rather than a real session's
 	// mode. The host's first `sessions` push (see `case 'sessions':` above) is what replaces it.

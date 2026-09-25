@@ -627,9 +627,36 @@ function modelSupportsTools(provider, model) {
 	});
 }
 
+/**
+ * Gives a <select> a customizable-select author button (`<button><selectedcontent>`), which
+ * styles.css's Dropdowns block uses on pointer devices so a long model id ellipsizes inside
+ * the pill. Inert where `appearance: base-select` is not applied — a phone keeps its native
+ * picker. Mirrors `media/main.js`'s `withSelectButton`.
+ * @param {HTMLSelectElement | null} select
+ */
+function withSelectButton(select) {
+	if (select && !select.querySelector(':scope > button')) {
+		const button = el('button');
+		button.type = 'button';
+		button.tabIndex = -1;
+		button.appendChild(document.createElement('selectedcontent'));
+		select.prepend(button);
+	}
+}
+
+/**
+ * Removes a select's options but not its {@link withSelectButton} button.
+ * @param {HTMLSelectElement} select
+ */
+function clearOptions(select) {
+	for (const child of [...select.children]) {
+		if (child.tagName !== 'BUTTON') { child.remove(); }
+	}
+}
+
 function renderProviderSelect() {
 	if (!els.providerSelect) { return; }
-	els.providerSelect.replaceChildren();
+	clearOptions(els.providerSelect);
 	for (const provider of providers) {
 		// A provider with no credential can't answer; say so in the list rather than let a pick
 		// fail on the next send with "No API key".
@@ -649,7 +676,7 @@ function renderProviderSelect() {
  */
 function renderModelSelect() {
 	if (!els.modelSelect) { return; }
-	els.modelSelect.replaceChildren();
+	clearOptions(els.modelSelect);
 	const p = providers.find(x => x.id === selectedProvider);
 	const live = fetchedModels[selectedProvider] || [];
 	const error = modelErrors[selectedProvider];
@@ -1145,6 +1172,10 @@ function resizeImageForUpload(file) {
 				canvas.height = height;
 				const ctx = canvas.getContext('2d');
 				if (!ctx) { reject(new Error('Canvas unavailable.')); return; }
+				// JPEG has no alpha: without a fill, a transparent PNG's clear pixels encode as
+				// black (media/main.js's resizeImage fills the same way).
+				ctx.fillStyle = '#ffffff';
+				ctx.fillRect(0, 0, width, height);
 				ctx.drawImage(img, 0, 0, width, height);
 				const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
 				resolve({ mimeType: 'image/jpeg', data: dataUrl.slice(dataUrl.indexOf(',') + 1) });
@@ -1938,6 +1969,9 @@ document.addEventListener('visibilitychange', () => {
 	}
 });
 
+withSelectButton(els.modeSelect);
+withSelectButton(els.providerSelect);
+withSelectButton(els.modelSelect);
 if (els.sendBtn) { els.sendBtn.addEventListener('click', sendMessage); }
 if (els.stopBtn) { els.stopBtn.addEventListener('click', stopRun); }
 if (els.newSessionBtn) { els.newSessionBtn.addEventListener('click', createSession); }

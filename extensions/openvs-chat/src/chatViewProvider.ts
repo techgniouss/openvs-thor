@@ -30,7 +30,7 @@ import { withProviderResilience } from './providers/resilience';
 import { ModelCatalog } from './providers/modelCatalog';
 import { ChatImage, ChatMessage, ChatProvider, entrySupportsTools, isAbortError, modelSupportsVision } from './providers/types';
 import { defaultChromeProfilePath } from './providers/webCookie/chromeCookies';
-import { AttachImageChunk, UploadAssembler } from './remote/attachments';
+import { AttachImageChunk, UploadAssembler, readPickedImages } from './remote/attachments';
 import { QueueDrainGate } from './session/queueDrain';
 import { appendRules, COMPACT_RULES_CHARS, RulesProvider } from './rules';
 import { MessageSink, SessionBus } from './session/bus';
@@ -410,6 +410,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	 * see {@link UploadAssembler}'s own doc.
 	 */
 	private readonly uploadAssembler = new UploadAssembler();
+
+	/** Whether the "Attach image" dialog is open (see {@link handlePickImages}). */
+	private pickingImages = false;
 
 	/**
 	 * Records whether this run can be steered and tells the tab, which until now assumed it
@@ -1657,6 +1660,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			case 'attachActive':
 				await this.handleAttachActive(origin);
 				break;
+			case 'pickImages':
+				await this.handlePickImages();
+				break;
 			case 'attachImage':
 				this.handleAttachImage(message, origin);
 				break;
@@ -1983,6 +1989,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			type: 'context',
 			context: { label, content: `File: ${name} (${editor.document.languageId})\n\n${text}` },
 		});
+	}
+
+	/**
+	 * The composer's "Attach image" button. VS Code's own open dialog rather than a browser
+	 * file input inside the webview: it is the dialog the rest of the editor uses, and reading
+	 * through `workspace.fs` works the same in a remote workspace, where the files are not on
+	 * this machine's disk at all. Reading and typing the files is `readPickedImages`'s job; the
+	 * reply goes to the desktop webview alone — `pickImages` is `REMOTE_DENIED`, and these are
+	 * local files. The webview does the resizing and the per-message cap, exactly as it does
+	 * for a pasted screenshot.
+	 */
+	private async handlePickImages(): Promise<void> {
+		// A second click while the dialog is up is not a second request: without this it queued
+		// behind the first and opened another dialog the moment the first one closed.
+		if (this.pickingImages) {
+			return;
+		}
+		this.pickingImages = true;
+		try {
+			const uris = await vscode.window.showOpenDialog({
+				canSelectMany: true,
+				openLabel: 'Attach',
+				title: 'Attach Images',
+				filters: { Images: ['png', 'jpg', 'jpeg', 'gif', 'webp'] },
+			});
+			if (!uris?.length) {
+				return;
+			}
+			const { images, skipped } = await readPickedImages(uris, vscode.workspace.fs);
+			this.bus.postTo(WEBVIEW_SINK_ID, { type: 'pickedImages', images, skipped });
+		} finally {
+			this.pickingImages = false;
+		}
 	}
 
 	/**

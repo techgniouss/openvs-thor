@@ -116,7 +116,14 @@ export function create(deps) {
 			for (const option of options) {
 				const label = String((option && option.label) || '');
 				if (!label) { continue; }
-				const button = el('button', 'prompt-option', label);
+				// The description is the agent's own note on what each choice means — dropping
+				// it left a phone deciding from bare labels the desktop card explains.
+				const button = el('button', 'prompt-option');
+				button.appendChild(el('span', 'prompt-option-label', label));
+				const description = String((option && option.description) || '');
+				if (description) {
+					button.appendChild(el('span', 'prompt-option-desc', description));
+				}
 				button.addEventListener('click', () => answer(request.id, { answer: label }, `Answered: ${label}`));
 				list.appendChild(button);
 			}

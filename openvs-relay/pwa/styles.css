@@ -22,6 +22,11 @@
 	--radius: 12px;
 	--font-mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
 	--ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+	/* One side gutter for every region, so the top bar, tabs, transcript, checklist and
+	   composer share a left edge: a readable 760px column on a tablet or desktop browser,
+	   edge to edge (clear of a landscape notch) on a phone. The regions used to pick 12px or
+	   14px each, and the top bar and tabs ignored the column entirely. */
+	--gutter: max(14px, env(safe-area-inset-left), env(safe-area-inset-right), calc((100% - 760px) / 2));
 }
 
 * { box-sizing: border-box; }
@@ -132,7 +137,7 @@ input, textarea, select {
 	gap: 12px;
 	/* status-bar-style is black-translucent (index.html) — content draws under the iOS
 	   notch/Dynamic Island without this. */
-	padding: calc(8px + env(safe-area-inset-top)) 12px 8px;
+	padding: calc(8px + env(safe-area-inset-top)) var(--gutter) 8px;
 	border-bottom: 1px solid var(--border);
 }
 
@@ -156,7 +161,9 @@ input, textarea, select {
 .status-warn { color: var(--warn); }
 .status-warn::before { background: var(--warn); }
 
-.topbar-actions { display: flex; gap: 4px; }
+/* Pulled out by the buttons' own padding so their labels, not their hit areas, meet the gutter. */
+.topbar-actions { display: flex; gap: 4px; margin-right: -10px; }
+.history-header .icon-btn { margin-right: -10px; }
 
 .icon-btn {
 	display: flex;
@@ -176,7 +183,7 @@ input, textarea, select {
 .tabs {
 	display: flex;
 	gap: 6px;
-	padding: 8px 12px;
+	padding: 8px var(--gutter);
 	overflow-x: auto;
 	scrollbar-width: none;
 	border-bottom: 1px solid var(--border);
@@ -194,7 +201,7 @@ input, textarea, select {
 	background: var(--bg-raised);
 	border: 1px solid var(--border);
 	border-radius: 999px;
-	padding: 4px 4px 4px 12px;
+	padding: 2px 2px 2px 12px;
 	color: var(--fg-dim);
 }
 .tab-active { border-color: var(--accent); color: var(--fg); background: var(--accent-soft); }
@@ -219,11 +226,15 @@ input, textarea, select {
 	text-overflow: ellipsis;
 	white-space: nowrap;
 }
+/* 28px: the 22px target it had is a miss-tap that switches tabs instead of closing one. */
 .tab-close {
-	display: flex;
+	display: grid;
+	place-items: center;
+	width: 28px;
+	height: 28px;
 	background: none;
 	border: none;
-	padding: 4px;
+	padding: 0;
 	border-radius: 50%;
 	color: inherit;
 	opacity: 0.6;
@@ -238,7 +249,7 @@ input, textarea, select {
 	overflow-y: auto;
 	overscroll-behavior: contain;
 	/* A readable column on a tablet or desktop browser, edge to edge on a phone. */
-	padding: 16px max(14px, calc((100% - 760px) / 2)) 20px;
+	padding: 16px var(--gutter) 20px;
 	display: flex;
 	flex-direction: column;
 	gap: 14px;
@@ -301,6 +312,7 @@ h5.md-heading, h6.md-heading { font-size: 14px; color: var(--fg-dim); }
 	overflow-x: auto;
 	font-size: 13px;
 	line-height: 1.45;
+	tab-size: 4;
 }
 .md-code code { background: none; padding: 0; font-size: inherit; white-space: pre; }
 .md-code-lang {
@@ -430,7 +442,7 @@ h5.md-heading, h6.md-heading { font-size: 14px; color: var(--fg-dim); }
 
 /* ---- Todos ---- */
 
-.todos { padding: 0 max(12px, calc((100% - 760px) / 2)) 6px; }
+.todos { padding: 0 var(--gutter) 6px; }
 .todo-panel { border: 1px solid var(--border); border-radius: 10px; background: var(--bg-raised); }
 .todo-summary {
 	display: flex;
@@ -490,7 +502,15 @@ h5.md-heading, h6.md-heading { font-size: 14px; color: var(--fg-dim); }
 .prompt-deny { border-color: var(--danger); color: var(--danger); background: none; }
 .prompt-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
 .prompt-options { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
-.prompt-option { text-align: left; min-height: 40px; }
+.prompt-option {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	text-align: left;
+	min-height: 40px;
+}
+.prompt-option-label { font-weight: 600; }
+.prompt-option-desc { font-size: 13px; color: var(--fg-dim); }
 .prompt-answer { flex: 1; min-width: 0; }
 .prompt-resolved { color: var(--fg-dim); font-size: 13px; }
 
@@ -498,7 +518,7 @@ h5.md-heading, h6.md-heading { font-size: 14px; color: var(--fg-dim); }
 
 .composer-bar {
 	border-top: 1px solid var(--border);
-	padding: 8px max(12px, calc((100% - 760px) / 2)) calc(8px + env(safe-area-inset-bottom));
+	padding: 8px var(--gutter) calc(8px + env(safe-area-inset-bottom));
 	display: flex;
 	flex-direction: column;
 	gap: 8px;
@@ -606,11 +626,17 @@ h5.md-heading, h6.md-heading { font-size: 14px; color: var(--fg-dim); }
 .chip > .icon, .queue-chip > .icon { width: 14px; height: 14px; flex-shrink: 0; }
 .queue-chip { border-style: dashed; }
 .chip-text, .queue-chip-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+/* 26px inside a 12.5px chip: the negative margin keeps the chip itself compact while the
+   tap target grows past the 19px it had. */
 .chip-remove, .queue-chip button {
-	display: flex;
+	display: grid;
+	place-items: center;
+	width: 26px;
+	height: 26px;
+	margin: -4px -3px -4px 0;
 	background: none;
 	border: none;
-	padding: 3px;
+	padding: 0;
 	border-radius: 50%;
 	color: inherit;
 	flex-shrink: 0;
@@ -661,14 +687,14 @@ h5.md-heading, h6.md-heading { font-size: 14px; color: var(--fg-dim); }
 	display: flex;
 	align-items: center;
 	justify-content: space-between;
-	padding: calc(8px + env(safe-area-inset-top)) 12px 8px;
+	padding: calc(8px + env(safe-area-inset-top)) var(--gutter) 8px;
 	border-bottom: 1px solid var(--border);
 }
 .history-title { font-weight: 600; }
 .history-list {
 	flex: 1;
 	overflow-y: auto;
-	padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
+	padding: 10px var(--gutter) calc(10px + env(safe-area-inset-bottom));
 	display: flex;
 	flex-direction: column;
 	gap: 8px;
@@ -688,6 +714,124 @@ h5.md-heading, h6.md-heading { font-size: 14px; color: var(--fg-dim); }
 .history-row:active { border-color: var(--accent); }
 .history-row-title { font-size: 14px; }
 .history-row-time { font-size: 12px; color: var(--fg-dim); }
+
+/* Pointer devices (a desktop browser, a tablet with a trackpad) get hover feedback; a phone
+   keeps only the `:active` press states above, since a tap there would leave hover stuck on. */
+@media (hover: hover) and (pointer: fine) {
+	.icon-btn:hover, .tool-btn:hover { background: var(--bg-raised); color: var(--fg); }
+	.tab:not(.tab-active):hover { border-color: var(--border-strong); color: var(--fg); }
+	.tab-close:hover, .chip-remove:hover, .queue-chip button:hover { opacity: 1; background: var(--bg); }
+	.history-row:hover, .prompt-option:hover, .load-earlier:hover { border-color: var(--border-strong); }
+	.slash-item:hover { background: var(--bg); }
+	.send-btn:hover { filter: brightness(1.08); }
+	.controls-row select:hover { border-color: var(--border-strong); color: var(--fg); }
+}
+
+/* Skills disclosure: a drawn chevron that turns, not the browser's ▶ glyph. */
+.skills-panel summary {
+	list-style: none;
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+.skills-panel summary::-webkit-details-marker { display: none; }
+.skills-panel summary::before {
+	content: "";
+	width: 10px;
+	height: 10px;
+	background-color: currentColor;
+	mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'><path d='M9 6l6 6-6 6'/></svg>") center / contain no-repeat;
+	transition: rotate 0.15s var(--ease-out);
+}
+.skills-panel[open] summary::before { rotate: 90deg; }
+
+/* Dropdowns on a pointer device (a desktop or tablet browser): the open list is styled as a
+   popover in the app's own palette instead of the OS menu. A phone keeps its native picker —
+   the bottom sheet / wheel is the better touch control, and the gate below never applies
+   there. Engines without customizable select skip the block entirely. The author button
+   app.js's `withSelectButton` adds is what lets a long model id ellipsize in the pill. */
+@supports (appearance: base-select) {
+	@media (hover: hover) and (pointer: fine) {
+		.controls-row select,
+		.controls-row select::picker(select) {
+			appearance: base-select;
+		}
+		.controls-row select {
+			display: flex;
+			align-items: center;
+			background-image: none;
+			padding-right: 10px;
+		}
+		.controls-row select > button {
+			all: unset;
+			display: flex;
+			flex: 1 1 auto;
+			min-width: 0;
+			overflow: hidden;
+		}
+		.controls-row select selectedcontent {
+			display: block;
+			min-width: 0;
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+		}
+		.controls-row select::picker-icon {
+			content: "";
+			flex: none;
+			width: 10px;
+			height: 10px;
+			margin-left: 6px;
+			background-color: currentColor;
+			mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><path d='M6 9l6 6 6-6'/></svg>") center / contain no-repeat;
+			transition: rotate 0.15s var(--ease-out);
+		}
+		.controls-row select:open::picker-icon { rotate: 180deg; }
+		.controls-row select::picker(select) {
+			margin: 6px 0;
+			padding: 4px;
+			max-height: min(360px, 60vh);
+			max-width: min(440px, calc(100vw - 24px));
+			overflow-y: auto;
+			color: var(--fg);
+			background: var(--bg-raised);
+			border: 1px solid var(--border-strong);
+			border-radius: var(--radius);
+			box-shadow: 0 16px 40px -12px rgba(0, 0, 0, 0.6);
+			font-size: 14px;
+			opacity: 0;
+			translate: 0 4px;
+			transition: opacity 0.15s var(--ease-out), translate 0.15s var(--ease-out), overlay 0.15s allow-discrete, display 0.15s allow-discrete;
+		}
+		.controls-row select:open::picker(select) { opacity: 1; translate: 0 0; }
+		@starting-style {
+			.controls-row select:open::picker(select) { opacity: 0; translate: 0 4px; }
+		}
+		.controls-row select option {
+			display: flex;
+			align-items: center;
+			gap: 8px;
+			padding: 7px 10px;
+			border-radius: 8px;
+			color: var(--fg);
+			white-space: normal;
+			overflow-wrap: anywhere;
+			cursor: pointer;
+		}
+		.controls-row select option:hover { background: var(--bg); }
+		.controls-row select option:checked { background: var(--accent-soft); color: var(--accent); }
+		.controls-row select option:disabled { color: var(--fg-faint); cursor: default; }
+		.controls-row select option::checkmark {
+			content: "";
+			order: 1;
+			width: 12px;
+			height: 12px;
+			margin-left: auto;
+			background-color: currentColor;
+			mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'><path d='M5 12l5 5 9-10'/></svg>") center / contain no-repeat;
+		}
+	}
+}
 
 @media (prefers-reduced-motion: reduce) {
 	*, *::before, *::after { animation: none !important; transition: none !important; }

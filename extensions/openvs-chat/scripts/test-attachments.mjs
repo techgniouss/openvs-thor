@@ -10,7 +10,7 @@
 // test-session-store.mjs's own doc), so the compiled module is imported directly, no stub
 // needed.
 import assert from 'node:assert/strict';
-import { MAX_SESSION_BYTES, MAX_UPLOAD_BYTES, UploadAssembler } from '../out/remote/attachments.js';
+import { MAX_PICK_BYTES, MAX_PICK_FILES, MAX_SESSION_BYTES, MAX_UPLOAD_BYTES, UploadAssembler, readPickedImages } from '../out/remote/attachments.js';
 
 /** Leading bytes of each image type; the assembler reads the type from these, not from the client's claim. */
 const MAGIC = { jpeg: [0xff, 0xd8, 0xff], png: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] };
@@ -198,6 +198,47 @@ function splitBase64(base64, size) {
 	}
 	const fresh = base64OfSize(1000);
 	assert.strictEqual(assembler.addChunk({ sessionId: 's8', uploadId: 'ok', index: 0, total: 1, chunk: fresh }).status, 'complete');
+}
+
+// 9. The desktop "Attach image" dialog (readPickedImages). Files are typed by their bytes, not
+// their names; an oversized file is refused from its size alone, never read; and every file left
+// out is named with the reason, including the ones past the per-pick limit.
+{
+	const files = new Map([
+		['/pics/shot.png', { bytes: Buffer.from(base64OfSize(64, 'png'), 'base64') }],
+		['/pics/photo-named-png.png', { bytes: Buffer.from(base64OfSize(64, 'jpeg'), 'base64') }],
+		['/pics/huge.png', { size: MAX_PICK_BYTES + 1 }],
+		['/pics/notes.png', { bytes: Buffer.from('just text, not an image') }],
+		['/pics/gone.png', { error: 'EACCES: permission denied' }],
+	]);
+	for (let n = 0; files.size < MAX_PICK_FILES + 2; n++) {
+		files.set(`/pics/extra${n}.png`, { bytes: Buffer.from(base64OfSize(64, 'png'), 'base64') });
+	}
+	const read = [];
+	const reader = {
+		async stat(uri) {
+			const f = files.get(uri.path);
+			if (f.error) { throw new Error(f.error); }
+			return { size: f.size ?? f.bytes.length };
+		},
+		async readFile(uri) {
+			read.push(uri.path);
+			return new Uint8Array(files.get(uri.path).bytes);
+		},
+	};
+	const { images, skipped } = await readPickedImages([...files.keys()].map(path => ({ path })), reader);
+	assert.deepStrictEqual(
+		{ images: images.map(i => [i.name, i.mimeType]), skipped, readHuge: read.includes('/pics/huge.png') },
+		{
+			images: [['shot.png', 'image/png'], ['photo-named-png.png', 'image/jpeg']],
+			skipped: [
+				`huge.png (over ${MAX_PICK_BYTES / (1024 * 1024)}MB)`,
+				'notes.png (not a PNG, JPEG, GIF or WebP image)',
+				'gone.png (EACCES: permission denied)',
+				`2 more (at most ${MAX_PICK_FILES} per pick)`,
+			],
+			readHuge: false,
+		});
 }
 
 console.log('test-attachments: all assertions passed');
