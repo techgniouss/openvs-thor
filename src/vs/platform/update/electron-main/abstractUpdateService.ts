@@ -15,6 +15,7 @@ import { IEnvironmentMainService } from '../../environment/electron-main/environ
 import { ILifecycleMainService, LifecycleMainPhase } from '../../lifecycle/electron-main/lifecycleMainService.js';
 import { ILogService } from '../../log/common/log.js';
 import { IProductService } from '../../product/common/productService.js';
+import { getReleaseVersion } from '../../../base/common/product.js';
 import { IRequestService } from '../../request/common/request.js';
 import { StorageScope, StorageTarget } from '../../storage/common/storage.js';
 import { IApplicationStorageMainService } from '../../storage/electron-main/storageMainService.js';
@@ -231,7 +232,7 @@ export abstract class AbstractUpdateService implements IUpdateService {
 		}
 
 		const to: ILastKnownVersion = {
-			version: this.productService.version,
+			version: getReleaseVersion(this.productService),
 			commit: this.productService.commit,
 			timestamp: Date.now(),
 		};
@@ -440,7 +441,7 @@ export abstract class AbstractUpdateService implements IUpdateService {
 			return undefined;
 		}
 
-		const headers = getUpdateRequestHeaders(this.productService.version);
+		const headers = getUpdateRequestHeaders(getReleaseVersion(this.productService));
 		this.logService.trace('update#isLatestVersion() - checking update server', { url, headers });
 
 		try {

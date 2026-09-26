@@ -84,7 +84,17 @@ export interface IAgentSdkProductConfig {
 }
 
 export interface IProductConfiguration {
+	/**
+	 * The VS Code version this build is based on. Every extension is told it runs on this
+	 * (`vscode.version`, `engines.vscode` checks), so it must stay a real VS Code version.
+	 */
 	readonly version: string;
+	/**
+	 * OpenVS's own release version: what updates compare, release notes and the installer
+	 * are named by, and what the user is shown. Absent in development builds; read it
+	 * through `getReleaseVersion`, which falls back to {@link version}.
+	 */
+	readonly openvsVersion?: string;
 	readonly date?: string;
 	readonly quality?: string;
 	readonly commit?: string;
@@ -436,4 +446,13 @@ export interface IDefaultChatAgent {
 	readonly completionsAdvancedSetting: string;
 	readonly completionsEnablementSetting: string;
 	readonly nextEditSuggestionsSetting: string;
+}
+
+/**
+ * OpenVS's release version (updates, release notes, installer, the About dialog), as opposed
+ * to the VS Code version extensions are told they run on. Development builds carry no release
+ * version and fall back to the VS Code one.
+ */
+export function getReleaseVersion(product: Pick<IProductConfiguration, 'version' | 'openvsVersion'>): string {
+	return product.openvsVersion || product.version;
 }

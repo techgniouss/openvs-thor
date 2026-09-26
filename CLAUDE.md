@@ -77,6 +77,42 @@ active development unless told otherwise; everything else is upstream VS Code.
 - Rendering *appearance* still has to be checked by hand in the Extension Development Host
   (`F5` from this repo, or launch VS Code with
   `--extensionDevelopmentPath=extensions/openvs-chat`).
+- **The installed build is a different path from development**, and three things have to hold
+  for the chat to exist there at all — each once shipped broken while dev looked fine:
+  1. *Packaging.* The product build packages openvs-chat through
+     `extensions/openvs-chat/esbuild.mts` (bundle to `dist/`, `main` rewritten by
+     `build/lib/extensions.ts`); dev, F5 and the tests still use `out/`. Without that file the
+     build copied the folder as-is, and a clean CI checkout has no `out/`. `sql.js` stays
+     external (it locates its `.wasm` beside itself) and is shipped via
+     `packagedDependenciesByExtension`; `.vscodeignore` keeps `.env` — which `loadEnvFile`
+     reads at runtime — out of every installer.
+  2. *Enablement.* `product.json`'s `defaultChatAgent.chatExtensionId` is openvs-chat, and
+     upstream's `ensureChatExtensionInitialDisabledState` disabled that extension in every
+     fresh profile until Copilot setup completed — which never happens here. That branch is
+     removed; `repairChatExtensionEnablement` re-enables profiles it already hit, once.
+  3. *Layout.* `OpenVSChatRedirectContribution` runs before the workbench grid exists, so it
+     must not remove the native chat container then (the secondary side bar hid itself with no
+     grid and threw). It removes it — views first — only once openvs-chat's container exists.
+  4. *Two versions.* `package.json`'s `version` is the VS Code base (`productService.version`,
+     i.e. `vscode.version` and every `engines.vscode` check) and is never stamped. OpenVS's
+     release version is `product.json`'s `openvsVersion`, stamped from the tag by
+     `release-windows.yml` and read through `getReleaseVersion` (`base/common/product.ts`) —
+     by the updater, release notes, the About dialog, the installer and the exe's version
+     resources. Stamping the tag into package.json once shipped "VS Code 1.0.0", and the JSON,
+     HTML, CSS and Markdown language servers refused to start. A new place that shows or
+     compares *our* version uses `getReleaseVersion`; anything extension-facing keeps `version`.
+  5. *Marketplace.* `product.json`'s `extensionsGallery` points at Open VSX (Microsoft's
+     Marketplace terms exclude forks). Open VSX signs extensions, but the verifier,
+     `@vscode/vsce-sign`, is licensed for Microsoft's products only and is not shipped, so
+     `extensionManagementService.downloadExtension` installs unverified when the verifier is
+     absent (upstream refused — every signed extension failed). A verifier that runs and
+     reports a bad signature still blocks the install.
+  Native modules in ESM code load with `await import(...)`, never a bare `require` — built,
+  that is the bundler's throwing stub (logging, Windows version and policy reading were all
+  silently dead that way).
+  To check the real product, launch the installed exe (or a copy) with a throwaway
+  `--user-data-dir` plus `--remote-debugging-port` and read the renderer console over CDP;
+  a copy outside Program Files also needs `--no-sandbox --disable-gpu` to start.
 
 **MANDATORY:** always check for compilation errors before running tests or declaring work
 done, and fix them first. Do not run tests while there are compile errors. Do not use

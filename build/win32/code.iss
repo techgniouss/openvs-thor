@@ -1316,9 +1316,12 @@ Root: {#EnvironmentRootKey}; Subkey: "Software\Microsoft\Windows\CurrentVersion\
 // extensions/openvs-chat/src/remote/local/tunnel.ts.
 function CloudflaredMissing(): Boolean;
 begin
+  // Same places tunnel.ts looks, PATH included (Scoop, Chocolatey, a manual install), so
+  // the task is only offered when the extension would not find one either.
   Result := not (FileExists(ExpandConstant('{commonpf32}\cloudflared\cloudflared.exe'))
     or FileExists(ExpandConstant('{commonpf}\cloudflared\cloudflared.exe'))
-    or FileExists(ExpandConstant('{localappdata}\Microsoft\WinGet\Links\cloudflared.exe')));
+    or FileExists(ExpandConstant('{localappdata}\Microsoft\WinGet\Links\cloudflared.exe'))
+    or (FileSearch('cloudflared.exe', GetEnv('PATH')) <> ''));
 end;
 
 // winget ships with Windows 10 1809+ and 11 as part of App Installer; without it the task

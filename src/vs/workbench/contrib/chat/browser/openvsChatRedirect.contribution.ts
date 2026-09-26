@@ -15,8 +15,9 @@ import { KeybindingWeight } from '../../../../platform/keybinding/common/keybind
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
 import { Registry } from '../../../../platform/registry/common/platform.js';
 import { IWorkbenchContribution } from '../../../common/contributions.js';
-import { Extensions as ViewExtensions, IViewContainersRegistry, IViewDescriptorService, ViewContainerLocation } from '../../../common/views.js';
+import { Extensions as ViewExtensions, IViewContainersRegistry, IViewDescriptorService, IViewsRegistry, ViewContainerLocation } from '../../../common/views.js';
 import { IChatEntitlementService } from '../../../services/chat/common/chatEntitlementService.js';
+import { IExtensionService } from '../../../services/extensions/common/extensions.js';
 import { IWorkbenchLayoutService, Parts } from '../../../services/layout/browser/layoutService.js';
 import { IPaneCompositePartService } from '../../../services/panecomposite/browser/panecomposite.js';
 import { IViewsService } from '../../../services/views/common/viewsService.js';
@@ -127,7 +128,8 @@ MenuRegistry.appendMenuItem(MenuId.TitleBar, {
 /**
  * Redirects the native chat entry points to the openvs-chat webview and
  * suppresses the built-in GitHub Copilot setup chrome. OpenVS ships its own
- * chat; Copilot remains an optional Marketplace install.
+ * chat; Copilot itself is not installable here (it is not on Open VSX, the
+ * extension gallery OpenVS uses).
  */
 export class OpenVSChatRedirectContribution extends Disposable implements IWorkbenchContribution {
 
@@ -145,6 +147,7 @@ export class OpenVSChatRedirectContribution extends Disposable implements IWorkb
 		@IViewDescriptorService private readonly viewDescriptorService: IViewDescriptorService,
 		@IPaneCompositePartService private readonly paneCompositePartService: IPaneCompositePartService,
 		@IWorkbenchLayoutService private readonly layoutService: IWorkbenchLayoutService,
+		@IExtensionService extensionService: IExtensionService,
 	) {
 		super();
 
@@ -184,7 +187,11 @@ export class OpenVSChatRedirectContribution extends Disposable implements IWorkb
 		this.relocateListener.value = this.viewDescriptorService.onDidChangeViewContainers(() => this.relocateOpenVSChatContainer());
 		this.relocateOpenVSChatContainer();
 
-		this.hideNativeChatContainer();
+		// Fallback for when openvs-chat never registers (disabled or not
+		// installed): the native container still goes, just without a
+		// replacement. By then the layout exists, so emptying the secondary
+		// side bar hides it cleanly instead of throwing.
+		extensionService.whenInstalledExtensionsRegistered().then(() => this.hideNativeChatContainer());
 	}
 
 	/**
@@ -194,13 +201,31 @@ export class OpenVSChatRedirectContribution extends Disposable implements IWorkb
 	 * ships its own chat instead. Best-effort: if the container hasn't been
 	 * registered (e.g. Copilot is disabled/uninstalled), this is a no-op.
 	 *
+	 * Never called from the constructor. This contribution is created before
+	 * the workbench grid exists, and while openvs-chat's container is not yet
+	 * registered the native one is the secondary side bar's only container:
+	 * removing it made the bar hide itself with no grid to hide it in, which
+	 * threw halfway and left the bar marked hidden — every fresh profile then
+	 * reported the OpenVS Chat view as unavailable. Removed only once the
+	 * replacement is registered, the bar is never empty, and the pane
+	 * composite part switches an active native chat over to openvs-chat itself.
+	 *
 	 * This is intentionally aggressive. If any native-chat-dependent feature
 	 * (e.g. agent sessions, chat sessions) misbehaves as a result, this can be
-	 * reverted by removing this one call without touching the command reroutes.
+	 * reverted by removing the calls without touching the command reroutes.
 	 */
 	private hideNativeChatContainer(): void {
 		const container = this.viewDescriptorService.getViewContainerById(ChatViewContainerId);
 		if (container) {
+			// Views first: left registered, they keep pointing at the removed
+			// container, which has no location, and every later
+			// `isViewVisible(ChatViewId)` (native chat contributions ask on each
+			// editor change) fails an assertion instead of answering false.
+			const viewsRegistry = Registry.as<IViewsRegistry>(ViewExtensions.ViewsRegistry);
+			const views = viewsRegistry.getViews(container);
+			if (views.length) {
+				viewsRegistry.deregisterViews(views, container);
+			}
 			Registry.as<IViewContainersRegistry>(ViewExtensions.ViewContainersRegistry).deregisterViewContainer(container);
 		}
 	}
@@ -232,6 +257,8 @@ export class OpenVSChatRedirectContribution extends Disposable implements IWorkb
 		}
 
 		this.relocateListener.clear();
+
+		this.hideNativeChatContainer();
 
 		this.fillEmptyAuxiliaryBar();
 	}

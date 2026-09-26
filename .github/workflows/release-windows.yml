@@ -7,9 +7,13 @@ name: Release Windows build
 # matched by exact file name and by the release tag's version, so:
 #   - tag releases as a v-prefixed version (v1.128.0), higher than the last one - the app
 #     finds a version's release notes at tag v<version>;
-#   - the build is stamped with the tag's version (not package.json's), because that is
-#     what an installed build compares the next release against. A build stamped with a
-#     stale version would see its own release as newer and reinstall it every hour.
+#   - the build is stamped with the tag's version, because that is what an installed build
+#     compares the next release against. A build stamped with a stale version would see its
+#     own release as newer and reinstall it every hour.
+# The tag is OpenVS's own release version (product.json `openvsVersion`). It is independent
+# of the VS Code version in package.json, which is what extensions are told they run on and
+# is never stamped: v1.0.0 once went into package.json, every extension saw "VS Code 1.0.0",
+# and the JSON, HTML, CSS and Markdown language servers refused to start.
 # There is no other CI in this fork — see README.md, "Continuous integration" — the microsoft/vscode Azure Pipelines definitions under
 # build/azure-pipelines/ target Microsoft's own self-hosted infra and cannot run here.
 # This workflow is independent of those and only builds+packages, no signing/telemetry/CG.
@@ -126,7 +130,8 @@ jobs:
         run: npm ci
 
       - name: Stamp release version
-        # After `npm ci`, which checks package.json against the lockfile.
+        # Into product.json's `openvsVersion` only - never package.json, whose version is the
+        # VS Code base every extension is checked against (see the header).
         if: steps.release.outputs.version != ''
         shell: pwsh
         env:
@@ -134,8 +139,9 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $version = $env:RELEASE_VERSION
-          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.version=process.argv[1];fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')" $version
-          Write-Host "Building as version $version"
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('product.json','utf8'));p.openvsVersion=process.argv[1];fs.writeFileSync('product.json',JSON.stringify(p,null,'\t')+'\n')" $version
+          $base = (node -p "require('./package.json').version")
+          Write-Host "Building OpenVS $version (VS Code $base)"
 
       - name: Build client (compile, mangle, minify, package)
         run: npm run gulp vscode-win32-x64-min
@@ -156,7 +162,9 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $version = (node -p "require('./package.json').version")
+          # The release version the build was stamped with; a tagless run has none and is
+          # named by the VS Code base version, as the build itself falls back to.
+          $version = (node -p "require('./product.json').openvsVersion || require('./package.json').version")
           New-Item -ItemType Directory -Force -Path out\setup | Out-Null
           # Names must match gitHubAssetName() in updateService.win32.ts exactly.
           $installers = @(

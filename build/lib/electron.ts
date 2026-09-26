@@ -257,7 +257,9 @@ function getElectron(arch: string): () => NodeJS.ReadWriteStream {
 		};
 
 		return vfs.src('package.json')
-			.pipe(jsonEditor({ name: product.nameShort }))
+			// This package.json only feeds the executable's metadata (it is filtered out below),
+			// so it carries OpenVS's release version rather than the VS Code base version.
+			.pipe(jsonEditor(product.openvsVersion ? { name: product.nameShort, version: product.openvsVersion } : { name: product.nameShort }))
 			.pipe(electron(electronOpts))
 			.pipe(filter(['**', '!**/app/package.json']))
 			.pipe(vfs.dest('.build/electron'));

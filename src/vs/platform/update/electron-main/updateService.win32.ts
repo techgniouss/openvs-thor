@@ -31,6 +31,7 @@ import { ILogService } from '../../log/common/log.js';
 import { IMeteredConnectionService } from '../../meteredConnection/common/meteredConnection.js';
 import { INativeHostMainService } from '../../native/electron-main/nativeHostMainService.js';
 import { IProductService } from '../../product/common/productService.js';
+import { getReleaseVersion } from '../../../base/common/product.js';
 import { asJson, IRequestService } from '../../request/common/request.js';
 import { IApplicationStorageMainService } from '../../storage/electron-main/storageMainService.js';
 import { ITelemetryService } from '../../telemetry/common/telemetry.js';
@@ -359,7 +360,7 @@ export class Win32UpdateService extends AbstractUpdateService implements IRelaun
 	 * feed answer from a recent reply instead of spending a request.
 	 */
 	private async fetchUpdate(url: string | undefined, pendingVersion: string | undefined, passive: boolean, token: CancellationToken): Promise<IUpdate | null> {
-		const headers = getUpdateRequestHeaders(this.productService.version);
+		const headers = getUpdateRequestHeaders(getReleaseVersion(this.productService));
 
 		if (!this.gitHubRepo) {
 			const context = await this.requestService.request({ url, headers, callSite: 'updateService.win32.checkForUpdates' }, token);
@@ -370,7 +371,7 @@ export class Win32UpdateService extends AbstractUpdateService implements IRelaun
 		const release = passive && cached && Date.now() - cached.fetchedAt < GITHUB_PASSIVE_CHECK_TTL
 			? cached.release
 			: await this.fetchLatestGitHubRelease(url, headers, token);
-		return (release && releaseToUpdate(release, pendingVersion ?? this.productService.version, this.gitHubAssetName())) ?? null;
+		return (release && releaseToUpdate(release, pendingVersion ?? getReleaseVersion(this.productService), this.gitHubAssetName())) ?? null;
 	}
 
 	private async fetchLatestGitHubRelease(url: string | undefined, headers: Record<string, string> | undefined, token: CancellationToken): Promise<IGitHubRelease | null> {
@@ -378,7 +379,7 @@ export class Win32UpdateService extends AbstractUpdateService implements IRelaun
 			url,
 			headers: {
 				// api.github.com refuses requests without a User-Agent.
-				'User-Agent': `${this.productService.applicationName}/${this.productService.version}`,
+				'User-Agent': `${this.productService.applicationName}/${getReleaseVersion(this.productService)}`,
 				...headers,
 				'Accept': 'application/vnd.github+json',
 				'X-GitHub-Api-Version': '2022-11-28',

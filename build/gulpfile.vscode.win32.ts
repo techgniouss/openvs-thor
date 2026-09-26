@@ -79,13 +79,16 @@ function buildWin32Setup(arch: string, target: string): task.CallbackTask {
 		const productJsonPath = path.join(outputPath, 'product.json');
 		const productJson = JSON.parse(fs.readFileSync(originalProductJsonPath, 'utf8'));
 		productJson['target'] = target;
+		const releaseVersion: string = productJson['openvsVersion'] || pkg.version;
 
 		const definitions: Record<string, unknown> = {
 			NameLong: product.nameLong,
 			NameShort: product.nameShort,
 			DirName: product.win32DirName,
-			Version: pkg.version,
-			RawVersion: pkg.version.replace(/-\w+$/, ''),
+			// OpenVS's release version, not the VS Code base version in package.json:
+			// this is what Windows shows under Installed Apps.
+			Version: releaseVersion,
+			RawVersion: releaseVersion.replace(/-\w+$/, ''),
 			Commit: commit,
 			NameVersion: product.win32NameVersion + (target === 'user' ? ' (User)' : ''),
 			ExeBasename: product.nameShort,

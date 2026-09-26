@@ -8,10 +8,14 @@ import { isLinuxSnap } from '../../../base/common/platform.js';
 import { localize } from '../../../nls.js';
 import { IOSProperties } from '../../native/common/native.js';
 import { IProductService } from '../../product/common/productService.js';
+import { getReleaseVersion } from '../../../base/common/product.js';
 import { process } from '../../../base/parts/sandbox/electron-browser/globals.js';
 
 export function createNativeAboutDialogDetails(productService: IProductService, osProps: IOSProperties): { title: string; details: string; detailsToCopy: string } {
-	let version = productService.version;
+	let version = getReleaseVersion(productService);
+	if (version !== productService.version) {
+		version = `${version} (VS Code ${productService.version})`;
+	}
 	if (productService.target) {
 		version = `${version} (${productService.target} setup)`;
 	} else if (productService.darwinUniversalAssetId) {

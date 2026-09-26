@@ -25,6 +25,7 @@ import { ShowCurrentReleaseNotesActionId, ShowCurrentReleaseNotesFromCurrentFile
 import { IsWebContext } from '../../../../platform/contextkey/common/contextkeys.js';
 import { IOpenerService } from '../../../../platform/opener/common/opener.js';
 import { IProductService } from '../../../../platform/product/common/productService.js';
+import { getReleaseVersion } from '../../../../base/common/product.js';
 import { URI } from '../../../../base/common/uri.js';
 
 const workbench = Registry.as<IWorkbenchContributionsRegistry>(WorkbenchExtensions.Workbench);
@@ -63,7 +64,7 @@ export class ShowReleaseNotesAction extends Action2 {
 		const instantiationService = accessor.get(IInstantiationService);
 		const productService = accessor.get(IProductService);
 		const openerService = accessor.get(IOpenerService);
-		const targetVersion = version ?? productService.version;
+		const targetVersion = version ?? getReleaseVersion(productService);
 
 		try {
 			await showReleaseNotesInEditor(instantiationService, targetVersion, false);
@@ -96,7 +97,7 @@ export class ShowCurrentReleaseNotesFromCurrentFileAction extends Action2 {
 		const productService = accessor.get(IProductService);
 
 		try {
-			await showReleaseNotesInEditor(instantiationService, productService.version, true);
+			await showReleaseNotesInEditor(instantiationService, getReleaseVersion(productService), true);
 		} catch (err) {
 			throw new Error(localize('releaseNotesFromFileNone', "Cannot open the current file as Release Notes"));
 		}
