@@ -31,11 +31,9 @@ export async function initWindowsVersionInfo() {
 	let buildNumber: number | undefined;
 	let release: string | undefined;
 	try {
-		// @ts-ignore
-		const Registry = typeof require !== 'undefined' ? require('@vscode/windows-registry') : undefined;
-		if (!Registry) {
-			throw new Error('require is not defined');
-		}
+		// A dynamic import, not `require`, which does not exist in this ESM module
+		// once built (see `id.ts`, which loads the same package the same way).
+		const Registry = await import('@vscode/windows-registry');
 		const versionKey = 'SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion';
 
 		const build = Registry.GetStringRegKey('HKEY_LOCAL_MACHINE', versionKey, 'CurrentBuild');

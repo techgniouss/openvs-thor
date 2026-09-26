@@ -26,11 +26,9 @@ export class NativePolicyService extends AbstractPolicyService implements IPolic
 		this.logService.trace(`NativePolicyService#_updatePolicyDefinitions - Found ${Object.keys(policyDefinitions).length} policy definitions`);
 
 		try {
-			// @ts-ignore
-			const { createWatcher } = typeof require !== 'undefined' ? require('@vscode/policy-watcher') : undefined;
-			if (!createWatcher) {
-				throw new Error('require is not defined');
-			}
+			// A dynamic import, not `require`, which does not exist in this ESM module
+			// once built: group policies were silently never read.
+			const { createWatcher } = await import('@vscode/policy-watcher');
 
 			await this.throttler.queue(() => new Promise<void>((c, e) => {
 				try {

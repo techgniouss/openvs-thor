@@ -345,8 +345,18 @@ export class ExtensionManagementService extends AbstractExtensionManagementServi
 		const { location, verificationStatus } = await this.extensionsDownloader.download(extension, operation, verifySignature, clientTargetPlatform);
 		const shouldRequireSignature = shouldRequireRepositorySignatureFor(extension.private, await this.extensionGalleryManifestService.getExtensionGalleryManifest());
 
+		// OpenVS: `undefined` means the verifier never ran because `@vscode/vsce-sign` could not be
+		// loaded — and it is never shipped here, its license permitting use only with Microsoft's
+		// own products. Upstream refuses the install in that case, which refused every signed
+		// extension from Open VSX. The install proceeds unverified instead; a verifier that runs
+		// and reports a bad signature is still refused below.
+		if (verifySignature && verificationStatus === undefined) {
+			this.logService.warn(`Extension signature was not verified (no signature verifier in this build): ${extension.identifier.id}`);
+		}
+
 		if (
-			verificationStatus !== ExtensionSignatureVerificationCode.Success
+			verificationStatus !== undefined
+			&& verificationStatus !== ExtensionSignatureVerificationCode.Success
 			&& !(verificationStatus === ExtensionSignatureVerificationCode.NotSigned && !shouldRequireSignature)
 			&& verifySignature
 			&& this.environmentService.isBuilt
@@ -357,10 +367,6 @@ export class ExtensionManagementService extends AbstractExtensionManagementServi
 			} catch (e) {
 				/* Ignore */
 				this.logService.warn(`Error while deleting the downloaded file`, location.toString(), getErrorMessage(e));
-			}
-
-			if (!verificationStatus) {
-				throw new ExtensionManagementError(nls.localize('signature verification not executed', "Signature verification was not executed."), ExtensionManagementErrorCode.SignatureVerificationInternal);
 			}
 
 			switch (verificationStatus) {

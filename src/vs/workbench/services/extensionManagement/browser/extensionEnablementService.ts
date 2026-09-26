@@ -154,6 +154,8 @@ export class ExtensionEnablementService extends Disposable implements IWorkbench
 			return;
 		}
 
+		this.repairChatExtensionEnablement(this._chatExtensionId);
+
 		const builtinChatExtensionEnablementMigrationKey = 'builtinChatExtensionEnablementMigration';
 		const builtinChatExtensionEnablementMigration = this.storageService.getBoolean(builtinChatExtensionEnablementMigrationKey, StorageScope.PROFILE) === true;
 		if (builtinChatExtensionEnablementMigration) {
@@ -175,15 +177,32 @@ export class ExtensionEnablementService extends Disposable implements IWorkbench
 							.catch(err => this.logService.error('Failed to update chat.disableAIFeatures setting during builtin chat extension enablement migration', err));
 					}
 				}
-			} else {
-				try {
-					// User has not used chat features before so avoid activating the chat extension by disabling it
-					this.logService.debug('Disabling builtin chat extension as chat set up is not completed');
-					this._disableExtension({ id: this._chatExtensionId });
-				} catch (error) {
-					this.logService.error('Failed to disable builtin chat extension during enablement migration', error);
-				}
 			}
+			// OpenVS: upstream disables the chat extension here until Copilot chat setup is
+			// completed. Here the chat extension is openvs-chat, which needs no setup, and that
+			// setup is force-hidden (`setForceHidden`), so it never completes: every fresh profile
+			// disabled OpenVS Chat for good, with nothing in the UI saying why.
+		}
+	}
+
+	/**
+	 * OpenVS: re-enables the chat extension once in profiles where an earlier build's copy of
+	 * the migration above disabled it. That migration ran silently on first launch, so its
+	 * disabled state is almost never a choice the user made; the one-time key means a later,
+	 * deliberate disable is respected.
+	 */
+	private repairChatExtensionEnablement(chatExtensionId: string): void {
+		const repairKey = 'openvsChatExtensionEnablementRepair';
+		if (this.storageService.getBoolean(repairKey, StorageScope.PROFILE) === true) {
+			return;
+		}
+
+		this.storageService.store(repairKey, true, StorageScope.PROFILE, StorageTarget.MACHINE);
+		const migrated = this.storageService.getBoolean('builtinChatExtensionEnablementMigration', StorageScope.PROFILE) === true;
+		if (migrated && this._isDisabledGlobally({ id: chatExtensionId })) {
+			this.logService.info('Re-enabling the builtin chat extension disabled by the chat setup migration');
+			this._enableExtension({ id: chatExtensionId })
+				.catch(error => this.logService.error('Failed to re-enable the builtin chat extension', error));
 		}
 	}
 

@@ -1174,7 +1174,9 @@ suite('ExtensionEnablementService Test', () => {
 		assert.deepStrictEqual((<IExtension>target.args[0][0][0]).identifier, { id: 'pub.a' });
 	});
 
-	test('test chat extension is disabled on profile switch when setup is not completed', async () => {
+	test('test chat extension stays enabled in a fresh profile when setup is not completed', async () => {
+		// OpenVS: the chat extension is openvs-chat, which needs no setup (and whose setup is
+		// force-hidden, so it never completes); upstream disabled it here in every fresh profile.
 		const chatExtensionId = productService.defaultChatAgent!.chatExtensionId;
 		const chatExtension = aLocalExtension(chatExtensionId, undefined, ExtensionType.System);
 		installed.push(chatExtension);
@@ -1189,19 +1191,33 @@ suite('ExtensionEnablementService Test', () => {
 
 		testObject = disposableStore.add(new TestExtensionEnablementService(instantiationService, chatEntitlementService));
 		await testObject.waitUntilInitialized();
-
-		// Chat extension should be disabled after initial setup
-		assert.strictEqual(testObject.getEnablementState(chatExtension), EnablementState.DisabledGlobally);
-
-		// Enable the chat extension to simulate it being enabled in a previous profile
-		await testObject.setEnablement([chatExtension], EnablementState.EnabledGlobally);
 		assert.strictEqual(testObject.getEnablementState(chatExtension), EnablementState.EnabledGlobally);
 
 		// Simulate switching to a fresh profile by clearing the migration flag
 		storageService = instantiationService.get(IStorageService);
 		storageService.store('builtinChatExtensionEnablementMigration', false, StorageScope.PROFILE, StorageTarget.MACHINE);
+		assert.strictEqual(testObject.getEnablementState(chatExtension), EnablementState.EnabledGlobally);
+	});
 
-		// Chat extension should be disabled again after computing enablement state
+	test('test chat extension disabled by the setup migration is re-enabled once', async () => {
+		const chatExtensionId = productService.defaultChatAgent!.chatExtensionId;
+		const chatExtension = aLocalExtension(chatExtensionId, undefined, ExtensionType.System);
+		installed.push(chatExtension);
+
+		// A profile an earlier build migrated: flag set, chat extension disabled, no repair yet
+		const storageService = instantiationService.get(IStorageService);
+		storageService.store('builtinChatExtensionEnablementMigration', true, StorageScope.PROFILE, StorageTarget.MACHINE);
+		storageService.remove('openvsChatExtensionEnablementRepair', StorageScope.PROFILE);
+		await testObject.setEnablement([chatExtension], EnablementState.DisabledGlobally);
+
+		testObject = disposableStore.add(new TestExtensionEnablementService(instantiationService));
+		await testObject.waitUntilInitialized();
+		assert.strictEqual(testObject.getEnablementState(chatExtension), EnablementState.EnabledGlobally);
+
+		// A deliberate disable after the repair is respected
+		await testObject.setEnablement([chatExtension], EnablementState.DisabledGlobally);
+		testObject = disposableStore.add(new TestExtensionEnablementService(instantiationService));
+		await testObject.waitUntilInitialized();
 		assert.strictEqual(testObject.getEnablementState(chatExtension), EnablementState.DisabledGlobally);
 	});
 

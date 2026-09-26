@@ -1,0 +1,13 @@
+src/**
+out/**
+scripts/**
+examples/**
+tsconfig*.json
+**/*.tsbuildinfo
+.vscode/**
+esbuild*
+package-lock.json
+media/*.d.ts
+.env
+.env.*
+.secrets/**

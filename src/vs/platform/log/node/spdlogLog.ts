@@ -20,11 +20,10 @@ enum SpdLogLevel {
 async function createSpdLogLogger(name: string, logfilePath: string, filesize: number, filecount: number, donotUseFormatters: boolean): Promise<spdlog.Logger | null> {
 	// Do not crash if spdlog cannot be loaded
 	try {
-		// @ts-ignore
-		const _spdlog = typeof require !== 'undefined' ? require('@vscode/spdlog') : undefined;
-		if (!_spdlog) {
-			throw new Error('require is not defined');
-		}
+		// A dynamic import, not `require`: this module is ESM, where `require` exists
+		// only as the bundler's throwing stub — every product build fell back to the
+		// console logger and wrote no log files at all.
+		const _spdlog = await import('@vscode/spdlog');
 		_spdlog.setFlushOn(SpdLogLevel.Trace);
 		const logger = await _spdlog.createAsyncRotatingLogger(name, logfilePath, filesize, filecount);
 		if (donotUseFormatters) {

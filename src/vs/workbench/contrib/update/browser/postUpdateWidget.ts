@@ -17,6 +17,7 @@ import { ILayoutService } from '../../../../platform/layout/browser/layoutServic
 import { IMarkdownRendererService, openLinkFromMarkdown } from '../../../../platform/markdown/browser/markdownRenderer.js';
 import { IOpenerService } from '../../../../platform/opener/common/opener.js';
 import { IProductService } from '../../../../platform/product/common/productService.js';
+import { getReleaseVersion } from '../../../../base/common/product.js';
 import { asTextOrError, IRequestService } from '../../../../platform/request/common/request.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { ITelemetryService } from '../../../../platform/telemetry/common/telemetry.js';
@@ -117,7 +118,7 @@ export class PostUpdateWidgetContribution extends Disposable implements IWorkben
 		// shares; a product updating from GitHub Releases has none of its own to show here.
 		if (!input && !parseGitHubReleasesRepo(this.productService.updateUrl)) {
 			try {
-				const url = getUpdateInfoUrl(this.productService.version);
+				const url = getUpdateInfoUrl(getReleaseVersion(this.productService));
 				const context = await this.requestService.request({ url, callSite: 'postUpdateWidget' }, CancellationToken.None);
 				input = await asTextOrError(context);
 			} catch { }
@@ -133,7 +134,7 @@ export class PostUpdateWidgetContribution extends Disposable implements IWorkben
 				...info, buttons: [{
 					label: localize('postUpdate.releaseNotes', "Release Notes"),
 					commandId: ShowCurrentReleaseNotesActionId,
-					args: [this.productService.version],
+					args: [getReleaseVersion(this.productService)],
 					style: 'secondary'
 				}]
 			};
@@ -181,7 +182,7 @@ export class PostUpdateWidgetContribution extends Disposable implements IWorkben
 		// Title
 		const titleEl = dom.append(body, dom.$('.title'));
 		titleEl.id = titleId;
-		titleEl.textContent = title ?? localize('postUpdate.title', "New in {0}", this.productService.version);
+		titleEl.textContent = title ?? localize('postUpdate.title', "New in {0}", getReleaseVersion(this.productService));
 
 		// Features (preferred) or markdown body
 		if (features?.length) {
@@ -276,7 +277,7 @@ export class PostUpdateWidgetContribution extends Disposable implements IWorkben
 		} catch { }
 
 		const to: ILastKnownVersion = {
-			version: this.productService.version,
+			version: getReleaseVersion(this.productService),
 			commit: this.productService.commit,
 			timestamp: Date.now(),
 		};

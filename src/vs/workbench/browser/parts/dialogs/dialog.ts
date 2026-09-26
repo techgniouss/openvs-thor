@@ -13,6 +13,7 @@ import { IKeybindingService } from '../../../../platform/keybinding/common/keybi
 import { ResultKind } from '../../../../platform/keybinding/common/keybindingResolver.js';
 import { ILayoutService } from '../../../../platform/layout/browser/layoutService.js';
 import { IProductService } from '../../../../platform/product/common/productService.js';
+import { getReleaseVersion } from '../../../../base/common/product.js';
 import { defaultButtonStyles, defaultCheckboxStyles, defaultInputBoxStyles, defaultDialogStyles } from '../../../../platform/theme/browser/defaultStyles.js';
 
 const defaultDialogAllowableCommands = new Set([
@@ -45,11 +46,22 @@ export function createWorkbenchDialogOptions(options: Partial<IDialogOptions>, k
 	};
 }
 
+/**
+ * OpenVS's release version, with the VS Code version it is based on when the two differ.
+ */
+function formatBrowserAboutVersion(productService: IProductService): string {
+	const release = getReleaseVersion(productService);
+	if (!release) {
+		return 'Unknown';
+	}
+	return release === productService.version ? release : `${release} (VS Code ${productService.version})`;
+}
+
 export function createBrowserAboutDialogDetails(productService: IProductService): { title: string; details: string; detailsToCopy: string } {
 	const detailString = (useAgo: boolean): string => {
 		return localize('aboutDetail',
 			"Version: {0}\nCommit: {1}\nDate: {2}\nBrowser: {3}",
-			productService.version || 'Unknown',
+			formatBrowserAboutVersion(productService),
 			productService.commit || 'Unknown',
 			productService.date ? `${productService.date}${useAgo ? ' (' + fromNow(new Date(productService.date), true) + ')' : ''}` : 'Unknown',
 			navigator.userAgent
