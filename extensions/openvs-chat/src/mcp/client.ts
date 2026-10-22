@@ -71,6 +71,33 @@ export function flattenContent(content: unknown): string {
 	return text || '(no output)';
 }
 
+/** How to launch an MCP server process. */
+export interface SpawnPlan {
+	readonly file: string;
+	readonly args: string[];
+	readonly shell: boolean;
+}
+
+/** Quotes one token for cmd.exe, which `npx` and every other `.cmd` shim is run through. */
+function quoteForCmd(token: string): string {
+	return token === '' || /[\s"&|<>^()%!]/.test(token) ? `"${token.replace(/"/g, '""')}"` : token;
+}
+
+/**
+ * How to start `command` on `platform`.
+ *
+ * On Windows `npx`, `uvx`-style launchers and most package-manager tools are `.cmd` shims, and
+ * Node cannot spawn those directly (ENOENT, or EINVAL on current Node) — which is how nearly
+ * every published MCP server is configured. Anything that is not an `.exe`/`.com` therefore goes
+ * through the shell as one quoted command line; elsewhere the arguments are passed untouched.
+ */
+export function planSpawn(command: string, args: readonly string[], platform: NodeJS.Platform = process.platform): SpawnPlan {
+	if (platform !== 'win32' || /\.(exe|com)$/i.test(command)) {
+		return { file: command, args: [...args], shell: false };
+	}
+	return { file: [command, ...args].map(quoteForCmd).join(' '), args: [], shell: true };
+}
+
 export interface McpStdioConfig {
 	readonly command: string;
 	readonly args?: string[];
@@ -96,10 +123,13 @@ export class McpStdioClient {
 
 	/** Spawns the server and completes the MCP initialize handshake. */
 	async start(): Promise<void> {
-		this.proc = spawn(this.config.command, this.config.args ?? [], {
+		const plan = planSpawn(this.config.command, this.config.args ?? []);
+		this.proc = spawn(plan.file, plan.args, {
 			env: { ...process.env, ...(this.config.env ?? {}) },
 			cwd: this.config.cwd,
 			stdio: ['pipe', 'pipe', 'pipe'],
+			shell: plan.shell,
+			windowsHide: true,
 		});
 		this.proc.stdout?.on('data', (chunk: any) => this.onData(chunk));
 		// stderr MUST be drained. It is piped, and a pipe nobody reads fills its OS buffer
@@ -146,7 +176,13 @@ export class McpStdioClient {
 	dispose(): void {
 		this.closed = true;
 		try {
-			this.proc?.kill();
+			// A server launched through cmd.exe is a grandchild of this process; killing the
+			// shell alone would orphan it, and every restart would leak another.
+			if (process.platform === 'win32' && this.proc?.pid !== undefined) {
+				spawn('taskkill', ['/pid', String(this.proc.pid), '/T', '/F'], { windowsHide: true }).on('error', () => this.proc?.kill());
+			} else {
+				this.proc?.kill();
+			}
 		} catch {
 			// ignore
 		}
@@ -174,8 +210,15 @@ export class McpStdioClient {
 		} catch {
 			return; // ignore non-JSON (some servers log to stdout)
 		}
+		if (typeof message?.method === 'string') {
+			// A request or notification FROM the server. It must not reach the response lookup
+			// below: server and client number their requests independently, so a server's
+			// `roots/list` with id 1 would resolve our own pending request 1 with nothing.
+			this.answerServerRequest(message);
+			return;
+		}
 		if (typeof message?.id !== 'number' || !this.pending.has(message.id)) {
-			return; // notifications / server requests are ignored
+			return;
 		}
 		const entry = this.pending.get(message.id)!;
 		this.pending.delete(message.id);
@@ -184,6 +227,25 @@ export class McpStdioClient {
 			entry.reject(new Error(message.error.message ?? 'MCP error'));
 		} else {
 			entry.resolve(message.result);
+		}
+	}
+
+	/**
+	 * Replies to a server-initiated request so the server is never left waiting: `ping` is
+	 * required to be answered, and everything else (sampling, roots) is a capability this client
+	 * did not declare, so it is declined rather than ignored.
+	 */
+	private answerServerRequest(message: { id?: unknown; method: string }): void {
+		if (typeof message.id !== 'number' && typeof message.id !== 'string') {
+			return; // a notification: nothing to answer
+		}
+		const reply = message.method === 'ping'
+			? { jsonrpc: '2.0', id: message.id, result: {} }
+			: { jsonrpc: '2.0', id: message.id, error: { code: -32601, message: `Method not found: ${message.method}` } };
+		try {
+			this.proc?.stdin?.write(JSON.stringify(reply) + '\n');
+		} catch {
+			// the process is going away; its exit handler reports that
 		}
 	}
 

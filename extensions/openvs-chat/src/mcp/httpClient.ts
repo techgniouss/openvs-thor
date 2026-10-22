@@ -331,8 +331,10 @@ export class McpHttpClient {
 		// A batch is legal on the wire, and a server that answers one request per element
 		// would otherwise have every reply dropped.
 		for (const entry of Array.isArray(message) ? message : [message]) {
-			if (typeof entry?.id !== 'number') {
-				continue; // notifications and server-initiated requests are ignored
+			if (typeof entry?.id !== 'number' || typeof entry?.method === 'string') {
+				// Notifications, and server-initiated requests — which carry an id of the
+				// SERVER's own numbering and so must never be matched against our pending ones.
+				continue;
 			}
 			const waiting = this.pending.get(entry.id);
 			if (!waiting) {
