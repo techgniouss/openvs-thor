@@ -37,6 +37,8 @@ const KNOWN = new Set(['read_file', 'list_dir', 'search_files', 'glob_files', 'w
 		['', {}],
 		['```json\n{"path":"src/a.ts"}\n```', { path: 'src/a.ts' }],                     // fenced
 		['{"path":"src/a.ts",}', { path: 'src/a.ts' }],                                  // trailing comma
+		['{"path":"C:\\Users\\me\\a.ts"}', { path: 'C:\\Users\\me\\a.ts' }],         // undoubled Windows path backslashes
+		['{path: "a.ts", content: "x, y: z"}', { path: 'a.ts', content: 'x, y: z' }],     // bare keys; a key-looking string is untouched
 		['{"path":"src/a.ts", "replaceAll": True}', { path: 'src/a.ts', replaceAll: true }], // Python literals
 		['{"path":"src/a.ts", "limit": None}', { path: 'src/a.ts', limit: null }],
 		['"{\\"path\\":\\"src/a.ts\\"}"', { path: 'src/a.ts' }],                          // double-encoded

@@ -157,7 +157,17 @@ function* repairs(text: string): Generator<string> {
 	if (escaped !== quoted) {
 		yield escaped;
 	}
-	const literals = escaped
+	// Backslashes the model did not double: a Windows path (`C:\Users\me`) written straight into
+	// the JSON is the commonest source, and `\U` is not an escape, so the call fails to parse.
+	const slashes = fixInvalidEscapes(escaped);
+	if (slashes !== escaped) {
+		yield slashes;
+	}
+	const keyed = quoteBareKeys(slashes);
+	if (keyed !== slashes) {
+		yield keyed;
+	}
+	const literals = keyed
 		.replace(/(^|[[{,:]\s*)True(\s*[,}\]]|$)/g, '$1true$2')
 		.replace(/(^|[[{,:]\s*)False(\s*[,}\]]|$)/g, '$1false$2')
 		.replace(/(^|[[{,:]\s*)(None|NaN|undefined)(\s*[,}\]]|$)/g, '$1null$3');
@@ -228,6 +238,71 @@ function escapeControlChars(text: string): string {
 			out += ch === '\n' ? '\\n' : ch === '\r' ? '\\r' : ch === '\t' ? '\\t' : `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`;
 		} else {
 			out += ch;
+		}
+	}
+	return out;
+}
+
+/**
+ * Doubles a backslash inside a string when what follows is not a JSON escape (`\U` in
+ * `C:\Users`, `\d` in a regex), so the character survives as written instead of failing the
+ * parse. Valid escapes are left alone — `\t` in `C:\temp` is ambiguous, and reading it as the
+ * tab the JSON says is the only answer that does not corrupt real escapes.
+ */
+function fixInvalidEscapes(text: string): string {
+	let out = '';
+	let inString = false;
+	for (let i = 0; i < text.length; i++) {
+		const ch = text[i];
+		if (!inString) {
+			inString = ch === '"';
+			out += ch;
+		} else if (ch === '"') {
+			inString = false;
+			out += ch;
+		} else if (ch === '\\') {
+			const next = text[i + 1];
+			const valid = next !== undefined && ('"\\/bfnrt'.includes(next) || (next === 'u' && /^[0-9a-fA-F]{4}/.test(text.slice(i + 2, i + 6))));
+			out += valid ? ch + next : '\\\\';
+			if (valid) {
+				i++;
+			}
+		} else {
+			out += ch;
+		}
+	}
+	return out;
+}
+
+/** Quotes object keys written bare (`{path: "a.ts"}`), the JavaScript habit; strings are untouched. */
+function quoteBareKeys(text: string): string {
+	let out = '';
+	let inString = false;
+	let escaped = false;
+	for (let i = 0; i < text.length; i++) {
+		const ch = text[i];
+		if (inString) {
+			out += ch;
+			if (escaped) {
+				escaped = false;
+			} else if (ch === '\\') {
+				escaped = true;
+			} else if (ch === '"') {
+				inString = false;
+			}
+			continue;
+		}
+		out += ch;
+		if (ch === '"') {
+			inString = true;
+		} else if (ch === '{' || ch === ',') {
+			const key = /(\s*)([A-Za-z_$][\w$-]*)(\s*:)/y;
+			key.lastIndex = i + 1;
+			const match = key.exec(text);
+			if (match) {
+				out += `${match[1]}"${match[2]}"${match[3]}`;
+				i = key.lastIndex - 1;
+			}
 		}
 	}
 	return out;
