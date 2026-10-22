@@ -109,6 +109,35 @@ export interface Guardrails {
 	readonly shell: string;
 }
 
+/**
+ * Fallbacks for the two hard guardrail lists, equal to the manifest defaults
+ * (`test-guardrail-defaults` pins that). They exist so that a host which cannot supply the
+ * contribution — and so returns `undefined` — fails closed: an empty list here would silently
+ * switch the denied-command and protected-path checks off.
+ */
+export const DEFAULT_DENIED_COMMANDS: readonly string[] = [
+	'rm\\s+-[a-z]*r[a-z]*f|rm\\s+-[a-z]*f[a-z]*r',
+	':\\(\\)\\s*\\{\\s*:\\s*\\|\\s*:',
+	'\\bmkfs\\b',
+	'\\bdd\\s+if=',
+	'\\bsudo\\b',
+	'git\\s+push\\s+.*(--force|-f)\\b',
+	'\\b(curl|wget)\\b[^|]*\\|\\s*(sudo\\s+)?(ba)?sh',
+	'>\\s*/dev/sd[a-z]',
+	'\\b(shutdown|reboot|halt|poweroff)\\b',
+	'chmod\\s+-R\\s+777\\s+/',
+];
+
+export const DEFAULT_PROTECTED_PATHS: readonly string[] = [
+	'.git',
+	'.env',
+	'.env.*',
+	'*.pem',
+	'*.key',
+	'id_rsa',
+	'.ssh',
+];
+
 function compile(patterns: string[]): RegExp[] {
 	const out: RegExp[] = [];
 	for (const p of patterns) {
@@ -126,9 +155,9 @@ export function loadGuardrails(): Guardrails {
 	const cfg = vscode.workspace.getConfiguration('openvsChat');
 	return {
 		approval: parseApprovalPolicy(cfg.get<string>('guardrails.approval')),
-		deniedCommands: compile(cfg.get<string[]>('guardrails.deniedCommands') ?? []),
+		deniedCommands: compile(cfg.get<string[]>('guardrails.deniedCommands') ?? [...DEFAULT_DENIED_COMMANDS]),
 		allowedCommands: compile(cfg.get<string[]>('guardrails.allowedCommands') ?? []),
-		protectedPaths: cfg.get<string[]>('guardrails.protectedPaths') ?? [],
+		protectedPaths: cfg.get<string[]>('guardrails.protectedPaths') ?? [...DEFAULT_PROTECTED_PATHS],
 		// Matches the manifest default. They disagreed (60s here, 300s there), so anything
 		// reading the setting without the contribution registered — a test, a host that
 		// hasn't activated the extension — silently got a timeout five times shorter than
