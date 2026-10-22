@@ -447,7 +447,17 @@ export abstract class OpenAICompatibleProvider implements ChatProvider {
 				request.onToken?.(delta.content);
 			}
 			for (const tc of delta.tool_calls ?? []) {
-				const index: number = typeof tc.index === 'number' ? tc.index : 0;
+				let index: number = typeof tc.index === 'number' ? tc.index : 0;
+				// Fragments are keyed by `index`, but several gateways (Gemini's compatibility
+				// endpoint, some proxies) send every parallel call as index 0 and tell them apart
+				// only by id. Merged by index alone, their names overwrite each other and their
+				// arguments concatenate into one unparseable call. A different id on an occupied
+				// slot is therefore a new call; fragments that repeat or omit the id still merge.
+				const existing = acc.get(index);
+				if (tc.id && existing?.id && existing.id !== tc.id) {
+					const known = [...acc.entries()].find(([, c]) => c.id === tc.id);
+					index = known ? known[0] : Math.max(...acc.keys()) + 1;
+				}
 				const cur = acc.get(index) ?? { args: '' };
 				if (tc.id) { cur.id = tc.id; }
 				if (tc.function?.name) { cur.name = tc.function.name; }

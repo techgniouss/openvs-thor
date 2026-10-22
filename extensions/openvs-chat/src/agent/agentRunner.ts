@@ -1997,6 +1997,12 @@ export class AgentRunner {
 		if (this.budget.spawned >= this.guardrails.maxSubagents) {
 			return { result: `Sub-agent budget (${this.guardrails.maxSubagents}) exhausted; do this work yourself.`, isError: true };
 		}
+		// Enforced here as well as in `toolSet`, which only controls what is *offered*: a model
+		// can emit a call to a tool it was never given, and a read-only Ask/Plan run must not
+		// be able to start a write-capable delegate (or nest past the configured depth) that way.
+		if (this.readOnly || this.depth >= this.guardrails.maxSubagentDepth) {
+			return { result: 'spawn_subagent is not available in this run; do this work yourself.', isError: true };
+		}
 		this.budget.spawned++;
 
 		const child = new AgentRunner(this.provider, this.approver, Math.max(3, Math.floor(this.maxSteps / 2)), {

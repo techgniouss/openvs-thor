@@ -393,4 +393,35 @@ const sentIds = (bodies, n) => bodies[n].messages.flatMap(
 	);
 }
 
+// Parallel tool calls are keyed by `index` in the stream, but Gemini's compatibility endpoint and
+// some proxies send every call as index 0, told apart only by id. Merged by index, the second
+// call's name overwrote the first and the arguments concatenated into unparseable JSON.
+{
+	const sse = chunks => () => new Response(new ReadableStream({
+		start(controller) {
+			for (const c of chunks) {
+				controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(c)}\n\n`));
+			}
+			controller.close();
+		},
+	}), { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+	const call = (index, id, name, args) => ({ choices: [{ delta: { tool_calls: [{ index, id, type: 'function', function: { name, arguments: args } }] } }] });
+	const stop = { choices: [{ delta: {}, finish_reason: 'tool_calls' }] };
+	const run = async chunks => {
+		stubFetch([sse(chunks)]);
+		const step = await new NvidiaProvider().runAgentStep(request());
+		return step.toolCalls.map(c => [c.id, c.name, c.args]);
+	};
+	assert.deepEqual(
+		await run([call(0, 'a', 'read_file', '{"path":"a.ts"}'), call(0, 'b', 'list_dir', '{"path":"."}'), stop]),
+		[['a', 'read_file', { path: 'a.ts' }], ['b', 'list_dir', { path: '.' }]],
+		'calls sharing index 0 but carrying distinct ids stay separate',
+	);
+	assert.deepEqual(
+		await run([call(0, 'a', 'read_file', '{"path":'), call(0, undefined, undefined, '"a.ts"}'), call(1, 'b', 'list_dir', '{}'), stop]),
+		[['a', 'read_file', { path: 'a.ts' }], ['b', 'list_dir', {}]],
+		'ordinary fragments (id only on the first) still merge by index',
+	);
+}
+
 console.log('test-provider-messages.mjs: all assertions passed');

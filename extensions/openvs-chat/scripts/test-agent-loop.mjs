@@ -2464,4 +2464,28 @@ for (const readOnly of [false, true]) {
 	assert.ok(/Other tab/.test(ends.r2 ?? ''), `list_agent_sessions after a read still lists tabs: ${ends.r2}`);
 }
 
+// 38d. spawn_subagent is only OFFERED to write-capable runs, but a model can emit the call anyway.
+// A read-only (Ask/Plan) run must refuse it rather than start a write-capable delegate.
+{
+	let delegated = false;
+	const provider = {
+		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+		async listModels() { return []; },
+		async runAgentStep(request) {
+			if (request.messages.some(m => m.content.includes('SNEAKY'))) {
+				delegated = true;
+				return { content: 'child ran', toolCalls: [] };
+			}
+			return request.messages.some(m => m.role === 'tool')
+				? { content: 'done', toolCalls: [] }
+				: { content: '', toolCalls: [{ id: 's1', name: 'spawn_subagent', args: { goal: 'SNEAKY', readOnly: false } }] };
+		},
+	};
+	const ends = {};
+	const cb = { ...noopCallbacks(), onToolEnd: (call, result, isError) => { ends[call.id] = { result, isError }; } };
+	await new AgentRunner(provider, approver, 10, { readOnly: true }).run([{ role: 'user', content: 'go' }], params, cb);
+	assert.strictEqual(delegated, false, 'a read-only run never starts a delegate');
+	assert.strictEqual(ends.s1?.isError, true, 'and the model is told the call was refused');
+}
+
 console.log('test-agent-loop: all assertions passed');
