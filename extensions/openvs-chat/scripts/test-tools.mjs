@@ -71,7 +71,8 @@ const vscodeStub = {
 				}
 				return new TextEncoder().encode(text);
 			},
-			async writeFile(u, bytes) { files.set(u.fsPath, new TextDecoder().decode(bytes)); },
+			// ignoreBOM: a real file system stores the bytes as given, BOM included.
+			async writeFile(u, bytes) { files.set(u.fsPath, new TextDecoder('utf-8', { ignoreBOM: true }).decode(bytes)); },
 			async readDirectory() { return []; },
 			async stat(u) {
 				if (!files.has(u.fsPath) && !dirs.has(u.fsPath)) { throw new Error(`ENOENT: ${u.fsPath}`); }
@@ -649,6 +650,25 @@ function reset(initial = {}, options = {}) {
 		setFolders([[ROOT, 'repo']]);
 		fsMod.rmSync(base, { recursive: true, force: true });
 	}
+}
+
+// write_file with no `content` must not truncate the target to an empty file.
+{
+	files.set('/repo/keep.txt', 'important\n');
+	const out = await run('write_file', { path: 'keep.txt' });
+	assert.strictEqual(out.isError, true, 'a write with no content argument is refused');
+	assert.strictEqual(files.get('/repo/keep.txt'), 'important\n', 'and the file is untouched');
+	assert.strictEqual((await run('write_file', { path: 'empty.txt', content: '' })).isError, false, 'an explicitly empty file is still allowed');
+}
+
+// A UTF-8 BOM survives an edit and a full overwrite (PowerShell 5 and other Windows tools need it).
+{
+	files.set('/repo/bom.ps1', '\uFEFFWrite-Host "héllo"\n');
+	const edit = await run('edit_file', { path: 'bom.ps1', oldText: 'héllo', newText: 'wörld' });
+	assert.strictEqual(edit.isError, false, edit.result);
+	assert.strictEqual(files.get('/repo/bom.ps1'), '\uFEFFWrite-Host "wörld"\n', 'edit keeps the BOM');
+	await run('write_file', { path: 'bom.ps1', content: 'Write-Host 1\n' });
+	assert.strictEqual(files.get('/repo/bom.ps1'), '\uFEFFWrite-Host 1\n', 'overwrite keeps the BOM');
 }
 
 console.log('test-tools: all assertions passed');

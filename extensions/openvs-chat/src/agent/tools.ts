@@ -643,6 +643,11 @@ export async function executeTool(rawCall: ToolCall, approver: ToolApprover, gua
 				return await fetchUrl(asString(call.args.url), asBoolean(call.args.raw), approver, g, limits?.maxReadChars, signal);
 			case 'write_file': {
 				const found = pathArg(true);
+				if (found.ok && (call.args.content === undefined || call.args.content === null)) {
+					// Absent is not empty: reading it as '' would overwrite the file with nothing,
+					// which is how a call whose arguments were cut short destroys a real file.
+					return { result: 'write_file requires "content" (the complete new file text). Nothing was written; send the call again with the content, or use edit_file for a targeted change.', isError: true };
+				}
 				return found.ok ? await writeFile(found.target, asString(call.args.content), approver, g)
 					: { result: found.error, isError: true };
 			}
@@ -1020,7 +1025,10 @@ export function renderDiff(before: string, after: string): string {
 /** Reads a file's current text, or undefined when it doesn't exist yet. */
 async function readIfExists(uri: vscode.Uri): Promise<string | undefined> {
 	try {
-		return new TextDecoder().decode(await vscode.workspace.fs.readFile(uri));
+		// `ignoreBOM` keeps a leading U+FEFF in the text instead of silently dropping it, so an
+		// edit written back out keeps the file's BOM (PowerShell 5 and several Windows tools
+		// read a BOM-less file as the wrong encoding).
+		return new TextDecoder('utf-8', { ignoreBOM: true }).decode(await vscode.workspace.fs.readFile(uri));
 	} catch {
 		return undefined;
 	}
@@ -1107,6 +1115,10 @@ async function writeFile(target: WorkspacePath, content: string, approver: ToolA
 		if (!approved) {
 			return { result: denialMessage('write', feedback), isError: true };
 		}
+	}
+	// A full overwrite keeps the BOM the file had; the model's text never includes one.
+	if (existing?.startsWith('\uFEFF') && !content.startsWith('\uFEFF')) {
+		content = '\uFEFF' + content;
 	}
 	await vscode.workspace.fs.writeFile(target.uri, new TextEncoder().encode(content));
 	approver.recordWrite?.({ uri: target.uri, path, before: existing, after: content });
