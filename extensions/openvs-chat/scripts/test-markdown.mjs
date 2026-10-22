@@ -94,4 +94,16 @@ assert.equal(escapeHtml(`<&"'>`), '&lt;&amp;&quot;&#39;&gt;');
 	assert.match(html, /<\/details>Answer<br \/>$/);
 }
 
+// A target holding balanced parentheses (Wikipedia-style) is one link, not a link and a stray `)`.
+assert.equal(render('[w](https://en.wikipedia.org/wiki/Foo_(bar))'),
+	'<a href="https://en.wikipedia.org/wiki/Foo_(bar)">w</a><br />');
+assert.equal(render('see https://en.wikipedia.org/wiki/Foo_(bar) now'),
+	'see <a href="https://en.wikipedia.org/wiki/Foo_(bar)">https://en.wikipedia.org/wiki/Foo_(bar)</a> now<br />');
+assert.equal(render('(see https://a.com/x).'), '(see <a href="https://a.com/x">https://a.com/x</a>).<br />',
+	'an unbalanced closing parenthesis still stays outside the link');
+
+// A fence indented under a list item loses the item's indent, front and back.
+assert.match(render('1. a\n   ```js\n   if (x) {\n     y();\n   }\n   ```\n2. b'),
+	/<code class="language-js" data-language="js">if \(x\) \{\n  y\(\);\n\}<\/code>/);
+
 console.log('PASS test-markdown.mjs');

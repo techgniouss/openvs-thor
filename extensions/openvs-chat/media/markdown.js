@@ -94,7 +94,9 @@
 		// anchor. An image (`![alt](url)`) is rendered as a link, not an <img>: a transcript
 		// that silently fetches a URL a model wrote is an exfiltration channel, and a link
 		// the user chooses to open is not.
-		out = out.replace(/(!?)\[([^\]\n]*)\]\(\s*([^\s)]+)\s*\)/g, (m, bang, label, url) => {
+		// The target may hold one level of balanced parentheses (`…/wiki/Foo_(bar)`), which a plain
+		// "up to the first )" cut short — truncating the href and leaving a stray `)` in the text.
+		out = out.replace(/(!?)\[([^\]\n]*)\]\(\s*((?:[^\s()]|\([^\s()]*\))+)\s*\)/g, (m, bang, label, url) => {
 			const href = safeHref(url);
 			if (!href) {
 				return m;
@@ -104,7 +106,7 @@
 		});
 		// Bare URLs. Trailing sentence punctuation is left outside the link — "see https://x.com."
 		// should not link the full stop.
-		out = out.replace(/(^|[\s(])(https?:\/\/[^\s<>()]+[^\s<>().,;:!?'"])/g,
+		out = out.replace(/(^|[\s(])(https?:\/\/(?:[^\s<>()]|\([^\s<>()]*\))*(?:[^\s<>().,;:!?'"]|\([^\s<>()]*\)))/g,
 			(_m, lead, url) => `${lead}${hold(`<a href="${url}">${url}</a>`)}`);
 
 		out = out.replace(/\*\*([^*\n]+)\*\*/g, (_m, s) => hold(`<strong>${s}</strong>`));
@@ -340,6 +342,14 @@
 					language = block.slice(0, nl).trim();
 					code = block.slice(nl + 1);
 				}
+				// A fence nested in a list item is indented with the item, and so is every line of
+				// its body and the line holding the closing fence. Taking that indent back off keeps
+				// the code as written instead of shifted, with stray whitespace after its last line.
+				const indent = /(?:^|\n)([ \t]+)$/.exec(parts[i - 1])?.[1];
+				if (indent) {
+					code = code.split('\n').map(line => line.startsWith(indent) ? line.slice(indent.length) : line.replace(/^[ \t]+/, '')).join('\n');
+				}
+				code = code.replace(/\n[ \t]*$/, '\n');
 				// The language is kept on the element (rather than dropped as it was) so the
 				// Copy/Insert bar and any later highlighting have something to key off.
 				const attr = language ? ` class="language-${escapeHtml(language)}" data-language="${escapeHtml(language)}"` : '';
