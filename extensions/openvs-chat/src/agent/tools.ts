@@ -1883,7 +1883,7 @@ async function readCapped(response: Response, maxBytes: number): Promise<string>
 /** How long Stop waits for a killed command to exit before returning anyway. */
 const STOP_GRACE_MS = 3_000;
 
-function killTree(child: ReturnType<typeof spawn>): void {
+function killTree(child: ReturnType<typeof spawn>, signal: NodeJS.Signals = 'SIGTERM'): void {
 	if (child.pid === undefined) {
 		return;
 	}
@@ -1891,10 +1891,10 @@ function killTree(child: ReturnType<typeof spawn>): void {
 		if (process.platform === 'win32') {
 			spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true }).on('error', () => child.kill());
 		} else {
-			process.kill(-child.pid, 'SIGTERM');
+			process.kill(-child.pid, signal);
 		}
 	} catch {
-		child.kill();
+		child.kill(signal);
 	}
 }
 
@@ -1954,7 +1954,12 @@ async function runCommand(dir: vscode.Uri, dirLabel: string, command: string, ap
 		const onStop = () => {
 			stopped = true;
 			killTree(child);
-			setTimeout(cancel, STOP_GRACE_MS);
+			setTimeout(() => {
+				if (!settled) {
+					killTree(child, 'SIGKILL');
+				}
+				cancel();
+			}, STOP_GRACE_MS);
 		};
 		const finish = (result: ToolResult) => {
 			if (!settled) {
@@ -1978,7 +1983,26 @@ async function runCommand(dir: vscode.Uri, dirLabel: string, command: string, ap
 		timer = setTimeout(() => {
 			timedOut = true;
 			killTree(child);
+			// A process that traps SIGTERM never closes, and this promise would wait on it for
+			// good — the timeout is the one backstop against a hung command, so it must not
+			// depend on the command's cooperation. Escalate, then report without waiting.
+			setTimeout(() => {
+				if (!settled) {
+					killTree(child, 'SIGKILL');
+					reportTimeout();
+				}
+			}, STOP_GRACE_MS).unref?.();
 		}, g.commandTimeoutMs);
+		const reportTimeout = () => {
+			const out = collector.render();
+			const seconds = Math.round(g.commandTimeoutMs / 1000);
+			finish({
+				result: `The command was killed after the ${seconds}s timeout (openvsChat.agent.commandTimeoutMs) — it did NOT fail on its own. `
+					+ `Its exit status is unknown. Re-run a faster subset, or raise the timeout.`
+					+ (out ? `\n\nOutput before it was killed:\n${out}` : ''),
+				isError: true,
+			});
+		};
 
 		child.stdout?.on('data', (chunk: Buffer) => collector.add(chunk.toString()));
 		child.stderr?.on('data', (chunk: Buffer) => collector.add(chunk.toString()));
@@ -1991,13 +2015,7 @@ async function runCommand(dir: vscode.Uri, dirLabel: string, command: string, ap
 			// A timeout is the one case where the exit status is meaningless, so it is
 			// reported as such rather than as a failing build the model would try to fix.
 			if (timedOut) {
-				const seconds = Math.round(g.commandTimeoutMs / 1000);
-				return finish({
-					result: `The command was killed after the ${seconds}s timeout (openvsChat.agent.commandTimeoutMs) — it did NOT fail on its own. `
-						+ `Its exit status is unknown. Re-run a faster subset, or raise the timeout.`
-						+ (out ? `\n\nOutput before it was killed:\n${out}` : ''),
-					isError: true,
-				});
+				return reportTimeout();
 			}
 			const failed = code !== 0;
 			const status = failed ? `\n\n[exit code ${code ?? `killed by ${exitSignal}`}]` : '';

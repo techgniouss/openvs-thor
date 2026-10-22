@@ -1752,9 +1752,9 @@ export class AgentRunner {
 			// its members, so it goes out at once. Only *adjacent* ones: a write between two
 			// reads changes what the second read should see, and reordering across it would
 			// answer from before the change.
-			if (this.guardrails.parallelReads && READ_ONLY_TOOL_NAMES.includes(call.name)) {
+			if (this.guardrails.parallelReads && isBatchableRead(call)) {
 				let end = i;
-				while (end < calls.length && READ_ONLY_TOOL_NAMES.includes(calls[end].name)) {
+				while (end < calls.length && isBatchableRead(calls[end])) {
 					end++;
 				}
 				if (end - i > 1) {
@@ -2062,13 +2062,18 @@ export class AgentRunner {
 					// delegate's activity under it instead of the user seeing nothing move
 					// until the whole delegation finishes. Narration/step lifecycle stays
 					// opaque, as above — only tool activity is worth surfacing mid-run.
+					//
+					// The id is namespaced by the delegation's own: every runner numbers its calls
+					// from `call_0`, and the UI keys its cards on the id, so two parallel delegates
+					// (or a delegate and its parent) would otherwise overwrite each other's cards
+					// and leave one spinning forever.
 					onToolStart: c => {
 						log.push(`• ${c.name}(${shortArgs(c.args)})`);
-						callbacks.onToolStart(c, call.id);
+						callbacks.onToolStart({ ...c, id: `${call.id}/${c.id}` }, call.id);
 					},
 					onToolEnd: (c, r, e) => {
 						log.push(`  ${e ? '⚠ ' : ''}${truncate(r, 300)}`);
-						callbacks.onToolEnd(c, r, e, call.id);
+						callbacks.onToolEnd({ ...c, id: `${call.id}/${c.id}` }, r, e, call.id);
 					},
 					// Surfaced to the user too: a sub-agent that quietly ran out of budget
 					// used to be invisible, leaving its half-done work unexplained.
@@ -2108,6 +2113,15 @@ function subagentSystem(readOnly: boolean): string {
 	const base = `${role} ${SUBAGENT_PREAMBLE} You were given one focused goal and do not see the parent conversation. ` +
 		`Accomplish exactly that goal using your tools, then end with a concise summary of what you found or changed. Do not ask follow-up questions.`;
 	return readOnly ? base : `${base}\n${SUBAGENT_WRITE_RULES}`;
+}
+
+/**
+ * Whether `call` may join a concurrent read batch. `list_agent_sessions` is read-only but is
+ * answered by the loop itself, never by {@link executeTool} — batched, it would reach the
+ * generic dispatch and come back as an unknown tool.
+ */
+function isBatchableRead(call: ToolCall): boolean {
+	return READ_ONLY_TOOL_NAMES.includes(call.name) && call.name !== LIST_AGENT_SESSIONS_TOOL.name;
 }
 
 /** `work`, or a cancellation as soon as `signal` aborts, whichever comes first. */

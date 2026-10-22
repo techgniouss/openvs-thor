@@ -1813,9 +1813,9 @@ async function runAuto(agentSteps, { maxSteps = 20, history = [{ role: 'user', c
 	const result = await runner.run([{ role: 'user', content: 'go' }], params, cb);
 	assert.strictEqual(result.reason, 'done');
 	assert.deepStrictEqual(
-		events.filter(e => e[1] === 'k1'),
-		[['start', 'k1', 's1'], ['end', 'k1', 's1']],
-		"the delegate's own tool call is tagged with the spawn_subagent call's id",
+		events.filter(e => e[1] === 's1/k1'),
+		[['start', 's1/k1', 's1'], ['end', 's1/k1', 's1']],
+		"the delegate's own tool call is tagged with the spawn_subagent call's id, and its card id is namespaced by it",
 	);
 	assert.deepStrictEqual(
 		events.filter(e => e[1] === 's1'),
@@ -2409,6 +2409,59 @@ for (const readOnly of [false, true]) {
 		'call:call_0', 'call:call_0_1', 'result:call_0', 'result:call_0_1',
 		'call:call_0_2', 'call:call_0_3', 'result:call_0_2', 'result:call_0_3',
 	], 'every call has its own id, and each result carries the id of its own call');
+}
+
+
+// 38b. Two parallel delegates each number their calls from the same id. Forwarded raw, the UI's
+// id-keyed cards collide and one spins forever; each must reach the outer callbacks under a
+// distinct id.
+{
+	const provider = {
+		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+		async listModels() { return []; },
+		async runAgentStep(request) {
+			const goal = ['ALPHA', 'BETA'].find(g => request.messages.some(m => m.content.includes(g)));
+			if (goal) {
+				return request.messages.some(m => m.role === 'tool')
+					? { content: `${goal} done`, toolCalls: [] }
+					: { content: '', toolCalls: [{ id: 'call_0', name: 'list_dir', args: { path: 'dir' } }] };
+			}
+			return request.messages.some(m => m.role === 'tool')
+				? { content: 'parent done', toolCalls: [] }
+				: { content: '', toolCalls: [
+					{ id: 'a', name: 'spawn_subagent', args: { goal: 'ALPHA', readOnly: true } },
+					{ id: 'b', name: 'spawn_subagent', args: { goal: 'BETA', readOnly: true } },
+				] };
+		},
+	};
+	const started = [];
+	const cb = { ...noopCallbacks(), onToolStart: call => started.push(call.id) };
+	const result = await new AgentRunner(provider, approver, 10).run([{ role: 'user', content: 'go' }], params, cb);
+	assert.strictEqual(result.reason, 'done');
+	const nested = started.filter(id => id.includes('/'));
+	assert.strictEqual(new Set(nested).size, 2, `parallel delegates' tool ids stay distinct: ${nested}`);
+}
+
+// 38c. list_agent_sessions arriving AFTER another read in the same step is still answered by the
+// loop itself, not swept into the concurrent read batch (where executeTool does not know it).
+{
+	const a2a = { selfId: 'me', listSessions: () => [{ id: 'other', title: 'Other tab', running: false }], sendMessage: async () => ({ ok: true, delivered: 'queued' }) };
+	const provider = {
+		info: { id: 'fake', label: 'Fake', supportsTools: true, toolModelPatterns: [], visionModelPatterns: [] },
+		async listModels() { return []; },
+		async runAgentStep(request) {
+			return request.messages.some(m => m.role === 'tool')
+				? { content: 'done', toolCalls: [] }
+				: { content: '', toolCalls: [
+					{ id: 'r1', name: 'list_dir', args: { path: 'dir' } },
+					{ id: 'r2', name: 'list_agent_sessions', args: {} },
+				] };
+		},
+	};
+	const ends = {};
+	const cb = { ...noopCallbacks(), onToolEnd: (call, result) => { ends[call.id] = result; } };
+	await new AgentRunner(provider, approver, 10, { a2a }).run([{ role: 'user', content: 'go' }], params, cb);
+	assert.ok(/Other tab/.test(ends.r2 ?? ''), `list_agent_sessions after a read still lists tabs: ${ends.r2}`);
 }
 
 console.log('test-agent-loop: all assertions passed');
