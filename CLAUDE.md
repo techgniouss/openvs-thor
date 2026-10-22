@@ -70,6 +70,8 @@ active development unless told otherwise; everything else is upstream VS Code.
   safe: model text is escaped exactly once, and inline constructs resolve through a token
   table so a later rule can never reach inside an earlier one's output (which is what kept
   emphasis out of code spans and the autolinker off its own href).
+- `test-mcp-stdio.mjs` drives a real child process speaking JSON-RPC (id collisions with the
+  server's own requests, and the per-platform launch plan).
 - `test-mcp-http.mjs` and `test-fetch-url.mjs` both drive a real local HTTP server rather
   than a stubbed `fetch`. Everything hard about those two modules is on the wire — which
   content type a reply arrives as, where it arrives at all, what status came back — and a
@@ -357,7 +359,9 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   side effect chosen by the *model*, so it asks for approval per host under exactly the
   policies that ask before a command and never under Full Auto; and a fetched page is
   untrusted input, so it comes back labelled as data with HTML reduced to text and clipped
-  to the run's own budget (raw markup is re-sent on every later step). It counts as
+  to the run's own budget (raw markup is re-sent on every later step). Redirects are followed by
+  hand, not by `fetch`: the approval is per host, so a hop to a different host asks again (or
+  fails the call if refused) rather than letting an approved page choose where the request goes. It counts as
   read-only (`READ_ONLY_TOOL_NAMES`) because it writes nothing — which is also what gives
   Ask/Plan and read-only sub-agents web access,
   `guardrails.ts` (protected paths, denied/allowed command regexes, approval policy, and
@@ -663,7 +667,10 @@ A standard VS Code extension (webview-based sidebar view) with this module layou
   (`manager.ts`); merges global (`openvsChat.mcp.servers`) and per-project
   (`.openvs/mcp.json` / `.vscode/mcp.json`) server configs; project overrides global.
   **Two transports, chosen per server by its config shape**: `client.ts` spawns a local
-  `command` over stdio, `httpClient.ts` connects to a `url`. The HTTP one covers both wires
+  `command` over stdio (`planSpawn`: on Windows anything but an `.exe` — `npx` and the other
+  `.cmd` shims, i.e. most configured servers — goes through the shell as one quoted command line,
+  and a server's own requests such as `ping` are answered by method, never matched against our
+  pending ids), `httpClient.ts` connects to a `url`. The HTTP one covers both wires
   in the wild — Streamable HTTP (reply on the POST's own response, as JSON or a short SSE
   stream) and the older HTTP+SSE (replies on a long-lived GET, requests POSTed to the
   endpoint that stream names) — failing over to the second when a POST is refused with
