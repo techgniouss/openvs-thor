@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { randomBytes } from 'crypto';
 import * as vscode from 'vscode';
 import { AgentA2A, AgentMessageDelivery, AgentOptions, AgentRunner, AgentSessionInfo, RunResult } from './agent/agentRunner';
 import { streamBudgeted } from './agent/budgetedStream';
@@ -3970,10 +3971,6 @@ function extractLastCodeBlock(text: string): string | undefined {
 }
 
 function getNonce(): string {
-	let text = '';
-	const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-	for (let i = 0; i < 32; i++) {
-		text += chars.charAt(Math.floor(Math.random() * chars.length));
-	}
-	return text;
+	// A CSP nonce only works if it cannot be predicted, which Math.random does not give.
+	return randomBytes(24).toString('base64').replace(/[^A-Za-z0-9]/g, '');
 }
