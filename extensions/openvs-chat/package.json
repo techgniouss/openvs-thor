@@ -826,7 +826,12 @@
             "\\b(curl|wget)\\b[^|]*\\|\\s*(sudo\\s+)?(ba)?sh",
             ">\\s*/dev/sd[a-z]",
             "\\b(shutdown|reboot|halt|poweroff)\\b",
-            "chmod\\s+-R\\s+777\\s+/"
+            "chmod\\s+-R\\s+777\\s+/",
+            "\\b(rmdir|rd)\\s+(/[a-z]\\s+)*/s\\b",
+            "\\bRemove-Item\\b[^|;]*-Recurse[^|;]*-Force|\\bRemove-Item\\b[^|;]*-Force[^|;]*-Recurse",
+            "\\bformat\\s+[a-z]:",
+            "\\bdel\\s+(/[a-z]\\s+)*/s\\b",
+            "rm\\s+-[a-z]*r[a-z]*\\s+(\\S+\\s+)*-[a-z]*f|rm\\s+-[a-z]*f[a-z]*\\s+(\\S+\\s+)*-[a-z]*r|rm\\s+.*--(recursive|force)\\b.*--(force|recursive)\\b"
           ],
           "description": "%config.guardrails.deniedCommands%"
         },

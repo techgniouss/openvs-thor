@@ -24,4 +24,18 @@ const g = loadGuardrails();
 assert.equal(g.deniedCommands.length, DEFAULT_DENIED_COMMANDS.length, 'an unsupplied setting still loads every denied-command pattern');
 assert.deepEqual(g.protectedPaths, [...DEFAULT_PROTECTED_PATHS], 'and every protected path');
 
+// The defaults actually stop the destructive forms a model writes on either platform, and leave
+// ordinary single-file deletes alone.
+const { checkCommand } = await import(new URL('../out/agent/guardrails.js', import.meta.url));
+for (const blocked of [
+	'rm -rf build', 'rm -fr build', 'rm -r -f build', 'rm -r build -f', 'rm --recursive --force build',
+	'rmdir /s /q C:\\proj', 'rd /s /q node_modules', 'del /f /s /q *.*', 'format c:',
+	'Remove-Item -Recurse -Force .\\dist', 'Remove-Item .\\dist -Force -Recurse',
+]) {
+	assert.equal(checkCommand(blocked, g).ok, false, `blocked: ${blocked}`);
+}
+for (const allowed of ['rm file.txt', 'rm -f stale.lock', 'rmdir empty', 'del old.txt', 'Remove-Item old.txt', 'npm run format', 'git push origin main']) {
+	assert.equal(checkCommand(allowed, g).ok, true, `allowed: ${allowed}`);
+}
+
 console.log('test-guardrail-defaults.mjs: all assertions passed');
