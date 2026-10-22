@@ -1810,16 +1810,52 @@ async function fetchUrl(rawUrl: string, raw: boolean, approver: ToolApprover, g:
 		if (signal?.aborted) {
 			throw new DOMException('Aborted', 'AbortError');
 		}
-		const response = await fetch(url, {
-			redirect: 'follow',
-			signal: abort.signal,
-			headers: {
-				// Named honestly. A site that blocks unknown agents should be able to say so
-				// rather than be worked around.
-				'user-agent': 'OpenVS-Thor/1.0 (+editor assistant)',
-				accept: 'text/html,application/json,text/plain;q=0.9,*/*;q=0.5',
-			},
-		});
+		// Redirects are followed by hand. The approval above is per host, and an automatic
+		// redirect lets an approved page send the request to a host the user never saw.
+		let response: Response;
+		for (let hops = 0; ; hops++) {
+			response = await fetch(url, {
+				redirect: 'manual',
+				signal: abort.signal,
+				headers: {
+					// Named honestly. A site that blocks unknown agents should be able to say so
+					// rather than be worked around.
+					'user-agent': 'OpenVS-Thor/1.0 (+editor assistant)',
+					accept: 'text/html,application/json,text/plain;q=0.9,*/*;q=0.5',
+				},
+			});
+			const location = response.status >= 300 && response.status < 400 ? response.headers.get('location') : null;
+			if (!location) {
+				break;
+			}
+			await response.body?.cancel().catch(() => { /* nothing left to read */ });
+			if (hops >= MAX_FETCH_REDIRECTS) {
+				return { result: `${rawUrl} redirected more than ${MAX_FETCH_REDIRECTS} times, so it was not followed any further.`, isError: true };
+			}
+			let next: URL;
+			try {
+				next = new URL(location, url);
+			} catch {
+				return { result: `${url} redirected to "${location}", which is not a valid URL.`, isError: true };
+			}
+			if (next.protocol !== 'http:' && next.protocol !== 'https:') {
+				return { result: `${url} redirected to a ${next.protocol} address, which fetch_url does not follow.`, isError: true };
+			}
+			if (next.host !== url.host && !autoApproves(g)) {
+				const { approved, feedback } = await approver.confirm({
+					kind: 'command',
+					signature: `fetch_url:${next.host}`,
+					title: 'Follow a redirect to another host?',
+					detail: `${url.host} redirected the request to ${next.host}.`,
+					preview: next.toString(),
+					previewLanguage: 'text',
+				});
+				if (!approved) {
+					return { result: denialMessage('command', feedback), isError: true };
+				}
+			}
+			url = next;
+		}
 		const type = response.headers.get('content-type') ?? '';
 		if (/^(image|audio|video|application\/(octet-stream|pdf|zip))/i.test(type)) {
 			return {
@@ -1886,15 +1922,18 @@ async function readCapped(response: Response, maxBytes: number): Promise<string>
 	return text;
 }
 
+/** How long Stop waits for a killed command to exit before returning anyway. */
+const STOP_GRACE_MS = 3_000;
+
+/** Redirect hops `fetch_url` follows before giving up. */
+const MAX_FETCH_REDIRECTS = 5;
+
 /**
  * Ends a command and every process it started. `child.kill()` ends only the shell the command
  * runs in: its children (npm, then node, then the test runner) survive it, and on Windows
  * nothing reaps them. `taskkill /T` takes the tree there; elsewhere the command runs as the
  * leader of its own process group, which a negative pid signals as a whole.
  */
-/** How long Stop waits for a killed command to exit before returning anyway. */
-const STOP_GRACE_MS = 3_000;
-
 function killTree(child: ReturnType<typeof spawn>, signal: NodeJS.Signals = 'SIGTERM'): void {
 	if (child.pid === undefined) {
 		return;

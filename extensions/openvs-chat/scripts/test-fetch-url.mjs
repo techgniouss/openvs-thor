@@ -144,5 +144,47 @@ function fetch_(args, approver, approval = 'yolo') {
 	assert.match(got.result, /not that site/);
 }
 
+// 6. A redirect is not a free pass to another host. The approval is per host, so an approved
+// page that bounces the request elsewhere must ask again; a loop must end.
+{
+	const redirector = http.createServer((req, res) => {
+		const here = `http://127.0.0.1:${redirector.address().port}`;
+		const to = req.url === '/same' ? `${here}/ok` : req.url === '/cross' ? `${base}/page` : req.url === '/loop' ? `${here}/loop` : undefined;
+		if (to) {
+			res.writeHead(302, { location: to });
+			res.end();
+			return;
+		}
+		res.writeHead(200, { 'content-type': 'text/plain' });
+		res.end('same-host body');
+	});
+	await new Promise(resolve => redirector.listen(0, '127.0.0.1', resolve));
+	const hereBase = `http://127.0.0.1:${redirector.address().port}`;
+
+	const same = approverThat({ approved: true });
+	assert.match((await fetch_({ url: `${hereBase}/same` }, same, 'always')).result, /same-host body/);
+	assert.equal(same.seen.length, 1, 'a same-host redirect needs no second approval');
+
+	const cross = approverThat({ approved: true });
+	const followed = await fetch_({ url: `${hereBase}/cross` }, cross, 'always');
+	assert.match(followed.result, /Release 2\.4/, 'an approved cross-host redirect is followed');
+	assert.deepStrictEqual(cross.seen.map(r => r.signature),
+		[`fetch_url:127.0.0.1:${redirector.address().port}`, `fetch_url:127.0.0.1:${server.address().port}`],
+		'the new host is asked about by name');
+
+	let answers = [{ approved: true }, { approved: false, feedback: 'not that host' }];
+	const refusing = { async confirm() { return answers.shift(); }, async ask() { return ''; } };
+	const refused = await fetch_({ url: `${hereBase}/cross` }, refusing, 'always');
+	assert.equal(refused.isError, true);
+	assert.match(refused.result, /not that host/);
+	assert.doesNotMatch(refused.result, /Release 2\.4/, 'a refused redirect target is never fetched');
+
+	assert.match((await fetch_({ url: `${hereBase}/cross` }, approverThat({ approved: true }), 'yolo')).result, /Release 2\.4/, 'yolo follows without asking');
+	const looped = await fetch_({ url: `${hereBase}/loop` }, approverThat({ approved: true }), 'yolo');
+	assert.equal(looped.isError, true);
+	assert.match(looped.result, /redirected more than/);
+	redirector.close();
+}
+
 server.close();
 console.log('PASS test-fetch-url.mjs');
